@@ -4,15 +4,16 @@ import { REACTIONS } from '../../shared/protocol.js';
 import { BLIND_PAYTABLE, NO_BETS, TRIPS_PAYTABLE, requiredToStart, sideTotal, type Decision, type DecisionPhase, type InitialBets } from '../../shared/rules.js';
 import { BAD_BEAT_VARIANTS, PAIRS_VARIANTS, previewPairs } from '../../shared/sidebets.js';
 import { PROGRESSIVE, progressiveHand } from '../../shared/progressive.js';
+import { pawnFor } from '../../shared/debt.js';
 import type { WagerKey } from '../../shared/protocol.js';
 import { advise } from '../../shared/strategy.js';
 import { session } from '../api.js';
 import { cardEl, setCard } from '../cardView.js';
 import { append, h, initials, modal, money, svg, toast } from '../dom.js';
 import { actionId, call, getSocket, onStatus, setCurrentTable } from '../net.js';
-import { motionScale, prefs } from '../settings.js';
+import { motionScale, prefs, setTableTheme } from '../settings.js';
 import { sfx, unlockAudio } from '../sound.js';
-import { openSettings } from './settingsModal.js';
+import { openSettings, tableLook } from './settingsModal.js';
 import { openReplay } from './replay.js';
 import { openHelp, openPayTables, readSideBetFields, sideBetFields } from './help.js';
 import { outsEl, outsText } from './outs.js';
@@ -33,12 +34,12 @@ const LAYOUTS: Record<number, [number, number][]> = {
 
 // Tall (phone) table: seats wrap around the lower curve, clear of the board.
 const LAYOUTS_TALL: Record<number, [number, number][]> = {
-  1: [[50, 86]],
-  2: [[33, 86], [67, 86]],
-  3: [[18, 74], [50, 89], [82, 74]],
-  4: [[13, 64], [35, 88], [65, 88], [87, 64]],
-  5: [[12, 62], [24, 81], [50, 91], [76, 81], [88, 62]],
-  6: [[11, 58], [15, 77], [36, 92], [64, 92], [85, 77], [89, 58]],
+  1: [[50, 85]],
+  2: [[32, 84], [68, 84]],
+  3: [[17, 72], [50, 88], [83, 72]],
+  4: [[14, 63], [34, 87], [66, 87], [86, 63]],
+  5: [[13, 58], [20, 80], [50, 91], [80, 80], [87, 58]],
+  6: [[12, 51], [13, 73], [33, 92], [67, 92], [87, 73], [88, 51]],
 };
 
 const ALL_WAGERS: WagerKey[] = ['ante', 'blind', 'play', 'trips', 'pairs', 'badBeat', 'progressive'];
@@ -81,19 +82,35 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
   const jackpotSign = h('button', { class: 'jackpot', title: 'Five Card Progressive — linked jackpot. Tap for the pay table.', hidden: true,
     onclick: () => view && openPayTables(view.config, view.jackpot?.amount) }, h('span', { class: 'jp-label' }, 'Progressive'), jackpotAmt);
   let shownJackpot = 0;
-  const hostBtn = h('button', { class: 'ghost', onclick: () => openHostMenu(), hidden: true }, 'Host');
+  const hostBtn = h('button', { class: 'ghost hide-m', onclick: () => openHostMenu(), hidden: true }, 'Host');
+  // Phones: one tidy row — back, name, jackpot, chat, and a menu for everything else.
+  const moreBtn = h('button', { class: 'ghost more-btn', 'aria-label': 'Table menu', title: 'Table menu', onclick: () => openMoreMenu() }, '☰');
   const chatBtn = h('button', { class: 'ghost panel-toggle', onclick: () => togglePanel('chat') }, 'Chat');
   const top = h('header', { class: 'tbar' },
-    h('button', { class: 'ghost', onclick: () => leave() }, '← Lobby'),
+    h('button', { class: 'ghost back-btn', 'aria-label': 'Back to the lobby', onclick: () => leave() }, '←', h('span', { class: 'hide-m' }, ' Lobby')),
     h('div', { class: 'tbar-title' }, tableName, h('button', { class: 'code', title: 'Copy invitation link', onclick: () => invite() }, code)),
     statusPill, jackpotSign,
     h('div', { class: 'tbar-actions' },
-      h('button', { class: 'ghost', onclick: () => invite() }, 'Invite'),
+      h('button', { class: 'ghost hide-m', onclick: () => invite() }, 'Invite'),
       chatBtn,
-      h('button', { class: 'ghost panel-toggle', onclick: () => togglePanel('table') }, 'History'),
+      h('button', { class: 'ghost panel-toggle hide-m', onclick: () => togglePanel('table') }, 'History'),
       hostBtn,
       h('button', { class: 'ghost hide-m', onclick: () => openHelp() }, 'Rules'),
-      h('button', { class: 'ghost', 'aria-label': 'Settings', title: 'Settings', onclick: () => openSettings({ inTable: true, view: () => view }) }, h('span', { class: 'hide-m' }, 'Settings'), h('span', { class: 'show-m' }, '⚙'))));
+      h('button', { class: 'ghost hide-m', 'aria-label': 'Settings', title: 'Settings', onclick: () => openSettings({ inTable: true, view: () => view }) }, 'Settings'),
+      moreBtn));
+
+  function openMoreMenu() {
+    const item = (label: string, sub: string, fn: () => void) => h('button', { class: 'menu-item', onclick: () => { m.close(); fn(); } },
+      h('b', {}, label), h('small', {}, sub));
+    const body = h('div', { class: 'menu-list' },
+      item('Invite friends', `Share the link · code ${code}`, () => invite()),
+      item('Table & history', 'Players, recent hands, your session', () => togglePanel('table')),
+      view?.you.isHost && !view.config.solo ? item('Host controls', 'Players, limits, felt and card colors', () => openHostMenu()) : null,
+      item('Settings', 'Sound, animations, strategy trainer', () => openSettings({ inTable: true, view: () => view })),
+      item('How to play', 'Rules and pay tables', () => openHelp()),
+      item('Leave table', 'Back to the lobby', () => leave()));
+    const m = modal(view?.config.name ?? 'Table', body);
+  }
 
   // Gold lettering printed on the felt, as on a real layout. Separate artwork for the wide and tall tables.
   const feltPrint = svg(`<svg class="felt-print fp-wide" viewBox="0 0 1000 562" aria-hidden="true">
@@ -282,6 +299,7 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     sock.off('kicked', handlers.kicked);
     offStatus();
     setCurrentTable(null);
+    setTableTheme(null);
   }
 
   // ---------------------------------------------------------------- render
@@ -299,6 +317,7 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     hostBtn.hidden = !v.you.isHost || v.config.solo;
     screen.classList.toggle('solo', v.config.solo);
     screen.dataset.phase = v.phase;
+    setTableTheme({ felt: v.config.felt, cardBack: v.config.cardBack });
     renderJackpot(v);
 
     // --- seats
@@ -373,6 +392,7 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
       Object.values(el.spots).forEach((x) => { x.textContent = ''; x.classList.remove('on'); });
       el.handName.textContent = '';
       el.root.classList.remove('acting', 'won', 'lost', 'pushed', 'folded', 'away', 'host', 'ready');
+      delete el.root.dataset.st;
       el.root.setAttribute('aria-label', `Seat ${realSeat + 1}, open`);
       return;
     }
@@ -380,6 +400,8 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     el.avatar.title = s.name;
     el.name.textContent = s.name;
     el.bal.textContent = money(s.balance);
+    el.bal.dataset.debt = s.debt ? `IOU ${money(s.debt)}` : '';
+    el.bal.title = s.debt ? `${s.name} owes the house ${money(s.debt)} in markers — just for fun.` : '';
     el.root.classList.toggle('host', s.isHost);
     el.root.classList.toggle('away', !s.connected);
     el.root.classList.toggle('acting', s.needsToAct);
@@ -390,6 +412,7 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     el.root.classList.toggle('lost', !!r && r.net < 0);
     el.root.classList.toggle('pushed', !!r && r.net === 0);
     el.status.textContent = !s.connected ? 'Away' : statusText(s);
+    el.root.dataset.st = !s.connected ? 'away' : s.leaving || s.standingUp ? 'leaving' : s.status;
     el.root.setAttribute('aria-label', `Seat ${realSeat + 1}, ${s.name}, ${money(s.balance)}, ${el.status.textContent}`);
 
     // cards
@@ -421,10 +444,11 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
 
   function statusText(s: SeatView) {
     if (s.leaving) return 'Leaving';
+    if (s.standingUp) return 'To the rail';
     switch (s.status) {
       case 'betting': return s.bet.ante ? 'Betting' : 'Choosing bet';
       case 'ready': return 'Ready';
-      case 'sitting-out': return 'Sitting out';
+      case 'sitting-out': return 'Away';
       case 'waiting-next': return 'Next hand';
       case 'folded': return 'Folded';
       case 'in-hand':
@@ -487,6 +511,7 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     const s = myView();
     dock.classList.toggle('spectating', !s);
     const inHand = !!s && s.cards.length > 0;
+    dock.classList.toggle('no-hand', !inHand);
     myCards.forEach((el, i) => { if (inHand) updateCard(el, s!.cards[i], false, 0); else clearCard(el); });
     myHandName.textContent = inHand ? (s!.result?.handName ?? s!.handName ?? '') : '';
 
@@ -517,7 +542,8 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
       append(totals, [
         h('span', {}, 'On the table ', h('b', {}, money(committed))),
         reserve ? h('span', {}, 'Reserved for 1× Play ', h('b', {}, money(reserve))) : null,
-        h('span', {}, betting ? 'Free after bets ' : 'Stack ', h('b', {}, money(betting ? s.balance - committed - reserve : s.balance)))]);
+        h('span', {}, betting ? 'Free after bets ' : 'Stack ', h('b', {}, money(betting ? s.balance - committed - reserve : s.balance))),
+        s.debt ? h('span', { class: 'debt-line', title: `To cover it, pawn ${pawnFor(s.debt).item}` }, 'Debt ', h('b', {}, money(s.debt))) : null]);
     } else totals.hidden = true;
     renderPairsFlash(v, s);
 
@@ -528,11 +554,14 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
       msg = free ? 'You are watching. Tap an open seat to join the table.' : 'You are watching this table.';
     } else if (v.phase === 'betting') {
       const need = requiredToStart(Math.max(draft.ante, v.config.minAnte), sideTotal(draft));
-      msg = s.status === 'ready' ? 'Ready — waiting for the others.' :
+      msg = s.status === 'sitting-out' ? (s.awayByHost ? 'The host set you away. Tap I’m back to play the next hand.' : 'You’re sitting out. Tap I’m back to play the next hand.') :
+        s.status === 'ready' ? 'Ready — waiting for the others.' :
         s.balance < requiredToStart(v.config.minAnte) ? 'Your stack can’t cover a minimum hand.' :
         draft.ante ? 'Add bonus bets if you like, then deal in. Bonus bets lock when the cards come out.' :
         `Choose a chip, then tap Ante. Limits ${money(v.config.minAnte)}–${money(v.config.maxAnte)}. You need ${money(need)} free.`;
-    } else if (s.status === 'waiting-next') msg = 'You’re in from the next hand.';
+    } else if (s.standingUp) msg = 'The host is moving you to the spectators after this hand. Your chips stay with you.';
+    else if (s.status === 'sitting-out') msg = 'You’re away — you’ll sit out the next hand.';
+    else if (s.status === 'waiting-next') msg = 'You’re in from the next hand.';
     else if (v.phase === 'settled') msg = '';
     else if (s.needsToAct) msg = v.phase === 'river' ? 'Play 1× or fold.' : v.phase === 'flop' ? 'Play 2× or check.' : 'Play 4×, 3× or check.';
     else if (inHand) msg = s.bet.play ? `Your ${money(s.bet.play)} Play bet is in. Waiting for the others.` : s.status === 'folded' ? 'You folded.' : 'Waiting for the others.';
@@ -543,6 +572,10 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     if (!s) {
       const free = v.seats.findIndex((x) => !x);
       if (free >= 0) controls.append(h('button', { class: 'btn gold', onclick: () => sit(free) }, 'Take a seat'));
+    } else if (v.phase === 'betting' && s.status === 'sitting-out') {
+      controls.append(h('button', { class: 'btn gold', onclick: async () => {
+        const r = await call('player:prefs', { sitOut: false }); if (!r.ok) toast(r.error, 'error');
+      } }, 'I’m back'));
     } else if (v.phase === 'betting') {
       if (v.you.canReload) controls.append(h('button', { class: 'btn', onclick: reload }, `Reload ${money(v.config.startingBankroll)}`));
       if (v.you.lastBet && s.status !== 'ready') controls.append(h('button', { class: 'btn', onclick: rebet }, 'Rebet'));
@@ -611,7 +644,7 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
   function onSpot(k: WagerKey) {
     if (!view || view.phase !== 'betting' || !BETTABLE.includes(k)) return;
     const s = myView();
-    if (!s || s.status === 'ready') return;
+    if (!s || s.status === 'ready' || s.status === 'sitting-out') return;
     const c = view.config;
     const key = k as keyof InitialBets;
     if (k === 'progressive' && !c.progressive) return toast('The progressive is not offered at this table.', 'error');
@@ -693,7 +726,9 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
   }
   async function reload() {
     const r = await call('player:reload');
-    if (!r.ok) toast(r.error, 'error'); else toast('Stack reloaded with virtual chips.', 'success');
+    if (!r.ok) return toast(r.error, 'error');
+    const debt = (r as { debt?: number }).debt ?? 0;
+    toast(debt ? `Marker signed. You owe the house ${money(debt)} — pawn ${pawnFor(debt).item} to cover it.` : 'Stack reloaded with virtual chips.', 'info');
   }
   async function leave() {
     if (view && myView()?.cards.length && view.phase !== 'settled' && view.phase !== 'betting') {
@@ -770,8 +805,19 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     const body = h('div', { class: 'stack' },
       h('p', {}, `${sv.name} · ${money(sv.balance)}`),
       h('button', { class: 'btn', onclick: () => { m.close(); mute(sv.playerId, sv.name); } }, 'Mute chat'),
-      view?.you.isHost ? h('button', { class: 'btn danger', onclick: () => { m.close(); kick(sv); } }, 'Remove from table') : null);
+      ...(view?.you.isHost ? hostSeatButtons(sv, () => m.close()) : []));
     const m = modal(sv.name, body);
+  }
+  /** Host seat controls: away/back, move to the spectators, remove. None of these touch cards or chips. */
+  function hostSeatButtons(sv: SeatView, done: () => void) {
+    const away = sv.status === 'sitting-out';
+    const act = async (ev: string, payload: object) => { done(); const r = await call(ev as 'host:away', payload as never); if (!r.ok) toast(r.error, 'error'); };
+    return [
+      h('button', { class: 'btn small', onclick: () => act('host:away', { playerId: sv.playerId, away: !away }) }, away ? 'Bring back' : 'Set away'),
+      sv.standingUp ? h('span', { class: 'muted tiny' }, 'Moving to spectators') :
+        h('button', { class: 'btn small', onclick: () => act('host:standUp', { playerId: sv.playerId }) }, 'Move to spectators'),
+      h('button', { class: 'btn small danger', onclick: () => { done(); kick(sv); } }, 'Remove'),
+    ];
   }
   async function kick(sv: SeatView) {
     if (!confirm(`Remove ${sv.name} from the table? They won't be able to rejoin.`)) return;
@@ -1047,8 +1093,11 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     const body = h('div', { class: 'stack' },
       form,
       h('h3', {}, 'Players'),
-      others.length ? h('ul', { class: 'plist' }, ...others.map((s) => h('li', {}, h('span', {}, s.name),
-        h('button', { class: 'btn small danger', onclick: () => { m.close(); kick(s); } }, 'Remove')))) : h('p', { class: 'muted' }, 'Nobody else is seated.'),
+      others.length ? h('ul', { class: 'plist host-plist' }, ...others.map((s) => h('li', {},
+        h('span', {}, h('b', {}, s.name), h('small', { class: 'muted' }, ` ${!s.connected ? 'Disconnected' : statusText(s)} · ${money(s.balance)}`)),
+        h('span', { class: 'host-btns' }, ...hostSeatButtons(s, () => m.close()))))) : h('p', { class: 'muted' }, 'Nobody else is seated.'),
+      h('p', { class: 'muted tiny' }, 'Set away: they keep their seat but sit out until they tap I’m back. Move to spectators: they stand up (after the current hand) and keep their chips if they sit again.'),
+      tableLook(view),
       h('p', { class: 'muted' }, 'Hosts manage the room only. Cards, shuffling, payouts and other players’ chips are controlled by the server.'),
       h('button', { class: 'btn danger', onclick: async () => {
         if (!confirm('Close this table for everyone? A hand in progress finishes first.')) return;

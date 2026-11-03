@@ -4,6 +4,7 @@
 import type { CardStr } from './cards.js';
 import type { Decision, DecisionPhase, InitialBets, Settlement } from './rules.js';
 import type { BadBeatVariant, PairsVariant } from './sidebets.js';
+import type { CardBack, FeltColor } from './themes.js';
 
 export type WagerKey = 'ante' | 'blind' | 'play' | 'trips' | 'pairs' | 'badBeat' | 'progressive';
 import type { Advice, Outs } from './strategy.js';
@@ -23,6 +24,8 @@ export interface TableConfig {
   pairsVariant: PairsVariant['id'];     // complete pay table, never mixed
   badBeatVariant: BadBeatVariant['id'];
   progressive: boolean;        // $5 Five Card Progressive offered at this table
+  felt: FeltColor;             // host's choice, shown to everyone
+  cardBack: CardBack;
   startingBankroll: number;    // cents
   decisionSeconds: number;     // 0 = no timer (solo only)
   bettingSeconds: number;      // countdown once someone is ready
@@ -46,6 +49,10 @@ export interface SeatView {
   handName?: string;           // only when cards are visible to this viewer
   result?: SeatResult;
   leaving?: boolean;
+  /** Just for fun: total virtual chips borrowed by reloading at this table (cents). */
+  debt?: number;
+  standingUp?: boolean;        // host moved them to spectators; takes effect after this hand
+  awayByHost?: boolean;        // the host set them away
 }
 
 export interface SeatResult {
@@ -132,12 +139,18 @@ export interface ClientToServer {
   'bet:clear': (p: { actionId: string }, ack: (r: Ack) => void) => void;
   'player:ready': (p: { actionId: string; ready: boolean }, ack: (r: Ack) => void) => void;
   'player:decide': (p: { actionId: string; handId: string; phase: DecisionPhase; decision: Decision }, ack: (r: Ack) => void) => void;
-  'player:reload': (ack: (r: Ack) => void) => void;
+  'player:reload': (ack: (r: Ack<{ balance: number; debt: number }>) => void) => void;
   'player:prefs': (p: { timeoutPolicy?: 'default' | 'strategy'; sitOut?: boolean }, ack: (r: Ack) => void) => void;
   'chat:send': (p: { text: string }, ack: (r: Ack) => void) => void;
   'chat:react': (p: { reaction: Reaction }, ack: (r: Ack) => void) => void;
   'host:kick': (p: { playerId: string }, ack: (r: Ack) => void) => void;
   'host:close': (ack: (r: Ack) => void) => void;
+  /** Cosmetic only, allowed at any time. */
+  'host:theme': (p: { felt?: FeltColor; cardBack?: CardBack }, ack: (r: Ack) => void) => void;
+  /** Set a seated player away (sitting out) or back. */
+  'host:away': (p: { playerId: string; away: boolean }, ack: (r: Ack) => void) => void;
+  /** Move a seated player to the rail as a spectator; their stack is kept for when they sit again. */
+  'host:standUp': (p: { playerId: string }, ack: (r: Ack) => void) => void;
   'host:settings': (p: Partial<TableConfig>, ack: (r: Ack) => void) => void;
 }
 

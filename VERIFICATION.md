@@ -3,13 +3,25 @@
 What was actually run, where, and what it proved — and what was not tested.
 
 **Environment:** Linux, Node.js 22.23, PostgreSQL 16 (local), Google Chrome for Testing 153, run on 2 November 2026.
-**Result:** 102 of 102 automated tests passed.
+**Result:** 109 of 109 automated tests passed.
 
 ```
 npx tsc --noEmit                 → no type errors (client, server, shared, tests)
-npm test  (Vitest)               → 6 files, 98 tests passed   (60 unit + 38 multiplayer integration)
-npm run test:e2e (Playwright)    → 4 tests passed in real Chrome against the production build
+npm test  (Vitest)               → 8 files, 104 tests passed   (62 unit + 42 multiplayer integration)
+npm run test:e2e (Playwright)    → 5 tests passed in real Chrome against the production build
 ```
+
+Update 3 November 2026 (later): host-chosen felt and card backs, host Set away / Move to spectators, debt counter, phone layout — section 1e.
+
+## 1e. Host look and seat controls, debt counter, phone layout
+
+**Integration (memory store).** Only the host can change the felt/backs; unknown values rejected; the other player's view updates and chat announces it. Host sets a player away → `sitting-out` with `awayByHost`; brings them back; a player readying comes back on their own. Host can't stand themselves up; standing a player up mid-hand flags `standingUp`, they finish the hand, then become a spectator; sitting again restores the same balance from the database.
+
+**Integration (PostgreSQL) + unit.** A $15-bankroll table: losing everything and reloading gives `debt $15` in the ack, the seat view and chat ("Ed takes a $15 marker. Total debt: $15. … pawn your AirPods …"); a second bust gives $30 with a different joke; debt is persisted (`stacks.debt`) and in `/api/stats/me`; ledger still reconciles with the balance. Unit: pawn item is the cheapest that covers the debt, item values ascend, jokes never repeat back to back, exact line wording.
+
+**Browser (Playwright, iPhone 13 + desktop).** Phone top bar hides Invite (menu button instead); host picks Burgundy felt and Gold backs from ☰ → Host controls → guest's page switches to `data-felt=burgundy`, `data-back=gold`; guest's Settings shows the look read-only; host taps Set away → guest sees *I'm back*, taps it, and *Deal me in* returns. No page errors.
+
+**By eye (393×659, the size of an iPhone with Safari's bars).** 3- and 6-player tables during betting, pre-flop and settlement: no overlapping name plates, no status text under the felt, community-card centre suits smaller, seat cards show corner indices only, menu sheet. Desktop 6-seat layout re-checked for regressions.
 
 Update 3 November 2026: casino rounding, cards face up after the round, $5 Five Card Progressive — section 1d.
 

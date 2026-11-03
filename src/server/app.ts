@@ -356,6 +356,9 @@ export async function createApp(opts: AppOptions) {
     on('player:prefs', async (e, p) => e.setPrefs(socket.data.player.id, obj(p)));
     on('host:kick', async (e, p) => e.kick(socket.data.player.id, String(obj(p).playerId)));
     on('host:close', async (e) => e.close(socket.data.player.id));
+    on('host:theme', async (e, p) => e.setTheme(socket.data.player.id, obj(p)));
+    on('host:away', async (e, p) => e.setAway(socket.data.player.id, String(obj(p).playerId), obj(p).away !== false));
+    on('host:standUp', async (e, p) => e.standUp(socket.data.player.id, String(obj(p).playerId)));
     on('host:settings', async (e, p) => e.updateSettings(socket.data.player.id, obj(p)));
 
     socket.on('chat:send', (p, ack) => {

@@ -6,28 +6,16 @@ export interface Prefs {
   motion: 'full' | 'fast' | 'off';
   trainer: 'casino' | 'training' | 'challenge';
   fourColorDeck: boolean;
-  felt: FeltColor;
-  cardBack: CardBack;
 }
 
-export type FeltColor = 'emerald' | 'sapphire' | 'burgundy' | 'charcoal' | 'purple' | 'teal';
-export type CardBack = 'burgundy' | 'navy' | 'black' | 'forest' | 'purple' | 'gold';
-export const FELTS: { id: FeltColor; name: string; swatch: string }[] = [
-  { id: 'emerald', name: 'Emerald', swatch: '#0e5236' }, { id: 'sapphire', name: 'Sapphire', swatch: '#134673' },
-  { id: 'burgundy', name: 'Burgundy', swatch: '#5e1c27' }, { id: 'charcoal', name: 'Charcoal', swatch: '#2c3236' },
-  { id: 'purple', name: 'Royal purple', swatch: '#432c61' }, { id: 'teal', name: 'Teal', swatch: '#115255' },
-];
-export const BACKS: { id: CardBack; name: string; swatch: string }[] = [
-  { id: 'burgundy', name: 'Burgundy', swatch: '#7a1f2b' }, { id: 'navy', name: 'Navy', swatch: '#173061' },
-  { id: 'black', name: 'Black', swatch: '#1c1c1c' }, { id: 'forest', name: 'Forest green', swatch: '#174a2c' },
-  { id: 'purple', name: 'Purple', swatch: '#432263' }, { id: 'gold', name: 'Gold', swatch: '#9a7330' },
-];
+import { DEFAULT_BACK, DEFAULT_FELT, type CardBack, type FeltColor } from '../shared/themes.js';
+export { BACKS, FELTS, type CardBack, type FeltColor } from '../shared/themes.js';
 
 const KEY = 'uth.prefs';
 const defaults: Prefs = {
   fxVolume: 0.7, ambientVolume: 0.25,
   motion: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'off' : 'full',
-  trainer: 'casino', fourColorDeck: false, felt: 'emerald', cardBack: 'burgundy',
+  trainer: 'casino', fourColorDeck: false,
 };
 
 let current: Prefs = { ...defaults, ...(() => { try { return JSON.parse(localStorage.getItem(KEY) ?? '{}'); } catch { return {}; } })() };
@@ -43,12 +31,18 @@ export const prefs = {
   },
   on(fn: (p: Prefs) => void) { listeners.add(fn); return () => listeners.delete(fn); },
 };
+// Felt and card backs belong to the table (the host picks them); outside a table the house defaults show.
+let tableTheme: { felt: FeltColor; cardBack: CardBack } | null = null;
+export function setTableTheme(t: { felt: FeltColor; cardBack: CardBack } | null) {
+  tableTheme = t;
+  applyTheme();
+}
 function applyTheme() {
   const d = document.documentElement.dataset;
   d.motion = current.motion;
   d.fourColor = String(current.fourColorDeck);
-  d.felt = current.felt;
-  d.back = current.cardBack;
+  d.felt = tableTheme?.felt ?? DEFAULT_FELT;
+  d.back = tableTheme?.cardBack ?? DEFAULT_BACK;
 }
 applyTheme();
 

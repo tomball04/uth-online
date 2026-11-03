@@ -81,31 +81,32 @@ export class PgStore implements Store {
   }
 
   async getStack(playerId: string, code: string): Promise<StackRow | null> {
-    const r = await this.pool.query('SELECT balance,reloads FROM stacks WHERE player_id=$1 AND table_code=$2', [playerId, code]);
-    return r.rows[0] ?? null;
+    const r = await this.pool.query('SELECT balance,reloads,debt FROM stacks WHERE player_id=$1 AND table_code=$2', [playerId, code]);
+    return r.rows[0] ? stackRow(r.rows[0]) : null;
   }
   async createStack(playerId: string, code: string, amount: number): Promise<StackRow> {
     return this.tx(async (c) => {
       const ins = await c.query(
-        `INSERT INTO stacks(player_id,table_code,balance) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING RETURNING balance,reloads`,
+        `INSERT INTO stacks(player_id,table_code,balance) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING RETURNING balance,reloads,debt`,
         [playerId, code, amount]);
       if (ins.rowCount) {
         await c.query(`INSERT INTO ledger(tx_key,player_id,table_code,kind,amount,balance_after) VALUES ($1,$2,$3,'buyin',$4,$4)`,
           [`${code}:${playerId}:buyin`, playerId, code, amount]);
-        return ins.rows[0];
+        return stackRow(ins.rows[0]);
       }
-      return (await c.query('SELECT balance,reloads FROM stacks WHERE player_id=$1 AND table_code=$2', [playerId, code])).rows[0];
+      return stackRow((await c.query('SELECT balance,reloads,debt FROM stacks WHERE player_id=$1 AND table_code=$2', [playerId, code])).rows[0]);
     });
   }
   async reloadStack(playerId: string, code: string, amount: number): Promise<StackRow> {
     return this.tx(async (c) => {
-      const cur = (await c.query('SELECT balance,reloads FROM stacks WHERE player_id=$1 AND table_code=$2 FOR UPDATE', [playerId, code])).rows[0];
+      const cur = (await c.query('SELECT balance,reloads,debt FROM stacks WHERE player_id=$1 AND table_code=$2 FOR UPDATE', [playerId, code])).rows[0];
       if (!cur) throw new Error('No stack');
       const n = cur.reloads + 1;
-      await c.query('UPDATE stacks SET balance=$3, reloads=$4, updated_at=now() WHERE player_id=$1 AND table_code=$2', [playerId, code, amount, n]);
+      const debt = Number(cur.debt) + Math.max(0, amount - Number(cur.balance));
+      await c.query('UPDATE stacks SET balance=$3, reloads=$4, debt=$5, updated_at=now() WHERE player_id=$1 AND table_code=$2', [playerId, code, amount, n, debt]);
       await c.query(`INSERT INTO ledger(tx_key,player_id,table_code,kind,amount,balance_after) VALUES ($1,$2,$3,'reload',$4,$5)`,
         [`${code}:${playerId}:reload:${n}`, playerId, code, amount - cur.balance, amount]);
-      return { balance: amount, reloads: n };
+      return { balance: amount, reloads: n, debt };
     });
   }
 
@@ -271,7 +272,7 @@ export class PgStore implements Store {
          GROUP BY phase, action, recommended ORDER BY count DESC LIMIT 5`),
       q(`SELECT COUNT(*)::int bets, COUNT(*) FILTER (WHERE trips_net>0)::int wins, COALESCE(SUM(trips_net),0) net FROM hand_players WHERE player_id=$1 AND settled AND trips>0`),
       q(`SELECT COUNT(*)::int n FROM hand_players hp JOIN hands h ON h.id=hp.hand_id WHERE hp.player_id=$1 AND hp.settled AND h.participant_count>1`),
-      q(`SELECT COALESCE(SUM(reloads),0)::int reloads, COUNT(*)::int tables FROM stacks WHERE player_id=$1`),
+      q(`SELECT COALESCE(SUM(reloads),0)::int reloads, COALESCE(SUM(debt),0) debt, COUNT(*)::int tables FROM stacks WHERE player_id=$1`),
       q(`SELECT h.settled_at at, SUM(hp.net) OVER (ORDER BY h.settled_at, h.id) cum
          FROM hand_players hp JOIN hands h ON h.id=hp.hand_id WHERE hp.player_id=$1 AND hp.settled ORDER BY h.settled_at DESC, h.id DESC LIMIT 500`),
     ]);
@@ -286,7 +287,7 @@ export class PgStore implements Store {
       trips: { bets: trips.rows[0].bets, wins: trips.rows[0].wins, net: Number(trips.rows[0].net) },
       side: { trips: sTrips, pairs: sPairs, badBeat: sBad, progressive: sProg },
       baseNet: Number(base.rows[0].net), baseWagered: Number(base.rows[0].wagered),
-      handsWithFriends: friends.rows[0].n, reloads: stacks.rows[0].reloads, tables: stacks.rows[0].tables,
+      handsWithFriends: friends.rows[0].n, reloads: stacks.rows[0].reloads, tables: stacks.rows[0].tables, debt: Number(stacks.rows[0].debt),
       series: series.rows.reverse().map((r) => ({ at: new Date(r.at).toISOString(), cumulative: Number(r.cum) })),
     };
   }
@@ -342,3 +343,6 @@ export class PgStore implements Store {
     return Number(r.rows[0].s);
   }
 }
+
+const stackRow = (r: { balance: unknown; reloads: unknown; debt: unknown }): StackRow =>
+  ({ balance: Number(r.balance), reloads: Number(r.reloads), debt: Number(r.debt ?? 0) });

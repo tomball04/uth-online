@@ -1,7 +1,7 @@
 import type { TableView } from '../../shared/protocol.js';
 import { h, modal, toast } from '../dom.js';
 import { call } from '../net.js';
-import { BACKS, FELTS, prefs, type Prefs } from '../settings.js';
+import { BACKS, FELTS, prefs, type CardBack, type FeltColor, type Prefs } from '../settings.js';
 import { cardEl } from '../cardView.js';
 import { unlockAudio } from '../sound.js';
 
@@ -38,22 +38,33 @@ export function openSettings(opts: { inTable?: boolean; view?: () => TableView |
       ['fast', 'Fast play', 'The same animations at about twice the speed.'],
       ['off', 'Reduced motion', 'Cards and chips appear without movement.'],
     ]),
-    h('fieldset', {}, h('legend', {}, 'Table and cards'),
-      swatches('felt', 'Felt', FELTS, p.felt),
-      swatches('cardBack', 'Card backs', BACKS, p.cardBack),
-      h('div', { class: 'theme-preview', 'aria-hidden': 'true' }, h('div', { class: 'cards-row' }, cardEl('Ah'), cardEl('Kd'), cardEl('Qc'), cardEl(null))),
+    h('fieldset', {}, h('legend', {}, 'Cards'),
       h('label', { class: 'radio' }, h('input', { type: 'checkbox', checked: p.fourColorDeck, onchange: (e: Event) => prefs.set({ fourColorDeck: (e.target as HTMLInputElement).checked }) }),
-        h('span', {}, h('b', {}, 'Four-colour deck'), h('small', {}, 'Blue diamonds and green clubs, easier to tell apart on small screens.')))),
+        h('span', {}, h('b', {}, 'Four-colour deck'), h('small', {}, 'Blue diamonds and green clubs, easier to tell apart on small screens. Just for you.')))),
+    v ? tableLook(v) : null,
     tablePrefs);
   modal('Settings', body);
 }
 
-function swatches<K extends 'felt' | 'cardBack'>(key: K, label: string, opts: { id: Prefs[K]; name: string; swatch: string }[], value: Prefs[K]) {
-  return h('div', { class: 'swatch-group', role: 'radiogroup', 'aria-label': label },
+/** Felt and card backs are the host's choice and everyone at the table sees them. Others see what's in use. */
+export function tableLook(v: TableView) {
+  const host = v.you.isHost;
+  return h('fieldset', {}, h('legend', {}, 'Table look'),
+    host ? null : h('p', { class: 'muted tiny' }, 'The host chooses the felt and card backs for everyone at this table.'),
+    swatches('felt', 'Felt', FELTS, v.config.felt, !host),
+    swatches('cardBack', 'Card backs', BACKS, v.config.cardBack, !host),
+    h('div', { class: 'theme-preview', 'aria-hidden': 'true' }, h('div', { class: 'cards-row' }, cardEl('Ah'), cardEl('Kd'), cardEl('Qc'), cardEl(null))));
+}
+
+function swatches<K extends 'felt' | 'cardBack'>(key: K, label: string, opts: { id: string; name: string; swatch: string }[], value: string, readOnly: boolean) {
+  return h('div', { class: `swatch-group ${readOnly ? 'readonly' : ''}`, role: 'radiogroup', 'aria-label': label },
     h('span', { class: 'swatch-label' }, label),
     h('div', { class: 'swatches' }, ...opts.map((o) => h('label', { class: 'swatch', title: o.name },
-      h('input', { type: 'radio', name: key, value: o.id, checked: o.id === value, 'aria-label': o.name,
-        onchange: () => prefs.set({ [key]: o.id } as Partial<Prefs>) }),
+      h('input', { type: 'radio', name: key, value: o.id, checked: o.id === value, disabled: readOnly, 'aria-label': o.name,
+        onchange: async () => {
+          const r = await call('host:theme', { [key]: o.id } as { felt?: FeltColor; cardBack?: CardBack });
+          if (!r.ok) toast(r.error, 'error');
+        } }),
       h('span', { class: 'swatch-dot', style: `--sw: ${o.swatch}` }),
       h('span', { class: 'swatch-name' }, o.name)))));
 }

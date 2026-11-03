@@ -216,3 +216,35 @@ test('side bets: bonus panel on a phone, Trips+ requirement, locking, and settle
   expect(host.errors).toEqual([]);
   expect(phone.errors).toEqual([]);
 });
+
+test('phone host: table menu, felt and card colours for everyone, set a player away', async ({ browser }) => {
+  const host = await newPlayer(browser, 'Pita', 'iphone');
+  const guest = await newPlayer(browser, 'Gus');
+  await signIn(host.page, 'Pita');
+  await host.page.getByRole('button', { name: 'Create a private table' }).click();
+  await host.page.getByRole('button', { name: 'Create table' }).click();
+  await host.page.waitForURL(/\/table\/[A-Z0-9]{8}$/);
+  await signIn(guest.page, 'Gus', new URL(host.page.url()).pathname);
+  await expect(host.page.locator('.seat:not(.empty-seat) .pname')).toHaveCount(2);
+
+  // One tidy top bar on the phone; everything else lives in the menu.
+  await expect(host.page.locator('.tbar').getByRole('button', { name: 'Invite' })).toBeHidden();
+  await host.page.getByRole('button', { name: 'Table menu' }).click();
+  await host.page.getByRole('button', { name: /Host controls/ }).click();
+  await host.page.locator('.swatch[title="Burgundy"]').first().click();          // felt
+  await host.page.locator('.swatch-group').nth(1).locator('.swatch[title="Gold"]').click();
+  await expect(guest.page.locator('html')).toHaveAttribute('data-felt', 'burgundy');
+  await expect(guest.page.locator('html')).toHaveAttribute('data-back', 'gold');
+  // The guest sees the look but can't change it.
+  await guest.page.getByRole('button', { name: 'Settings' }).click();
+  await expect(guest.page.getByText('The host chooses the felt and card backs')).toBeVisible();
+  await expect(guest.page.locator('.swatch-group.readonly input').first()).toBeDisabled();
+  await guest.page.keyboard.press('Escape');
+
+  // Set Gus away from the host's player list.
+  await host.page.getByRole('button', { name: 'Set away' }).click();
+  await expect(guest.page.getByRole('button', { name: 'I’m back' })).toBeVisible();
+  await guest.page.getByRole('button', { name: 'I’m back' }).click();
+  await expect(guest.page.getByRole('button', { name: 'Deal me in' })).toBeVisible();
+  expect([...host.errors, ...guest.errors]).toEqual([]);
+});

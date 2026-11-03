@@ -1,12 +1,13 @@
 import { api } from '../api.js';
 import { h, money, svg, toast } from '../dom.js';
+import { pawnFor } from '../../shared/debt.js';
 
 interface Stats {
   hands: number; net: number; wins: number; losses: number; pushes: number; folds: number; biggestWin: number; biggestLoss: number;
   bestHand: string | null; totalWagered: number; decisions: number; correctDecisions: number; evLost: number;
   byPhase: { phase: string; action: string; count: number; correct: number }[];
   commonMistakes: { phase: string; action: string; recommended: string; count: number; evCost: number }[];
-  trips: { bets: number; wins: number; net: number }; handsWithFriends: number; reloads: number; tables: number;
+  trips: { bets: number; wins: number; net: number }; handsWithFriends: number; reloads: number; tables: number; debt?: number;
   side: Record<'trips' | 'pairs' | 'badBeat' | 'progressive', Side>; baseNet: number; baseWagered: number;
   series: { at: string; cumulative: number }[];
 }
@@ -46,7 +47,7 @@ export async function mountStats(root: HTMLElement, nav: (p: string) => void) {
       fig('Main-game return', s.baseWagered ? `${((s.baseNet / s.baseWagered) * 100).toFixed(2)}%` : '—'),
       fig('With friends', `${s.handsWithFriends} hands`)),
     h('section', { class: 'card-sec' }, h('h2', {}, 'Lifetime bankroll'), graph(s.series),
-      h('p', { class: 'muted' }, `Across ${s.tables} table${s.tables === 1 ? '' : 's'} · ${s.reloads} reload${s.reloads === 1 ? '' : 's'}. With perfect strategy the house edge is about 2.2% of the Ante per hand, roughly 0.5% of total action.`)),
+      h('p', { class: 'muted' }, `Across ${s.tables} table${s.tables === 1 ? '' : 's'} · ${s.reloads} reload${s.reloads === 1 ? '' : 's'}${s.debt ? ` · ${money(s.debt)} in markers (to cover it, pawn ${pawnFor(s.debt).item})` : ''}. With perfect strategy the house edge is about 2.2% of the Ante per hand, roughly 0.5% of total action.`)),
     h('section', { class: 'card-sec' }, h('h2', {}, 'Strategy'),
       h('p', {}, `${pct(s.correctDecisions, s.decisions)} of your ${s.decisions} decisions matched optimal strategy. Mistakes have cost about `,
         h('b', {}, `${s.evLost.toFixed(2)} antes`), ' of expected value in total.'),

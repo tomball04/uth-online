@@ -7,7 +7,7 @@
 import type { DecisionRecord, TableConfig } from '../shared/protocol.js';
 
 export interface PlayerRow { id: string; name: string; avatar: string }
-export interface StackRow { balance: number; reloads: number }
+export interface StackRow { balance: number; reloads: number; debt: number }
 export interface TableRow { code: string; hostId: string; config: TableConfig; handCounter: number; closed: boolean }
 
 export interface HandStartPlayer {
@@ -43,7 +43,7 @@ export interface PlayerStats {
   trips: { bets: number; wins: number; net: number };
   side: { trips: SideBetStats; pairs: SideBetStats; badBeat: SideBetStats; progressive: SideBetStats };
   baseNet: number; baseWagered: number;
-  handsWithFriends: number; reloads: number; tables: number;
+  handsWithFriends: number; reloads: number; tables: number; debt: number;
   series: { at: string; cumulative: number }[];
 }
 

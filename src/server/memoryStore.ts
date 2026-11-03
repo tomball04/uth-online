@@ -74,7 +74,7 @@ export class MemoryStore implements Store {
   async createStack(p: string, c: string, amount: number) {
     const k = this.sk(p, c);
     if (!this.stacks.has(k)) {
-      this.stacks.set(k, { balance: amount, reloads: 0 });
+      this.stacks.set(k, { balance: amount, reloads: 0, debt: 0 });
       this.post({ key: `${c}:${p}:buyin`, playerId: p, code: c, kind: 'buyin', amount, after: amount });
     }
     return { ...this.stacks.get(k)! };
@@ -83,6 +83,7 @@ export class MemoryStore implements Store {
     const s = this.stacks.get(this.sk(p, c));
     if (!s) throw new Error('No stack');
     s.reloads++;
+    s.debt += Math.max(0, amount - s.balance);
     this.post({ key: `${c}:${p}:reload:${s.reloads}`, playerId: p, code: c, kind: 'reload', amount: amount - s.balance, after: amount });
     s.balance = amount;
     return { ...s };
@@ -219,7 +220,7 @@ export class MemoryStore implements Store {
       baseNet: rows.reduce((s, r) => s + (r.hp.row?.baseNet ?? 0), 0),
       baseWagered: rows.reduce((s, r) => s + r.hp.ante + r.hp.blind + r.hp.play, 0),
       handsWithFriends: rows.filter((r) => r.h.participants > 1).length,
-      reloads: stacks.reduce((s, [, v]) => s + v.reloads, 0), tables: stacks.length,
+      reloads: stacks.reduce((s, [, v]) => s + v.reloads, 0), tables: stacks.length, debt: stacks.reduce((s, [, v]) => s + v.debt, 0),
       series: rows.slice(-500).map((r) => ({ at: r.h.settledAt!.toISOString(), cumulative: (cum += r.hp.net!) })),
     };
   }

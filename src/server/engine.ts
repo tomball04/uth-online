@@ -27,9 +27,13 @@ export function withSideBetDefaults(c: TableConfig): TableConfig {
     pairsVariant: isPairsVariant(c.pairsVariant) ? c.pairsVariant : DEFAULT_PAIRS_VARIANT,
     badBeatVariant: isBadBeatVariant(c.badBeatVariant) ? c.badBeatVariant : DEFAULT_BAD_BEAT_VARIANT,
     progressive: c.progressive !== false,
+    felt: isFelt(c.felt) ? c.felt : DEFAULT_FELT,
+    cardBack: isBack(c.cardBack) ? c.cardBack : DEFAULT_BACK,
   };
 }
 import { newId, sha256 } from './rng.js';
+import { debtLine } from '../shared/debt.js';
+import { BACKS, DEFAULT_BACK, DEFAULT_FELT, FELTS, isBack, isFelt } from '../shared/themes.js';
 import type { PlayerRow, Store } from './store.js';
 
 export interface Timing {
@@ -53,10 +57,11 @@ export interface EngineHooks {
 }
 
 interface Seat {
-  seat: number; playerId: string; name: string; avatar: string; balance: number; reloads: number;
+  seat: number; playerId: string; name: string; avatar: string; balance: number; reloads: number; debt: number;
   connected: boolean; disconnectedAt: number | null;
   pending: InitialBets; ready: boolean; lastBet: InitialBets | null;
   sitOut: boolean; timeoutPolicy: 'default' | 'strategy'; leaving: boolean;
+  standingUp: boolean; awayByHost: boolean;
   seen: string[];
 }
 
@@ -168,9 +173,9 @@ export class TableEngine {
     if (this.seats[idx] || this.seatOf(player.id)) throw new EngineError('That seat is taken.');
     this.spectators.delete(player.id);
     this.seats[idx] = {
-      seat: idx, playerId: player.id, name: player.name, avatar: player.avatar, balance: stack.balance, reloads: stack.reloads,
+      seat: idx, playerId: player.id, name: player.name, avatar: player.avatar, balance: stack.balance, reloads: stack.reloads, debt: stack.debt ?? 0,
       connected: true, disconnectedAt: null, pending: { ...NO_BETS }, ready: false, lastBet: null,
-      sitOut: false, timeoutPolicy: 'default', leaving: false, seen: [],
+      sitOut: false, timeoutPolicy: 'default', leaving: false, standingUp: false, awayByHost: false, seen: [],
     };
     if (!this.seatOf(this.hostId)) this.hostId = player.id;
     this.say(`${player.name} takes seat ${idx + 1}.`, 'system');
@@ -206,6 +211,12 @@ export class TableEngine {
     }
     if (!this.seatedCount() && !this.hand) { this.phase = 'waiting'; this.clearTimer(); }
     else if (this.phase === 'betting') this.checkStart();
+  }
+
+  /** Seat → rail. The stack stays in the database, so sitting down again restores it. */
+  private standUpNow(s: Seat) {
+    this.spectators.set(s.playerId, { name: s.name });
+    this.removeSeat(s, `${s.name} was moved to the spectators by the host.`);
   }
 
   setConnected(pid: string, connected: boolean) {
@@ -251,7 +262,8 @@ export class TableEngine {
     if (ready) {
       const err = validateInitialBet(s.pending, s.balance, this.limits());
       if (err) throw new EngineError(s.pending.ante ? err : 'Place an Ante first.');
-      s.sitOut = false;
+      if (s.sitOut) this.say(`${s.name} is back.`, 'system');
+      s.sitOut = false; s.awayByHost = false;
     }
     s.ready = ready;
     await this.checkStart();
@@ -557,6 +569,7 @@ export class TableEngine {
       s.ready = false;
       if (s.leaving || (!s.connected && s.disconnectedAt && this.now() - s.disconnectedAt > this.timing.graceMs))
         this.removeSeat(s, `${s.name} leaves the table.`);
+      else if (s.standingUp) this.standUpNow(s);
     }
     if (this.closing) { await this.doClose('The host closed the table.'); return; }
     this.phase = this.seatedCount() ? 'betting' : 'waiting';
@@ -569,16 +582,26 @@ export class TableEngine {
     if (this.inActiveHand(pid)) throw new EngineError('You can reload between hands.');
     if (requiredToStart(this.config.minAnte) <= s.balance) throw new EngineError('You can reload once your stack can no longer cover a minimum hand.');
     const st = await this.store.reloadStack(pid, this.code, this.config.startingBankroll);
+    const borrowed = st.debt - s.debt;
     s.balance = st.balance;
     s.reloads = st.reloads;
+    s.debt = st.debt;
     s.pending = { ...NO_BETS };
-    this.say(`${s.name} reloads to ${formatMoney(st.balance)} in virtual chips.`, 'system');
+    // Just for fun: the dealer keeps a running tab and suggests something to pawn.
+    const out = { balance: st.balance, debt: st.debt };
+    this.say(borrowed > 0 ? debtLine(s.name, borrowed, st.debt, st.reloads) : `${s.name} reloads to ${formatMoney(st.balance)} in virtual chips.`);
+    return out;
   }
 
   async setPrefs(pid: string, p: { timeoutPolicy?: 'default' | 'strategy'; sitOut?: boolean }) {
     const s = this.requireSeat(pid);
     if (p.timeoutPolicy === 'default' || p.timeoutPolicy === 'strategy') s.timeoutPolicy = p.timeoutPolicy;
-    if (typeof p.sitOut === 'boolean') { s.sitOut = p.sitOut; if (p.sitOut) s.ready = false; await this.checkStart(); }
+    if (typeof p.sitOut === 'boolean') {
+      s.sitOut = p.sitOut; s.awayByHost = false;
+      if (p.sitOut) { s.ready = false; s.pending = { ...NO_BETS }; }
+      this.say(p.sitOut ? `${s.name} is sitting out.` : `${s.name} is back.`, 'system');
+      await this.checkStart();
+    }
   }
 
   // ------------------------------------------------------------------ host controls (no access to cards/outcomes)
@@ -595,6 +618,47 @@ export class TableEngine {
       if (this.inActiveHand(target)) { s.leaving = true; await this.autoActForAbsent(); await this.maybeAdvance(); }
       else this.removeSeat(s, `${s.name} was removed by the host.`);
     }
+  }
+
+  /** Host sets a player away (sitting out) or back. The current hand is unaffected; it applies from the next deal. */
+  async setAway(hostId: string, target: string, away: boolean) {
+    this.requireHost(hostId);
+    const s = this.seatOf(target);
+    if (!s) throw new EngineError('That player is not seated.');
+    if (s.sitOut === away) return;
+    s.sitOut = away; s.awayByHost = away;
+    if (away) { s.ready = false; s.pending = { ...NO_BETS }; }
+    const live = this.inActiveHand(target) ? ' after this hand' : '';
+    this.say(away ? `The host set ${s.name} away${live}. They can come back from Settings → Sit out, or the “I’m back” button.` : `The host brought ${s.name} back in.`, 'system');
+    await this.checkStart();
+  }
+
+  /** Host moves a player to the spectators. Mid-hand, they finish the hand first. */
+  async standUp(hostId: string, target: string) {
+    this.requireHost(hostId);
+    if (target === hostId) throw new EngineError('Use Leave to stand up yourself.');
+    const s = this.seatOf(target);
+    if (!s) throw new EngineError('That player is not seated.');
+    if (this.inActiveHand(target)) {
+      s.standingUp = true; s.sitOut = true;
+      this.say(`${s.name} will move to the spectators after this hand.`, 'system');
+      return;
+    }
+    this.standUpNow(s);
+  }
+
+  /** Felt and card backs: cosmetic, so the host may change them at any time, even mid-hand. */
+  async setTheme(hostId: string, p: { felt?: unknown; cardBack?: unknown }) {
+    this.requireHost(hostId);
+    const c = { ...this.config };
+    if (p.felt !== undefined) { if (!isFelt(p.felt)) throw new EngineError('Unknown felt.'); c.felt = p.felt; }
+    if (p.cardBack !== undefined) { if (!isBack(p.cardBack)) throw new EngineError('Unknown card back.'); c.cardBack = p.cardBack; }
+    if (c.felt === this.config.felt && c.cardBack === this.config.cardBack) return;
+    const msg = c.felt !== this.config.felt ? `The host changed the felt to ${FELTS.find((f) => f.id === c.felt)!.name}.`
+      : `The host changed the card backs to ${BACKS.find((b) => b.id === c.cardBack)!.name}.`;
+    this.config = c;
+    await this.store.updateTable(this.code, { config: c });
+    this.say(msg, 'system');
   }
 
   async close(hostId: string) {
@@ -734,7 +798,8 @@ export class TableEngine {
       cards: h ? (canSee ? h.hole.map(intToCard) : [null, null]) : [],
       handName: h && canSee ? handName(evaluate([...h.hole, ...visible])) : undefined,
       result,
-      leaving: s.leaving,
+      debt: s.debt || undefined,
+      leaving: s.leaving, standingUp: s.standingUp || undefined, awayByHost: s.awayByHost || undefined,
     };
   }
 
