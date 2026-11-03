@@ -3,7 +3,7 @@ import { api, session, signIn } from '../api.js';
 import { cardEl } from '../cardView.js';
 import { h, modal, money, toast } from '../dom.js';
 import { resetSocket } from '../net.js';
-import { openHelp } from './help.js';
+import { openHelp, readSideBetFields, sideBetFields } from './help.js';
 import { openSettings } from './settingsModal.js';
 
 export function mountHome(root: HTMLElement, nav: (path: string) => void, opts: { joinCode?: string; message?: string } = {}) {
@@ -110,6 +110,7 @@ function openCreate(nav: (p: string) => void) {
     num('minAnte', 'Minimum Ante ($)', 5, { min: 1, step: 1 }),
     num('maxAnte', 'Maximum Ante ($)', 100, { min: 1, step: 1 }),
     num('maxTrips', 'Maximum Trips+ ($)', 25, { min: 0, step: 1 }),
+    ...sideBetFields(),
     num('decisionSeconds', 'Decision timer (seconds)', 25, { min: 5, max: 120 }),
     h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'isPublic' }), 'List in public tables'),
     h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'allowSpectators', checked: true }), 'Allow spectators'),
@@ -122,7 +123,7 @@ function openCreate(nav: (p: string) => void) {
     try {
       const { code } = await api<{ code: string }>('/api/tables', { method: 'POST', body: JSON.stringify({
         name: String(fd.get('name') ?? ''), maxSeats: Number(fd.get('maxSeats')), startingBankroll: d('startingBankroll'),
-        minAnte: d('minAnte'), maxAnte: d('maxAnte'), maxTrips: d('maxTrips'), decisionSeconds: Number(fd.get('decisionSeconds')),
+        minAnte: d('minAnte'), maxAnte: d('maxAnte'), maxTrips: d('maxTrips'), decisionSeconds: Number(fd.get('decisionSeconds')), ...readSideBetFields(fd),
         isPublic: fd.get('isPublic') === 'on', allowSpectators: fd.get('allowSpectators') === 'on',
       }) });
       m.close();

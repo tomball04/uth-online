@@ -153,3 +153,66 @@ test('solo practice with the training hints', async ({ page }) => {
   await expect(page.locator('.grades')).toBeVisible({ timeout: 10000 });
   await expect(page.locator('.grades .bad')).toHaveCount(0);
 });
+
+test('side bets: bonus panel on a phone, Trips+ requirement, locking, and settlement lines', async ({ browser }) => {
+  const host = await newPlayer(browser, 'Bettor');
+  const phone = await newPlayer(browser, 'Pocket', 'iphone');
+  await signIn(host.page, 'Bettor');
+  await host.page.getByRole('button', { name: 'Create a private table' }).click();
+  await host.page.getByRole('button', { name: 'Create table' }).click();
+  await host.page.waitForURL(/\/table\//);
+  await signIn(phone.page, 'Pocket', new URL(host.page.url()).pathname);
+
+  // Pay tables are visible before betting
+  await host.page.getByRole('button', { name: 'Pay tables' }).click();
+  await expect(host.page.getByRole('dialog')).toContainText('Ultimate Pairs Bonus 4');
+  await expect(host.page.getByRole('dialog')).toContainText('Bad Beat Bonus 01');
+  await host.page.keyboard.press('Escape');
+
+  // Desktop: Bad Beat without Trips+ is refused; then all three bonus bets
+  const h = host.page;
+  await h.locator('.rack .chip.c25').click(); await h.locator('.spot-ante').click();
+  await h.locator('.rack .chip.c5').click();
+  await h.locator('.spot-badBeat').click();
+  await expect(h.locator('.toast-error')).toContainText('Trips+');
+  await h.locator('.spot-trips').click(); await h.locator('.spot-pairs').click(); await h.locator('.spot-badBeat').click();
+  await expect(h.locator('.spot-badBeat .spot-amt')).toHaveText('$5');
+  await expect(h.locator('.totals')).toContainText('On the table $65');
+  await expect(h.locator('.totals')).toContainText('Reserved for 1× Play $25');
+
+  // Phone: bonus circles live in a collapsed panel until opened
+  const p = phone.page;
+  await p.locator('.rack .chip.c25').click(); await p.locator('.spot-ante').click();
+  await expect(p.locator('.spot-pairs')).toBeHidden();
+  await p.locator('.bonus-toggle').click();
+  await p.locator('.rack .chip.c5').click(); await p.locator('.spot-pairs').click();
+  await expect(p.locator('.bonus-toggle')).toContainText('$5');
+  // The other player sees the bonus amounts on the felt
+  await expect(h.locator('.seat:not(.mine):not(.empty-seat) .ms-pairs')).toHaveText('$5');
+
+  await h.getByRole('button', { name: 'Deal me in' }).click();
+  await p.getByRole('button', { name: 'Deal me in' }).click();
+  await expect(h.getByRole('button', { name: /Check/ })).toBeVisible({ timeout: 15000 });
+  // Locked after the deal
+  await expect(h.locator('.spot-pairs')).toBeDisabled();
+  await expect(p.locator('.bonus-panel')).not.toHaveClass(/open/);
+
+  await h.getByRole('button', { name: /^Check/ }).click(); await p.getByRole('button', { name: /^Check/ }).click();
+  await expect(h.getByRole('button', { name: /Play 2×/ })).toBeVisible({ timeout: 15000 });
+  await h.getByRole('button', { name: /^Check/ }).click(); await p.getByRole('button', { name: /^Check/ }).click();
+  await expect(h.getByRole('button', { name: /Play 1×/ })).toBeVisible({ timeout: 15000 });
+  await h.getByRole('button', { name: /^Fold/ }).click(); await p.getByRole('button', { name: /^Fold/ }).click();
+
+  // Every wager appears in the result, and side bets are reported apart from the main game
+  await expect(h.locator('.my-result')).toBeVisible({ timeout: 20000 });
+  for (const w of ['Ante', 'Blind', 'Trips+', 'Ultimate Pairs', 'Bad Beat']) await expect(h.locator('.my-result .lines')).toContainText(w);
+  await expect(h.locator('.my-result .subtotals')).toContainText('Main game −$50');
+  await expect(p.locator('.my-result .lines')).toContainText('Ultimate Pairs');
+  const bal = Number((await h.locator('.seat.mine .pbal').innerText()).replace(/[^0-9.]/g, ''));
+  const sub = await h.locator('.my-result .subtotals').innerText();
+  const m = sub.match(/Bonus bets ([+−])?\$([0-9,]+)/)!;
+  const side = Number(m[2].replace(/,/g, '')) * (m[1] === '−' ? -1 : 1);
+  expect(bal).toBe(1000 - 50 + side);
+  expect(host.errors).toEqual([]);
+  expect(phone.errors).toEqual([]);
+});

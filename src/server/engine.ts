@@ -9,10 +9,26 @@ import type {
   ChatMessage, DecisionRecord, HandSummary, Phase, SeatResult, SeatView, TableConfig, TableView,
 } from '../shared/protocol.js';
 import {
-  LEGAL_DECISIONS, PLAY_MULTIPLIER, TIMEOUT_DEFAULT, decisionLabel, formatMoney, requiredToStart,
-  settle, validateInitialBet, type Decision, type DecisionPhase, type Settlement,
+  LEGAL_DECISIONS, NO_BETS, PLAY_MULTIPLIER, TIMEOUT_DEFAULT, decisionLabel, formatMoney, requiredToStart, sideTotal,
+  dealerQualifies, settle, validateInitialBet, type Decision, type DecisionPhase, type InitialBets, type Settlement,
 } from '../shared/rules.js';
-import { advise, mistakeCost } from '../shared/strategy.js';
+import { advise, mistakeCost, outsFor } from '../shared/strategy.js';
+import { PROGRESSIVE, progressiveHand, resolveProgressive, type ProgressiveEntry, type ProgressiveResolution } from '../shared/progressive.js';
+import {
+  BAD_BEAT_VARIANTS, DEFAULT_BAD_BEAT_VARIANT, DEFAULT_PAIRS_VARIANT, PAIRS_VARIANTS, isBadBeatVariant, isPairsVariant,
+} from '../shared/sidebets.js';
+
+/** Configs saved before side bets existed get the default pay tables and the Trips+ limit. */
+export function withSideBetDefaults(c: TableConfig): TableConfig {
+  return {
+    ...c,
+    maxPairs: c.maxPairs ?? c.maxTrips ?? 2_500,
+    maxBadBeat: c.maxBadBeat ?? c.maxTrips ?? 2_500,
+    pairsVariant: isPairsVariant(c.pairsVariant) ? c.pairsVariant : DEFAULT_PAIRS_VARIANT,
+    badBeatVariant: isBadBeatVariant(c.badBeatVariant) ? c.badBeatVariant : DEFAULT_BAD_BEAT_VARIANT,
+    progressive: c.progressive !== false,
+  };
+}
 import { newId, sha256 } from './rng.js';
 import type { PlayerRow, Store } from './store.js';
 
@@ -31,19 +47,22 @@ export interface EngineHooks {
   analysis(playerId: string, payload: { handId: string; decisions: DecisionRecord[] }): void;
   kicked(playerId: string, reason: string): void;
   closed(reason: string): void;
+  jackpot(amount: number): void;
+  jackpotHit(p: { tableName: string; playerName: string; hand: string; amount: number }): void;
+  jackpotAmount(): number;
 }
 
 interface Seat {
   seat: number; playerId: string; name: string; avatar: string; balance: number; reloads: number;
   connected: boolean; disconnectedAt: number | null;
-  pending: { ante: number; trips: number }; ready: boolean; lastBet: { ante: number; trips: number } | null;
+  pending: InitialBets; ready: boolean; lastBet: InitialBets | null;
   sitOut: boolean; timeoutPolicy: 'default' | 'strategy'; leaving: boolean;
   seen: string[];
 }
 
 interface HandPlayer {
   playerId: string; seat: number; name: string; hole: number[];
-  ante: number; blind: number; trips: number; play: number; folded: boolean;
+  ante: number; blind: number; trips: number; pairs: number; badBeat: number; progressive: number; play: number; folded: boolean;
   acted: boolean; lastAction?: Decision; decisions: DecisionRecord[];
   settlement?: Settlement; best5?: number[];
 }
@@ -83,6 +102,7 @@ export class TableEngine {
     private timing: Timing = DEFAULT_TIMING,
     private now: () => number = Date.now,
   ) {
+    this.config = withSideBetDefaults(config);
     this.seats = Array(6).fill(null);
     this.sweepTimer = setInterval(() => this.run(() => this.sweep()).catch(() => {}), Math.min(5000, timing.graceMs / 2));
     this.sweepTimer.unref?.();
@@ -120,7 +140,11 @@ export class TableEngine {
     this.timer = setTimeout(() => { this.timer = null; this.run(fn).catch((e) => console.error('[engine timer]', e)); }, Math.max(0, ms));
   }
   private clearTimer() { if (this.timer) clearTimeout(this.timer); this.timer = null; this.deadline = null; }
-  private limits() { return { minAnte: this.config.minAnte, maxAnte: this.config.maxAnte, maxTrips: this.config.maxTrips }; }
+  private limits() {
+    const c = this.config;
+    return { minAnte: c.minAnte, maxAnte: c.maxAnte, maxTrips: c.maxTrips, maxPairs: c.maxPairs, maxBadBeat: c.maxBadBeat,
+      pairsVariant: c.pairsVariant, badBeatVariant: c.badBeatVariant, progressiveEnabled: c.progressive };
+  }
   private needsToAct(h: HandPlayer) {
     return DECISION_PHASES.includes(this.phase) && !h.folded && h.play === 0 && !h.acted;
   }
@@ -145,7 +169,7 @@ export class TableEngine {
     this.spectators.delete(player.id);
     this.seats[idx] = {
       seat: idx, playerId: player.id, name: player.name, avatar: player.avatar, balance: stack.balance, reloads: stack.reloads,
-      connected: true, disconnectedAt: null, pending: { ante: 0, trips: 0 }, ready: false, lastBet: null,
+      connected: true, disconnectedAt: null, pending: { ...NO_BETS }, ready: false, lastBet: null,
       sitOut: false, timeoutPolicy: 'default', leaving: false, seen: [],
     };
     if (!this.seatOf(this.hostId)) this.hostId = player.id;
@@ -200,13 +224,13 @@ export class TableEngine {
   }
 
   // ------------------------------------------------------------------ betting
-  async placeBet(pid: string, actionId: string, ante: number, trips: number) {
+  async placeBet(pid: string, actionId: string, bets: InitialBets) {
     const s = this.requireSeat(pid);
     if (this.dedupe(s, actionId)) return;
     if (this.phase !== 'betting') throw new EngineError('Bets can only be placed between hands.');
-    const err = validateInitialBet(ante, trips, s.balance, this.limits());
+    const err = validateInitialBet(bets, s.balance, this.limits());
     if (err) throw new EngineError(err);
-    s.pending = { ante, trips };
+    s.pending = { ante: bets.ante, trips: bets.trips, pairs: bets.pairs, badBeat: bets.badBeat, progressive: bets.progressive };
     s.ready = false;
     this.checkStart();
   }
@@ -215,7 +239,7 @@ export class TableEngine {
     const s = this.requireSeat(pid);
     if (this.dedupe(s, actionId)) return;
     if (this.phase !== 'betting') throw new EngineError('Bets are locked during a hand.');
-    s.pending = { ante: 0, trips: 0 };
+    s.pending = { ...NO_BETS };
     s.ready = false;
     this.checkStart();
   }
@@ -225,7 +249,7 @@ export class TableEngine {
     if (this.dedupe(s, actionId)) return;
     if (this.phase !== 'betting') throw new EngineError('Not in the betting phase.');
     if (ready) {
-      const err = validateInitialBet(s.pending.ante, s.pending.trips, s.balance, this.limits());
+      const err = validateInitialBet(s.pending, s.balance, this.limits());
       if (err) throw new EngineError(s.pending.ante ? err : 'Place an Ante first.');
       s.sitOut = false;
     }
@@ -261,7 +285,7 @@ export class TableEngine {
     if (this.phase !== 'betting') return;
     this.clearTimer();
     const players = this.seats.filter((s): s is Seat => !!s && s.ready && !s.leaving &&
-      !validateInitialBet(s.pending.ante, s.pending.trips, s.balance, this.limits()));
+      !validateInitialBet(s.pending, s.balance, this.limits()));
     if (!players.length) return;
 
     const deck = this.shuffle();
@@ -281,20 +305,24 @@ export class TableEngine {
 
     const id = newId();
     const number = this.handCounter + 1;
-    const balances = await this.store.startHand({
+    const { balances, jackpot } = await this.store.startHand({
       id, tableCode: this.code, handNumber: number,
       deckCommitment: sha256(deck.map(intToCard).join('') + ':' + id),
       dealerCards: dealer.map(intToCard), community: community.map(intToCard),
+      pairsVariant: this.config.pairsVariant, badBeatVariant: this.config.badBeatVariant,
       players: players.map((s) => ({ playerId: s.playerId, seat: s.seat, name: s.name, hole: holes.get(s.playerId)!.map(intToCard),
-        ante: s.pending.ante, blind: s.pending.ante, trips: s.pending.trips })),
+        ante: s.pending.ante, blind: s.pending.ante, trips: s.pending.trips, pairs: s.pending.pairs, badBeat: s.pending.badBeat,
+        progressive: s.pending.progressive })),
     });
+    this.hooks.jackpot(jackpot);
     this.handCounter = number;
     const map = new Map<string, HandPlayer>();
     for (const s of players) {
       s.balance = balances.get(s.playerId)!;
       s.lastBet = { ...s.pending };
       map.set(s.playerId, { playerId: s.playerId, seat: s.seat, name: s.name, hole: holes.get(s.playerId)!,
-        ante: s.pending.ante, blind: s.pending.ante, trips: s.pending.trips, play: 0, folded: false, acted: false, decisions: [] });
+        ante: s.pending.ante, blind: s.pending.ante, trips: s.pending.trips, pairs: s.pending.pairs, badBeat: s.pending.badBeat,
+        progressive: s.pending.progressive, play: 0, folded: false, acted: false, decisions: [] });
     }
     this.hand = { id, number, dealer, community, revealed: 0, players: map, settled: false };
     for (const s of this.seats) if (s) { s.ready = false; }
@@ -370,7 +398,8 @@ export class TableEngine {
       if (s && bal !== null) s.balance = bal;
     }
     if (decision === 'fold') h.folded = true;
-    const record: DecisionRecord = { phase, action: decision, recommended: rec.action, correct: rec.action === decision, reason: rec.reason, timedOut };
+    const record: DecisionRecord = { phase, action: decision, recommended: rec.action, correct: rec.action === decision, reason: rec.reason, timedOut,
+      outs: outsFor(phase, h.hole, community) };
     h.decisions.push(record);
     await this.store.recordDecision(hand.id, h.playerId, record, { play: h.play, folded: h.folded });
     if (mult) this.say(`${h.name} plays ${mult}x (${formatMoney(h.ante * mult)}).${timedOut ? ' (auto)' : ''}`);
@@ -426,30 +455,71 @@ export class TableEngine {
     this.phase = 'showdown';
     const dealerScore = evaluate([...hand.dealer, ...hand.community]);
     hand.dealerScore = dealerScore;
-    const rows = [...hand.players.values()].map((h) => {
-      const playerScore = evaluate([...h.hole, ...hand.community]);
-      const st = settle({ ante: h.ante, blind: h.blind, play: h.play, trips: h.trips, folded: h.folded, playerScore, dealerScore });
-      h.settlement = st;
-      h.best5 = bestFive([...h.hole, ...hand.community]);
-      return {
-        playerId: h.playerId, credit: st.totalCredit, net: st.net, outcome: st.outcome, handName: st.playerHand,
-        handRank: handNameRank(st.playerHand), tripsNet: st.trips.net, play: h.play, folded: h.folded, settlement: st,
-      };
-    });
+    const players = [...hand.players.values()];
     const dealerName = handName(dealerScore);
-    const qualifies = rows.length ? (hand.players.values().next().value!.settlement!.dealerQualifies) : false;
-    const res = await this.store.settleHand(hand.id, this.code, { hand: dealerName, qualifies }, rows);
+    const qualifies = dealerQualifies(dealerScore);
+    // Progressive: the hand is decided by hole cards + flop; the award is resolved against the live meter
+    // inside the settlement transaction, so two tables can never both take the same jackpot.
+    const entries: ProgressiveEntry[] = players.filter((h) => h.progressive > 0)
+      .map((h) => ({ playerId: h.playerId, seat: h.seat, hand: progressiveHand(h.hole, hand.community) }));
+    let resolution: ProgressiveResolution | null = null;
+    const build = (meter: number) => {
+      resolution = resolveProgressive(entries, meter);
+      const rows = players.map((h) => {
+        const playerScore = evaluate([...h.hole, ...hand.community]);
+        const st = settle({
+          ante: h.ante, blind: h.blind, play: h.play, trips: h.trips, pairs: h.pairs, badBeat: h.badBeat, folded: h.folded,
+          playerScore, dealerScore, playerHole: h.hole, dealerHole: hand.dealer,
+          pairsVariant: this.config.pairsVariant, badBeatVariant: this.config.badBeatVariant,
+          progressive: h.progressive, progressiveAward: resolution!.awards.get(h.playerId) ?? null,
+        });
+        h.settlement = st;
+        h.best5 = bestFive([...h.hole, ...hand.community]);
+        return {
+          playerId: h.playerId, credit: st.totalCredit, net: st.net, outcome: st.outcome, handName: st.playerHand,
+          handRank: handNameRank(st.playerHand), tripsNet: st.trips.net, play: h.play, folded: h.folded, settlement: st,
+          pairsNet: st.pairs.net, badBeatNet: st.badBeat.net, pairsCombo: st.pairs.combo ?? null, badBeatCombo: st.badBeat.combo ?? null,
+          pairsMultiplier: st.pairs.multiplier ?? null, badBeatMultiplier: st.badBeat.multiplier ?? null,
+          pairsVariant: h.pairs ? this.config.pairsVariant : null, badBeatVariant: h.badBeat ? this.config.badBeatVariant : null,
+          baseNet: st.baseNet, progressiveNet: st.progressive.net,
+          progressiveHand: h.progressive ? (resolution!.awards.get(h.playerId)?.envy && !resolution!.awards.get(h.playerId)?.base ? 'Envy bonus' : st.progressive.combo ?? null) : null,
+        };
+      });
+      return { rows, jackpotAfter: resolution.meterAfter, hits: resolution.hits.map((x) => ({ ...x, hand: x.hand as string })) };
+    };
+    const res = await this.store.settleHand(hand.id, this.code, { hand: dealerName, qualifies }, build);
     if (!res.applied) console.warn(`[engine] hand ${hand.id} was already settled — skipping payout`);
+    this.hooks.jackpot(res.jackpot);
+    const hitList = (resolution as ProgressiveResolution | null)?.hits ?? [];
+    for (const hit of hitList) {
+      const who = hand.players.get(hit.playerId)!.name;
+      this.hooks.jackpotHit({ tableName: this.config.name, playerName: who, hand: hit.hand, amount: hit.amount });
+    }
     for (const [pid, bal] of res.balances) { const s = this.seatOf(pid); if (s) s.balance = bal; }
     hand.settled = true;
     this.phase = 'settled';
 
     const parts = [...hand.players.values()].map((h) => `${h.name} ${formatMoney(h.settlement!.net, { sign: true })}`);
     this.say(`Dealer has ${dealerName}${qualifies ? '' : ' — does not qualify (Ante pushes)'}. ${parts.join(' · ')}`);
+    for (const hit of hitList)
+      this.say(`${hit.hand === 'Royal Flush' ? 'JACKPOT! ' : ''}${hand.players.get(hit.playerId)!.name} hits a ${hit.hand} on the progressive — ${formatMoney(hit.amount)}.`);
+    for (const h of hand.players.values()) {
+      const st = h.settlement!;
+      if (st.progressive.result === 'win' && !hitList.some((x) => x.playerId === h.playerId))
+        this.say(`${h.name}: Progressive — ${st.progressive.note} (${formatMoney(st.progressive.credit)}).`);
+      if (st.pairs.result === 'win')
+        this.say(`${h.name}: Ultimate Pairs — ${st.pairs.combo} — ${st.pairs.multiplier!.toLocaleString('en-US')}:1 (${formatMoney(st.pairs.net, { sign: true })}).`);
+      if (st.badBeat.result === 'win') {
+        const who = st.badBeat.combo!.startsWith('Dealer') ? 'Dealer’s' : `${h.name}’s`;
+        const hn = st.badBeat.combo!.replace(/^(Dealer|Player) /, '');
+        this.say(`Bad Beat! ${who} ${hn} beaten — ${st.badBeat.multiplier!.toLocaleString('en-US')}:1 for ${h.name} (${formatMoney(st.badBeat.net, { sign: true })}).`);
+      }
+    }
     this.recent.unshift({
       handId: hand.id, handNumber: hand.number, at: this.now(), dealerHand: dealerName, dealerQualifies: qualifies,
       players: [...hand.players.values()].sort((a, b) => a.seat - b.seat)
-        .map((h) => ({ name: h.name, net: h.settlement!.net, outcome: h.settlement!.outcome, handName: h.settlement!.playerHand })),
+        .map((h) => ({ name: h.name, net: h.settlement!.net, outcome: h.settlement!.outcome,
+          handName: h.settlement!.playerHand, sideHits: sideHits(h.settlement!) })),
     });
     this.recent = this.recent.slice(0, 15);
     this.scheduleAnalysis(hand);
@@ -483,7 +553,7 @@ export class TableEngine {
     this.hand = null;
     for (const s of [...this.seats]) {
       if (!s) continue;
-      s.pending = { ante: 0, trips: 0 };
+      s.pending = { ...NO_BETS };
       s.ready = false;
       if (s.leaving || (!s.connected && s.disconnectedAt && this.now() - s.disconnectedAt > this.timing.graceMs))
         this.removeSeat(s, `${s.name} leaves the table.`);
@@ -497,11 +567,11 @@ export class TableEngine {
   async reload(pid: string) {
     const s = this.requireSeat(pid);
     if (this.inActiveHand(pid)) throw new EngineError('You can reload between hands.');
-    if (requiredToStart(this.config.minAnte, 0) <= s.balance) throw new EngineError('You can reload once your stack can no longer cover a minimum hand.');
+    if (requiredToStart(this.config.minAnte) <= s.balance) throw new EngineError('You can reload once your stack can no longer cover a minimum hand.');
     const st = await this.store.reloadStack(pid, this.code, this.config.startingBankroll);
     s.balance = st.balance;
     s.reloads = st.reloads;
-    s.pending = { ante: 0, trips: 0 };
+    s.pending = { ...NO_BETS };
     this.say(`${s.name} reloads to ${formatMoney(st.balance)} in virtual chips.`, 'system');
   }
 
@@ -555,6 +625,11 @@ export class TableEngine {
     if (p.minAnte !== undefined) c.minAnte = int(p.minAnte, 100, 1_000_000, 'minimum ante');
     if (p.maxAnte !== undefined) c.maxAnte = int(p.maxAnte, 100, 1_000_000, 'maximum ante');
     if (p.maxTrips !== undefined) c.maxTrips = int(p.maxTrips, 0, 1_000_000, 'Trips+ limit');
+    if (p.maxPairs !== undefined) c.maxPairs = int(p.maxPairs, 0, 1_000_000, 'Ultimate Pairs limit');
+    if (p.maxBadBeat !== undefined) c.maxBadBeat = int(p.maxBadBeat, 0, 1_000_000, 'Bad Beat limit');
+    if (p.pairsVariant !== undefined) { if (!isPairsVariant(p.pairsVariant)) throw new EngineError('Unknown Ultimate Pairs pay table.'); c.pairsVariant = p.pairsVariant; }
+    if (p.progressive !== undefined) c.progressive = !!p.progressive;
+    if (p.badBeatVariant !== undefined) { if (!isBadBeatVariant(p.badBeatVariant)) throw new EngineError('Unknown Bad Beat pay table.'); c.badBeatVariant = p.badBeatVariant; }
     if (p.startingBankroll !== undefined) c.startingBankroll = int(p.startingBankroll, 1000, 100_000_000, 'starting bankroll');
     if (p.decisionSeconds !== undefined) c.decisionSeconds = c.solo ? int(p.decisionSeconds, 0, 300, 'timer') : int(p.decisionSeconds, 5, 120, 'decision timer');
     if (p.bettingSeconds !== undefined) c.bettingSeconds = int(p.bettingSeconds, 5, 120, 'betting timer');
@@ -562,12 +637,21 @@ export class TableEngine {
       c.maxSeats = int(p.maxSeats, 2, 6, 'seat count');
       if (this.seats.some((s, i) => s && i >= c.maxSeats)) throw new EngineError('Players are seated beyond that seat count.');
     }
-    for (const k of ['minAnte', 'maxAnte', 'maxTrips'] as const) if (c[k] % 100) throw new EngineError('Limits must be whole dollars.');
+    for (const k of ['minAnte', 'maxAnte', 'maxTrips', 'maxPairs', 'maxBadBeat'] as const) if (c[k] % 100) throw new EngineError('Limits must be whole dollars.');
     if (c.maxAnte < c.minAnte) throw new EngineError('Maximum ante must be at least the minimum.');
+    const pairsChanged = c.pairsVariant !== this.config.pairsVariant;
+    const badBeatChanged = c.badBeatVariant !== this.config.badBeatVariant;
+    const progressiveChanged = c.progressive !== this.config.progressive;
     this.config = c;
+    // Switching the progressive off takes back any $5 already placed, without touching the rest of the bet.
+    if (!c.progressive) for (const s of this.seats) if (s?.pending.progressive) s.pending = { ...s.pending, progressive: 0 };
     await this.store.updateTable(this.code, { config: c });
-    for (const s of this.seats) if (s && s.pending.ante && validateInitialBet(s.pending.ante, s.pending.trips, s.balance, this.limits())) {
-      s.pending = { ante: 0, trips: 0 }; s.ready = false;
+    // Pay tables never change silently: announce every change to the whole table.
+    if (pairsChanged) this.say(`Pay table change: Ultimate Pairs is now ${PAIRS_VARIANTS[c.pairsVariant].name}, starting next hand.`);
+    if (progressiveChanged) this.say(c.progressive ? 'The $5 Progressive is now open at this table, starting next hand.' : 'The $5 Progressive is closed at this table, starting next hand.');
+    if (badBeatChanged) this.say(`Pay table change: Bad Beat is now ${BAD_BEAT_VARIANTS[c.badBeatVariant].name}, starting next hand.`);
+    for (const s of this.seats) if (s && s.pending.ante && validateInitialBet(s.pending, s.balance, this.limits())) {
+      s.pending = { ...NO_BETS }; s.ready = false;
     }
     this.say('The host updated the table settings.', 'system');
   }
@@ -609,12 +693,13 @@ export class TableEngine {
         isHost: viewerId === this.hostId,
         legal: this.legalFor(viewerId),
         canBet: !!me && this.phase === 'betting',
-        pending: me?.pending ?? { ante: 0, trips: 0 },
+        pending: me?.pending ?? { ...NO_BETS },
         lastBet: me?.lastBet ?? null,
-        canReload: !!me && !this.inActiveHand(viewerId) && me.balance < requiredToStart(this.config.minAnte, 0),
+        canReload: !!me && !this.inActiveHand(viewerId) && me.balance < requiredToStart(this.config.minAnte),
         timeoutPolicy: me?.timeoutPolicy ?? 'default',
       },
       recent: this.recent,
+      jackpot: { amount: this.hooks.jackpotAmount(), wager: PROGRESSIVE.wager },
     };
   }
 
@@ -622,8 +707,9 @@ export class TableEngine {
     const h = this.hp(s.playerId);
     const showdown = !!this.hand?.settled;
     const own = s.playerId === viewerId;
-    // Showdown policy: non-folded hands are revealed at settlement; folded hands stay private.
-    const canSee = !!h && (own || (showdown && !h.folded));
+    // Showdown policy: once the round has settled, every hand at the table is turned face up, folded ones included.
+    // Until then, players see only their own hole cards.
+    const canSee = !!h && (own || showdown);
     let status: SeatView['status'];
     if (h) status = h.folded ? 'folded' : 'in-hand';
     else if (this.hand && !this.hand.settled) status = s.sitOut ? 'sitting-out' : 'waiting-next';
@@ -631,21 +717,23 @@ export class TableEngine {
     else status = s.ready ? 'ready' : 'betting';
     const result: SeatResult | undefined = h?.settlement ? {
       outcome: h.settlement.outcome, net: h.settlement.net, handName: h.settlement.playerHand,
-      best5: !h.folded || own ? h.best5?.map(intToCard) : undefined,
-      lines: (['ante', 'blind', 'play', 'trips'] as const).filter((k) => h.settlement![k].stake > 0)
-        .map((k) => ({ wager: k, result: h.settlement![k].result, net: h.settlement![k].net, note: h.settlement![k].note })),
+      best5: h.best5?.map(intToCard),
+      lines: (['ante', 'blind', 'play', 'trips', 'pairs', 'badBeat', 'progressive'] as const).filter((k) => h.settlement![k].stake > 0)
+        .map((k) => {
+          const w = h.settlement![k];
+          return { wager: k, result: w.result, net: w.net, stake: w.stake, credit: w.credit, note: w.note, multiplier: w.multiplier, combo: w.combo, variant: w.variant };
+        }),
+      baseNet: h.settlement.baseNet, sideNet: h.settlement.sideNet,
     } : undefined;
-    // Folded players' hand names are private to them.
-    const showResultHand = result && (own || !h!.folded);
     return {
       seat: s.seat, playerId: s.playerId, name: s.name, avatar: s.avatar, balance: s.balance, connected: s.connected,
       isHost: s.playerId === this.hostId, status,
-      bet: h ? { ante: h.ante, blind: h.blind, trips: h.trips, play: h.play }
-             : { ante: s.pending.ante, blind: s.pending.ante, trips: s.pending.trips, play: 0 },
+      bet: h ? { ante: h.ante, blind: h.blind, trips: h.trips, play: h.play, pairs: h.pairs, badBeat: h.badBeat, progressive: h.progressive }
+             : { ante: s.pending.ante, blind: s.pending.ante, trips: s.pending.trips, play: 0, pairs: s.pending.pairs, badBeat: s.pending.badBeat, progressive: s.pending.progressive },
       acted: !!h && !this.needsToAct(h), needsToAct: !!h && this.needsToAct(h), lastAction: h?.lastAction,
       cards: h ? (canSee ? h.hole.map(intToCard) : [null, null]) : [],
       handName: h && canSee ? handName(evaluate([...h.hole, ...visible])) : undefined,
-      result: result ? (showResultHand ? result : { ...result, handName: 'Folded', best5: undefined }) : undefined,
+      result,
       leaving: s.leaving,
     };
   }
@@ -660,6 +748,16 @@ export class TableEngine {
       allowSpectators: this.config.allowSpectators,
     };
   }
+}
+
+/** Public labels for bonus bets that paid. */
+function sideHits(st: Settlement): string[] {
+  const out: string[] = [];
+  if (st.trips.result === 'win') out.push(`Trips+ ${st.trips.multiplier}:1`);
+  if (st.pairs.result === 'win') out.push(`Ultimate Pairs ${st.pairs.multiplier}:1`);
+  if (st.badBeat.result === 'win') out.push(`Bad Beat ${st.badBeat.multiplier}:1`);
+  if (st.progressive.result === 'win') out.push(`Progressive ${st.progressive.combo ?? ''}`.trim());
+  return out;
 }
 
 export function cleanName(s: string, max: number): string {

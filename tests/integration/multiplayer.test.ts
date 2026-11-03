@@ -78,10 +78,11 @@ describe('six-player table on PostgreSQL', () => {
     expect(done.seats.map((x) => x!.bet.play)).toEqual([$(40), $(30), $(20), $(10), 0, 0]);
     expect(done.seats[5]!.status).toBe('folded');      // river timeout -> fold
 
-    // Showdown policy: non-folded hands revealed, folded hands stay private to others
+    // Showdown policy: after settlement every hand is face up, folded ones included
     expect(done.seats[0]!.cards).toEqual(['As', 'Kd']);
-    expect(done.seats[4]!.cards).toEqual([null, null]);
-    expect(done.seats[4]!.result!.handName).toBe('Folded');
+    expect(done.seats[4]!.cards).toEqual(['3s', '5d']);
+    expect(done.seats[4]!.result!.handName).toBe('High Card');
+    expect(done.seats[4]!.result!.outcome).toBe('fold');
     const eliOwn = p[4].state.seats[4]!;
     expect(eliOwn.cards).toEqual(['3s', '5d']);
 
@@ -112,20 +113,27 @@ describe('six-player table on PostgreSQL', () => {
     expect(ben[0].evCost).toBeGreaterThan(0);
     await p[5].waitState(() => p[5].analysis.length > 0, 8000, 'analysis');
     expect(p[5].analysis[0].decisions.every((d) => d.timedOut)).toBe(true);
+    // Fay's timed-out river fold with pocket tens was a mistake: the record carries the dealer's outs.
+    const fayRiver = p[5].analysis[0].decisions.find((d) => d.phase === 'river')!;
+    expect(fayRiver).toMatchObject({ action: 'fold', recommended: 'play1', correct: false });
+    expect(fayRiver.outs).toMatchObject({ kind: 'dealer', combos: 990 });
+    expect(fayRiver.outs!.count).toBeGreaterThan(0);
+    const fayFlop = p[5].analysis[0].decisions.find((d) => d.phase === 'flop')!;
+    expect(fayFlop.outs?.kind).toBe('improve');
     const stats = (await s.api('/api/stats/me', p[1].token)).body.stats;
     expect(stats.hands).toBe(1);
     expect(stats.trips.bets).toBe(1);
     expect(stats.handsWithFriends).toBe(1);
   });
 
-  it('serves a replay that matches the saved hand and hides folded opponents', async () => {
+  it('serves a replay that matches the saved hand, folded hands included', async () => {
     const handId = p[0].state.handId ?? p[0].states.findLast((v) => v.handId)!.handId!;
     const r = await s.api(`/api/hands/${handId}`, p[0].token);
     expect(r.status).toBe(200);
     expect(r.body.hand.community).toEqual(BOARD.split(' '));
     expect(r.body.hand.dealer).toEqual(['Qc', 'Qd']);
     const eli = r.body.hand.players.find((x: any) => x.name === 'Eli');
-    expect(eli.hole).toBeNull();
+    expect(eli.hole).toEqual(['3s', '5d']);
     const outsider = await s.player('Outsider');
     expect((await s.api(`/api/hands/${handId}`, outsider.token)).status).toBe(404);
   });
@@ -219,9 +227,12 @@ describe('abuse, duplicates and stale messages', () => {
     const handId = a.state.handId!;
     const before = await s.store.ledgerSum(a.id, code);
     const r = await s.store.settleHand(handId, code, { hand: 'x', qualifies: true },
-      [{ playerId: a.id, credit: $(999), net: 0, outcome: 'win', handName: 'x', handRank: 0, tripsNet: 0, play: 0, folded: false, settlement: {} }]);
+      (jp) => ({ jackpotAfter: jp + $(999), hits: [], rows: [{ playerId: a.id, credit: $(999), net: 0, outcome: 'win', handName: 'x', handRank: 0, tripsNet: 0, play: 0, folded: false, settlement: {},
+        pairsNet: 0, badBeatNet: 0, pairsCombo: null, badBeatCombo: null, pairsMultiplier: null, badBeatMultiplier: null, pairsVariant: null, badBeatVariant: null, baseNet: 0,
+        progressiveNet: 0, progressiveHand: null }] }));
     expect(r.applied).toBe(false);
     expect(await s.store.ledgerSum(a.id, code)).toBe(before);
+    expect(r.jackpot).toBe(await s.store.getJackpot());   // the meter is untouched by a rejected settlement
   });
 
   it('rejects unauthenticated sockets, non-host moderation and spoofed seats', async () => {
@@ -288,7 +299,7 @@ describe('connections, mid-hand joins and multiple tables', () => {
     expect((await b2.join(code)).seat).toBe(1);
     const r = await b2.waitState((x) => !!x.handId);
     expect(r.seats[1]!.cards).toEqual(myCards);
-    expect(r.seats[1]!.bet).toEqual({ ante: $(10), blind: $(10), trips: $(5), play: $(40) });
+    expect(r.seats[1]!.bet).toEqual({ ante: $(10), blind: $(10), trips: $(5), play: $(40), pairs: 0, badBeat: 0, progressive: 0 });
     expect(r.seats[1]!.connected).toBe(true);
     expect(r.seats[1]!.balance).toBe($(1000) - $(65));
 
@@ -357,8 +368,9 @@ describe('persistence and crash recovery', () => {
     const a = await s.player('Persist');
     const code = await s.createTable(a.token);
     await a.join(code);
-    await a.bet($(10), $(5)); await a.ready();
-    await a.decide('preflop', 'play4');                               // $65 committed, hand in progress
+    const meter0 = await s.store.getJackpot();
+    await a.bet($(10), $(5), 0, 0, $(5)); await a.ready();
+    await a.decide('preflop', 'play4');                               // $70 committed (incl. $5 progressive), hand in progress
     await a.waitState((x) => x.phase === 'flop');
     const token = a.token;
     // "Crash": tear the server down mid-hand without settling. Kill engine timers first.
@@ -367,12 +379,14 @@ describe('persistence and crash recovery', () => {
     const handId = a.state.handId!;
     const hand = await (s.store as any).pool.query('SELECT status FROM hands WHERE id=$1', [handId]);
     expect(hand.rows[0].status).toBe('active');
-    expect(midBalance).toBe($(1000) - $(65));
+    expect(midBalance).toBe($(1000) - $(70));
+    expect(await s.store.getJackpot()).toBe(meter0 + 350);            // contribution added at the deal
     await s.stop();
 
     s = await startServer({ reset: false });
     const status = (await (s.store as any).pool.query('SELECT status FROM hands WHERE id=$1', [handId])).rows[0].status;
     expect(status).toBe('voided');
+    expect(await s.store.getJackpot()).toBe(meter0);                  // voided hand's contribution reversed
     const stack = (await s.store.getStack(a.id, code))!;
     expect(stack.balance).toBe($(1000));
     expect(await s.store.ledgerSum(a.id, code)).toBe(stack.balance);

@@ -65,6 +65,8 @@ export class TableManager {
   chat = new Map<string, ChatMessage[]>();
   private loading = new Map<string, Promise<TableEngine | null>>();
   private pendingBroadcast = new Set<string>();
+  /** Linked progressive meter, shared by every table on this server. Seeded from the store at startup. */
+  jackpot = 0;
 
   constructor(private io: IO, private store: Store, private shuffle: () => number[], private timing: Timing) {}
 
@@ -104,6 +106,16 @@ export class TableManager {
       },
       kicked: (pid: string, reason: string) => {
         for (const s of [...(this.sockets.get(code) ?? [])]) if (s.data.player.id === pid) { s.emit('kicked', { reason }); this.detach(s); }
+      },
+      jackpot: (amount: number) => {
+        if (amount === this.jackpot) return;
+        this.jackpot = amount;
+        for (const c of this.tables.keys()) if (c !== code) this.broadcast(c);
+      },
+      jackpotAmount: () => this.jackpot,
+      jackpotHit: (p: { tableName: string; playerName: string; hand: string; amount: number }) => {
+        // Every table hears about a linked jackpot hit, like the sign over a casino pit.
+        for (const [c, set] of this.sockets) for (const s of set) s.emit('jackpot:hit', { ...p, same: c === code });
       },
       closed: (reason: string) => {
         for (const s of [...(this.sockets.get(code) ?? [])]) { s.emit('table:closed', { reason }); s.data.code = null; }
@@ -199,6 +211,7 @@ export async function createApp(opts: AppOptions) {
     connectionStateRecovery: undefined,
   });
   const manager = new TableManager(io, store, opts.shuffle ?? secureShuffle, timing);
+  manager.jackpot = await store.getJackpot();
 
   const auth = async (token: unknown): Promise<PlayerRow | null> =>
     typeof token === 'string' && token.length >= 20 && token.length <= 100 ? store.playerByTokenHash(sha256(token)) : null;
@@ -252,8 +265,7 @@ export async function createApp(opts: AppOptions) {
     const me = res.locals.player.id as string;
     if (!r || !r.players.some((p) => p.playerId === me)) { res.status(404).json({ error: 'Hand not found.' }); return; }
     if (r.status === 'active') { res.status(409).json({ error: 'Hand still in progress.' }); return; }
-    // Showdown policy applies to replays too: folded opponents' cards stay private.
-    r.players = r.players.map((p) => (p.playerId !== me && p.folded ? { ...p, hole: null, handName: null, settlement: null } : p));
+    // Settled hands are fully face up (folded hands included), matching the table's showdown policy.
     r.decisions = r.decisions.filter((d) => d.playerId === me);
     res.json({ hand: r, you: me });
   }));
@@ -329,7 +341,11 @@ export async function createApp(opts: AppOptions) {
       await e.leave(socket.data.player.id);
       setImmediate(() => manager.detach(socket));
     });
-    on('bet:place', async (e, p) => e.placeBet(socket.data.player.id, obj(p).actionId, obj(p).ante, obj(p).trips ?? 0));
+    on('bet:place', async (e, p) => {
+      const x = obj(p);
+      // Raw values go to the engine; validateInitialBet rejects anything that isn't a whole, non-negative number.
+      await e.placeBet(socket.data.player.id, x.actionId, { ante: x.ante, trips: x.trips ?? 0, pairs: x.pairs ?? 0, badBeat: x.badBeat ?? 0, progressive: x.progressive ?? 0 });
+    });
     on('bet:clear', async (e, p) => e.clearBet(socket.data.player.id, obj(p).actionId));
     on('player:ready', async (e, p) => e.setReady(socket.data.player.id, obj(p).actionId, obj(p).ready !== false));
     on('player:decide', async (e, p) => {

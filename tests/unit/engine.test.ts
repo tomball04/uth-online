@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { cardToInt, intToCard } from '../../src/shared/cards';
 import { evaluate, handName, bestFive, categoryOf } from '../../src/shared/evaluator';
 import { settle, settleCards, validateInitialBet, requiredToStart, formatMoney } from '../../src/shared/rules';
-import { preflopAdvice, flopAdvice, riverAdvice, flopEV, preflopEV, mistakeCost } from '../../src/shared/strategy';
+import { preflopAdvice, flopAdvice, riverAdvice, flopEV, preflopEV, mistakeCost, dealerOuts, improvementOuts, outsFor } from '../../src/shared/strategy';
 
 const C = (s: string) => s.split(' ').filter(Boolean).map(cardToInt);
 const $ = (d: number) => d * 100;
@@ -116,13 +116,19 @@ describe('settlement (all amounts in cents)', () => {
     expect(s.net).toBe(-$(20));
   });
 
-  it('dealer qualifies and player wins with a flush: blind pays 3:2 in exact cents', () => {
-    const s = settleCards(C('Ac 8c'), C('Jh Jd'), C('2c 7d 9c Js 4c'), { ante: $(1), play: $(4) });
+  it('flush pays the Blind 3:2, rounded down to the whole dollar like a casino', () => {
+    const board = C('2c 7d 9c Js 4c');
+    const s = settleCards(C('Ac 8c'), C('Jh Jd'), board, { ante: $(1), play: $(4) });
     expect(s.playerHand).toBe('Flush');
-    expect(s.blind.net).toBe(150);
-    expect(s.ante.net).toBe(100);
-    expect(s.play.net).toBe(400);
-    expect(s.net).toBe(650);
+    expect(s.blind.net).toBe($(1));                 // $1.50 -> $1
+    expect(s.blind.note).toMatch(/rounded down/);
+    expect(s.net).toBe($(6));
+    expect(settleCards(C('Ac 8c'), C('Jh Jd'), board, { ante: $(25), play: $(100) }).blind.net).toBe($(37)); // not $37.50
+    expect(settleCards(C('Ac 8c'), C('Jh Jd'), board, { ante: $(20), play: $(80) }).blind.net).toBe($(30));  // exact, no rounding
+    for (const ante of [1, 5, 7, 25, 35, 99]) {
+      const x = settleCards(C('Ac 8c'), C('Jh Jd'), board, { ante: $(ante), play: $(ante) });
+      expect(x.net % 100).toBe(0);                  // never a half-dollar
+    }
   });
 
   it('tie pushes ante, blind and play', () => {
@@ -169,18 +175,19 @@ describe('settlement (all amounts in cents)', () => {
 });
 
 describe('bet validation and affordability', () => {
-  const limits = { minAnte: $(5), maxAnte: $(100), maxTrips: $(25) };
+  const limits = { minAnte: $(5), maxAnte: $(100), maxTrips: $(25), maxPairs: $(25), maxBadBeat: $(25) };
+  const B = (ante: number, trips = 0, pairs = 0, badBeat = 0) => ({ ante, trips, pairs, badBeat });
   it('reserves Ante + Blind + Trips + 1x Play', () => {
     expect(requiredToStart($(10), $(5))).toBe($(35));
-    expect(validateInitialBet($(10), $(5), $(35), limits)).toBeNull();
-    expect(validateInitialBet($(10), $(5), $(34), limits)).toMatch(/need/);
+    expect(validateInitialBet(B($(10), $(5)), $(35), limits)).toBeNull();
+    expect(validateInitialBet(B($(10), $(5)), $(34), limits)).toMatch(/need/);
   });
   it('enforces limits and whole dollars', () => {
-    expect(validateInitialBet($(1), 0, $(500), limits)).toMatch(/Minimum/);
-    expect(validateInitialBet($(500), 0, $(5000), limits)).toMatch(/Maximum/);
-    expect(validateInitialBet(550, 0, $(500), limits)).toMatch(/whole dollars/);
-    expect(validateInitialBet($(5), -100, $(500), limits)).not.toBeNull();
-    expect(validateInitialBet($(5), $(50), $(500), limits)).toMatch(/Trips/);
+    expect(validateInitialBet(B($(1), 0), $(500), limits)).toMatch(/Minimum/);
+    expect(validateInitialBet(B($(500), 0), $(5000), limits)).toMatch(/Maximum/);
+    expect(validateInitialBet(B(550, 0), $(500), limits)).toMatch(/whole dollars/);
+    expect(validateInitialBet(B($(5), -100), $(500), limits)).not.toBeNull();
+    expect(validateInitialBet(B($(5), $(50)), $(500), limits)).toMatch(/Trips/);
   });
   it('formats money', () => {
     expect(formatMoney(150)).toBe('$1.50');
@@ -251,4 +258,24 @@ describe('strategy', () => {
     expect(m!.exact).toBe(true);
     expect(m!.cost).toBeGreaterThan(0);
   });
+});
+
+describe('outs', () => {
+  it('counts the dealer\'s single-card outs on the river (matches the strategy chart examples)', () => {
+    const a = dealerOuts(C('Ad 3c'), C('Ks 9d 7c 4h 2s'));
+    expect(a.count).toBe(15);                                   // pairing any board card
+    expect(a.byRank).toEqual([{ rank: 'K', count: 3 }, { rank: '9', count: 3 }, { rank: '7', count: 3 }, { rank: '4', count: 3 }, { rank: '2', count: 3 }]);
+    expect(a.combos).toBe(990);
+    const b = dealerOuts(C('6d 3c'), C('Ks 9d 7c 4h 2s'));
+    expect(b.count).toBe(35);                                   // 15 board pairs + A, Q, J, 10, 8
+    expect(riverAdvice(C('Ad 3c'), C('Ks 9d 7c 4h 2s')).action).toBe('play1');
+    expect(riverAdvice(C('6d 3c'), C('Ks 9d 7c 4h 2s')).action).toBe('fold');
+  });
+  it('counts the player\'s outs to improve on the flop', () => {
+    const f = improvementOuts(C('Ac 8c'), C('Kc 7c 2d'));
+    expect(f.count).toBe(15);                                   // 9 clubs + 3 aces + 3 eights
+    expect(f.hitByRiver!).toBeCloseTo(0.541, 2);
+    expect(improvementOuts(C('2c 3d'), C('Kh Ks Kd')).cards).not.toContain('Kc'); // board quads aren't your improvement
+  });
+  it('has no outs before the flop', () => expect(outsFor('preflop', C('Ac Kd'), [])).toBeUndefined());
 });

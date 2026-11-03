@@ -2,8 +2,9 @@ import pg from 'pg';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { DecisionRecord, TableConfig } from '../shared/protocol.js';
+import { PROGRESSIVE } from '../shared/progressive.js';
 import {
-  InsufficientFunds, type HandStart, type PlayerRow, type PlayerSettlementRow, type PlayerStats,
+  InsufficientFunds, JACKPOT_ID, type HandStart, type SettlementBuilder, type PlayerRow, type PlayerSettlementRow, type PlayerStats,
   type RecentHandRow, type ReplayData, type StackRow, type Store, type TableRow,
 } from './store.js';
 
@@ -125,21 +126,30 @@ export class PgStore implements Store {
   async startHand(h: HandStart) {
     return this.tx(async (c) => {
       await c.query(
-        `INSERT INTO hands(id,table_code,hand_number,status,deck_commitment,dealer_cards,community,participant_count)
-         VALUES ($1,$2,$3,'active',$4,$5,$6,$7)`,
-        [h.id, h.tableCode, h.handNumber, h.deckCommitment, JSON.stringify(h.dealerCards), JSON.stringify(h.community), h.players.length]);
+        `INSERT INTO hands(id,table_code,hand_number,status,deck_commitment,dealer_cards,community,participant_count,pairs_variant,bad_beat_variant)
+         VALUES ($1,$2,$3,'active',$4,$5,$6,$7,$8,$9)`,
+        [h.id, h.tableCode, h.handNumber, h.deckCommitment, JSON.stringify(h.dealerCards), JSON.stringify(h.community), h.players.length,
+         h.pairsVariant, h.badBeatVariant]);
       await c.query('UPDATE game_tables SET hand_counter=$2 WHERE code=$1', [h.tableCode, h.handNumber]);
       const balances = new Map<string, number>();
       for (const p of h.players) {
         await c.query(
-          `INSERT INTO hand_players(hand_id,player_id,seat,name,hole,ante,blind,trips) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-          [h.id, p.playerId, p.seat, p.name, JSON.stringify(p.hole), p.ante, p.blind, p.trips]);
-        const total = p.ante + p.blind + p.trips;
+          `INSERT INTO hand_players(hand_id,player_id,seat,name,hole,ante,blind,trips,pairs,bad_beat,progressive) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+          [h.id, p.playerId, p.seat, p.name, JSON.stringify(p.hole), p.ante, p.blind, p.trips, p.pairs, p.badBeat, p.progressive]);
+        const total = p.ante + p.blind + p.trips + p.pairs + p.badBeat + p.progressive;
         const bal = await this.debit(c, p.playerId, h.tableCode, h.id, total, `${h.id}:${p.playerId}:initial`);
         balances.set(p.playerId, bal!);
       }
-      return balances;
+      // Each progressive wager feeds the linked meter in the same transaction as the debit.
+      const bets = h.players.filter((p) => p.progressive > 0).length;
+      const jackpot = (await c.query('UPDATE progressive_meter SET amount=amount+$2, updated_at=now() WHERE id=$1 RETURNING amount',
+        [JACKPOT_ID, bets * PROGRESSIVE.contribution])).rows[0].amount;
+      return { balances, jackpot };
     });
+  }
+
+  async getJackpot() {
+    return (await this.pool.query('SELECT amount FROM progressive_meter WHERE id=$1', [JACKPOT_ID])).rows[0].amount as number;
   }
 
   async wager(handId: string, playerId: string, code: string, amount: number, key: string) {
@@ -154,9 +164,9 @@ export class PgStore implements Store {
 
   async recordDecision(handId: string, playerId: string, d: DecisionRecord, state: { play: number; folded: boolean }) {
     await this.pool.query(
-      `INSERT INTO decisions(hand_id,player_id,phase,action,recommended,correct,timed_out,reason)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING`,
-      [handId, playerId, d.phase, d.action, d.recommended, d.correct, d.timedOut, d.reason]);
+      `INSERT INTO decisions(hand_id,player_id,phase,action,recommended,correct,timed_out,reason,outs)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING`,
+      [handId, playerId, d.phase, d.action, d.recommended, d.correct, d.timedOut, d.reason, d.outs ? JSON.stringify(d.outs) : null]);
     if (state.folded) await this.pool.query('UPDATE hand_players SET folded=true WHERE hand_id=$1 AND player_id=$2', [handId, playerId]);
   }
   async updateDecisionEV(handId: string, playerId: string, phase: string, evCost: number, exact: boolean) {
@@ -164,16 +174,28 @@ export class PgStore implements Store {
       [handId, playerId, phase, evCost, exact]);
   }
 
-  async settleHand(handId: string, code: string, dealer: { hand: string; qualifies: boolean }, rows: PlayerSettlementRow[]) {
+  async settleHand(handId: string, code: string, dealer: { hand: string; qualifies: boolean }, build: SettlementBuilder) {
     return this.tx(async (c) => {
       const balances = new Map<string, number>();
       const h = await c.query('SELECT status FROM hands WHERE id=$1 FOR UPDATE', [handId]);
-      if (h.rows[0]?.status !== 'active') return { applied: false, balances };
+      const meterNow = (await c.query('SELECT amount FROM progressive_meter WHERE id=$1 FOR UPDATE', [JACKPOT_ID])).rows[0].amount as number;
+      if (h.rows[0]?.status !== 'active') return { applied: false, balances, jackpot: meterNow };
+      const { rows, jackpotAfter, hits } = build(meterNow);
+      if (jackpotAfter !== meterNow || hits.length)
+        await c.query(`UPDATE progressive_meter SET amount=$2, hits=hits+$3, last_hit_at=CASE WHEN $3>0 THEN now() ELSE last_hit_at END, updated_at=now() WHERE id=$1`,
+          [JACKPOT_ID, jackpotAfter, hits.length]);
+      for (const x of hits)
+        await c.query(`INSERT INTO progressive_hits(hand_id,player_id,table_code,hand_name,amount,meter_before) VALUES ($1,$2,$3,$4,$5,$6)`,
+          [handId, x.playerId, code, x.hand, x.amount, x.meterBefore]);
       for (const r of rows) {
         await c.query(
-          `UPDATE hand_players SET outcome=$3, hand_name=$4, hand_rank=$5, net=$6, trips_net=$7, settlement=$8, play=$9, folded=$10, settled=true
+          `UPDATE hand_players SET outcome=$3, hand_name=$4, hand_rank=$5, net=$6, trips_net=$7, settlement=$8, play=$9, folded=$10, settled=true,
+             pairs_net=$11, bad_beat_net=$12, pairs_combo=$13, bad_beat_combo=$14, pairs_multiplier=$15, bad_beat_multiplier=$16,
+             pairs_variant=$17, bad_beat_variant=$18, base_net=$19, progressive_net=$20, progressive_hand=$21
            WHERE hand_id=$1 AND player_id=$2`,
-          [handId, r.playerId, r.outcome, r.handName, r.handRank, r.net, r.tripsNet, JSON.stringify(r.settlement), r.play, r.folded]);
+          [handId, r.playerId, r.outcome, r.handName, r.handRank, r.net, r.tripsNet, JSON.stringify(r.settlement), r.play, r.folded,
+           r.pairsNet, r.badBeatNet, r.pairsCombo, r.badBeatCombo, r.pairsMultiplier, r.badBeatMultiplier,
+           r.pairsVariant, r.badBeatVariant, r.baseNet, r.progressiveNet, r.progressiveHand]);
         let bal: number;
         if (r.credit > 0) {
           bal = (await c.query('UPDATE stacks SET balance=balance+$3, updated_at=now() WHERE player_id=$1 AND table_code=$2 RETURNING balance',
@@ -187,7 +209,7 @@ export class PgStore implements Store {
       }
       await c.query(`UPDATE hands SET status='settled', settled_at=now(), dealer_hand=$2, dealer_qualifies=$3 WHERE id=$1`,
         [handId, dealer.hand, dealer.qualifies]);
-      return { applied: true, balances };
+      return { applied: true, balances, jackpot: jackpotAfter };
     });
   }
 
@@ -208,6 +230,9 @@ export class PgStore implements Store {
             [`${h.id}:${d.player_id}:refund`, d.player_id, h.table_code, h.id, amt, bal]);
           refunds++;
         }
+        // The voided hand's progressive contributions come back out of the meter along with the refunds.
+        const prog = (await c.query('SELECT COUNT(*)::int n FROM hand_players WHERE hand_id=$1 AND progressive>0', [h.id])).rows[0].n;
+        if (prog) await c.query('UPDATE progressive_meter SET amount=GREATEST($3, amount-$2) WHERE id=$1', [JACKPOT_ID, prog * PROGRESSIVE.contribution, PROGRESSIVE.seed]);
         await c.query(`UPDATE hands SET status='voided', settled_at=now() WHERE id=$1`, [h.id]);
       });
     }
@@ -216,6 +241,22 @@ export class PgStore implements Store {
 
   async playerStats(pid: string): Promise<PlayerStats> {
     const q = (sql: string) => this.pool.query(sql, [pid]);
+    const side = (stake: string, net: string, combo: string) => Promise.all([
+      q(`SELECT COUNT(*)::int bets, COUNT(*) FILTER (WHERE ${net}>0)::int wins, COALESCE(SUM(${stake}),0) wagered,
+            COALESCE(SUM(${stake}+${net}),0) returned, COALESCE(SUM(${net}),0) net, COALESCE(MAX(${net}) FILTER (WHERE ${net}>0),0) biggest
+         FROM hand_players WHERE player_id=$1 AND settled AND ${stake}>0`),
+      q(`SELECT ${combo} combo, COUNT(*)::int count FROM hand_players WHERE player_id=$1 AND settled AND ${stake}>0 AND ${net}>0
+         GROUP BY ${combo} ORDER BY count DESC`),
+    ]).then(([a, c]) => ({
+      bets: a.rows[0].bets, wins: a.rows[0].wins, wagered: Number(a.rows[0].wagered), returned: Number(a.rows[0].returned),
+      net: Number(a.rows[0].net), biggestPayout: Number(a.rows[0].biggest), combos: c.rows.map((r) => ({ combo: r.combo ?? '—', count: r.count })),
+    }));
+    const [sTrips, sPairs, sBad, sProg, base] = await Promise.all([
+      side('trips', 'trips_net', 'hand_name'), side('pairs', 'pairs_net', 'pairs_combo'), side('bad_beat', 'bad_beat_net', 'bad_beat_combo'),
+      side('progressive', 'progressive_net', 'progressive_hand'),
+      q(`SELECT COALESCE(SUM(COALESCE(base_net, net - COALESCE(trips_net,0))),0) net, COALESCE(SUM(ante+blind+play),0) wagered
+         FROM hand_players WHERE player_id=$1 AND settled`),
+    ]);
     const [agg, best, dec, byPhase, mistakes, trips, friends, stacks, series] = await Promise.all([
       q(`SELECT COUNT(*)::int hands, COALESCE(SUM(net),0) net,
             COUNT(*) FILTER (WHERE outcome='win')::int wins, COUNT(*) FILTER (WHERE outcome='lose')::int losses,
@@ -243,6 +284,8 @@ export class PgStore implements Store {
       byPhase: byPhase.rows,
       commonMistakes: mistakes.rows.map((m) => ({ ...m, evCost: Number(m.ev) })),
       trips: { bets: trips.rows[0].bets, wins: trips.rows[0].wins, net: Number(trips.rows[0].net) },
+      side: { trips: sTrips, pairs: sPairs, badBeat: sBad, progressive: sProg },
+      baseNet: Number(base.rows[0].net), baseWagered: Number(base.rows[0].wagered),
       handsWithFriends: friends.rows[0].n, reloads: stacks.rows[0].reloads, tables: stacks.rows[0].tables,
       series: series.rows.reverse().map((r) => ({ at: new Date(r.at).toISOString(), cumulative: Number(r.cum) })),
     };
@@ -251,14 +294,22 @@ export class PgStore implements Store {
   async recentHands(code: string, limit: number): Promise<RecentHandRow[]> {
     const r = await this.pool.query(
       `SELECT h.id, h.hand_number, h.settled_at, h.dealer_hand, h.dealer_qualifies,
-              json_agg(json_build_object('name',hp.name,'net',hp.net,'outcome',hp.outcome,'handName',hp.hand_name) ORDER BY hp.seat) players
+              json_agg(json_build_object('name',hp.name,'net',hp.net,'outcome',hp.outcome,'handName',hp.hand_name,'folded',hp.folded,
+                'tripsNet',hp.trips_net,'pairsNet',hp.pairs_net,'pairsMult',hp.pairs_multiplier,'badBeatNet',hp.bad_beat_net,'badBeatMult',hp.bad_beat_multiplier)
+                ORDER BY hp.seat) players
        FROM hands h JOIN hand_players hp ON hp.hand_id=h.id
        WHERE h.table_code=$1 AND h.status='settled'
        GROUP BY h.id ORDER BY h.hand_number DESC LIMIT $2`, [code, limit]);
     return r.rows.map((x) => ({
       handId: x.id, handNumber: x.hand_number, at: new Date(x.settled_at).getTime(),
       dealerHand: x.dealer_hand, dealerQualifies: x.dealer_qualifies,
-      players: x.players.map((p: { name: string; net: number | string; outcome: string; handName: string }) => ({ ...p, net: Number(p.net) })),
+      players: x.players.map((p: any) => {
+        const hits: string[] = [];
+        if (Number(p.tripsNet) > 0) hits.push('Trips+');
+        if (Number(p.pairsNet) > 0) hits.push(`Ultimate Pairs ${p.pairsMult}:1`);
+        if (Number(p.badBeatNet) > 0) hits.push(`Bad Beat ${p.badBeatMult}:1`);
+        return { name: p.name, net: Number(p.net), outcome: p.outcome, handName: p.handName, sideHits: hits };
+      }),
     }));
   }
 
@@ -272,14 +323,15 @@ export class PgStore implements Store {
       startedAt: new Date(h.started_at).toISOString(), settledAt: h.settled_at ? new Date(h.settled_at).toISOString() : null,
       dealer: h.dealer_cards, community: h.community, dealerHand: h.dealer_hand, dealerQualifies: h.dealer_qualifies,
       deckCommitment: h.deck_commitment,
+      pairsVariant: h.pairs_variant, badBeatVariant: h.bad_beat_variant,
       players: ps.map((p) => ({
         playerId: p.player_id, name: p.name, seat: p.seat, hole: p.hole, folded: p.folded,
-        ante: p.ante, blind: p.blind, trips: p.trips, play: p.play, net: p.net, outcome: p.outcome,
+        ante: p.ante, blind: p.blind, trips: p.trips, pairs: p.pairs, badBeat: p.bad_beat, progressive: p.progressive, play: p.play, net: p.net, outcome: p.outcome,
         handName: p.hand_name, settlement: p.settlement,
       })),
       decisions: ds.map((d) => ({
         playerId: d.player_id, phase: d.phase, action: d.action, recommended: d.recommended, correct: d.correct,
-        reason: d.reason, timedOut: d.timed_out, evCost: d.ev_cost ?? undefined, evExact: d.ev_exact ?? undefined,
+        reason: d.reason, timedOut: d.timed_out, evCost: d.ev_cost ?? undefined, evExact: d.ev_exact ?? undefined, outs: d.outs ?? undefined,
         at: new Date(d.created_at).toISOString(),
       })),
     };

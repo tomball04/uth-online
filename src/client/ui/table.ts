@@ -1,7 +1,10 @@
 import { cardToInt } from '../../shared/cards.js';
 import type { ChatMessage, DecisionRecord, Reaction, SeatView, TableView } from '../../shared/protocol.js';
 import { REACTIONS } from '../../shared/protocol.js';
-import { BLIND_PAYTABLE, TRIPS_PAYTABLE, requiredToStart, type Decision, type DecisionPhase } from '../../shared/rules.js';
+import { BLIND_PAYTABLE, NO_BETS, TRIPS_PAYTABLE, requiredToStart, sideTotal, type Decision, type DecisionPhase, type InitialBets } from '../../shared/rules.js';
+import { BAD_BEAT_VARIANTS, PAIRS_VARIANTS, previewPairs } from '../../shared/sidebets.js';
+import { PROGRESSIVE, progressiveHand } from '../../shared/progressive.js';
+import type { WagerKey } from '../../shared/protocol.js';
 import { advise } from '../../shared/strategy.js';
 import { session } from '../api.js';
 import { cardEl, setCard } from '../cardView.js';
@@ -11,7 +14,9 @@ import { motionScale, prefs } from '../settings.js';
 import { sfx, unlockAudio } from '../sound.js';
 import { openSettings } from './settingsModal.js';
 import { openReplay } from './replay.js';
-import { openHelp } from './help.js';
+import { openHelp, openPayTables, readSideBetFields, sideBetFields } from './help.js';
+import { outsEl, outsText } from './outs.js';
+import { outsFor } from '../../shared/strategy.js';
 
 const CHIPS = [100, 500, 2500, 10000, 50000];
 const CHIP_CLASS: Record<number, string> = { 100: 'c1', 500: 'c5', 2500: 'c25', 10000: 'c100', 50000: 'c500' };
@@ -36,12 +41,17 @@ const LAYOUTS_TALL: Record<number, [number, number][]> = {
   6: [[11, 58], [15, 77], [36, 92], [64, 92], [85, 77], [89, 58]],
 };
 
+const ALL_WAGERS: WagerKey[] = ['ante', 'blind', 'play', 'trips', 'pairs', 'badBeat', 'progressive'];
+const BETTABLE: WagerKey[] = ['ante', 'trips', 'pairs', 'badBeat', 'progressive'];
+const SIDE_KEYS = ['trips', 'pairs', 'badBeat', 'progressive'] as const;
+const WAGER_NAME: Record<WagerKey, string> = { ante: 'Ante', blind: 'Blind', play: 'Play', trips: 'Trips+', pairs: 'Ultimate Pairs', badBeat: 'Bad Beat', progressive: '$5 Progressive' };
+
 const DECISION_LABEL: Record<Decision, string> = { play4: 'Play 4×', play3: 'Play 3×', play2: 'Play 2×', play1: 'Play 1×', check: 'Check', fold: 'Fold' };
 const MULT: Partial<Record<Decision, number>> = { play4: 4, play3: 3, play2: 2, play1: 1 };
 
 interface SeatEls {
   root: HTMLElement; plate: HTMLElement; avatar: HTMLElement; name: HTMLElement; bal: HTMLElement; status: HTMLElement;
-  cards: HTMLElement[]; spots: Record<'trips' | 'ante' | 'blind' | 'play', HTMLElement>; handName: HTMLElement; float: HTMLElement;
+  cards: HTMLElement[]; spots: Record<WagerKey, HTMLElement>; handName: HTMLElement; float: HTMLElement; gem: HTMLElement;
 }
 
 export function mountTable(root: HTMLElement, code: string, onExit: (msg?: string) => void) {
@@ -51,13 +61,14 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
   let prev: TableView | null = null;
   let clockOffset = 0;
   let chip = 2500;
-  let draft = { ante: 0, trips: 0 };
+  let draft: InitialBets = { ...NO_BETS };
   let draftDirty = false;
   let betTimer: number | null = null;
   let chat: ChatMessage[] = [];
   const muted = new Set<string>(JSON.parse(localStorage.getItem('uth.muted') ?? '[]'));
   const analysis = new Map<string, DecisionRecord[]>();
-  const sessionStats = { hands: 0, net: 0, decisions: 0, correct: 0, evLostCents: 0, series: [] as number[] };
+  const sessionStats = { hands: 0, net: 0, baseNet: 0, decisions: 0, correct: 0, evLostCents: 0, series: [] as number[],
+    side: { trips: { bets: 0, wins: 0, net: 0 }, pairs: { bets: 0, wins: 0, net: 0 }, badBeat: { bets: 0, wins: 0, net: 0 }, progressive: { bets: 0, wins: 0, net: 0 } } };
   let panel: 'chat' | 'table' = 'chat';
   let panelOpenMobile = false;
   let unread = 0;
@@ -66,12 +77,16 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
   // ---------------------------------------------------------------- skeleton
   const tableName = h('span', { class: 'tname' });
   const statusPill = h('span', { class: 'conn', hidden: true }, 'Reconnecting…');
+  const jackpotAmt = h('b', { class: 'jp-amt' });
+  const jackpotSign = h('button', { class: 'jackpot', title: 'Five Card Progressive — linked jackpot. Tap for the pay table.', hidden: true,
+    onclick: () => view && openPayTables(view.config, view.jackpot?.amount) }, h('span', { class: 'jp-label' }, 'Progressive'), jackpotAmt);
+  let shownJackpot = 0;
   const hostBtn = h('button', { class: 'ghost', onclick: () => openHostMenu(), hidden: true }, 'Host');
   const chatBtn = h('button', { class: 'ghost panel-toggle', onclick: () => togglePanel('chat') }, 'Chat');
   const top = h('header', { class: 'tbar' },
     h('button', { class: 'ghost', onclick: () => leave() }, '← Lobby'),
     h('div', { class: 'tbar-title' }, tableName, h('button', { class: 'code', title: 'Copy invitation link', onclick: () => invite() }, code)),
-    statusPill,
+    statusPill, jackpotSign,
     h('div', { class: 'tbar-actions' },
       h('button', { class: 'ghost', onclick: () => invite() }, 'Invite'),
       chatBtn,
@@ -112,9 +127,25 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
   const myHandName = h('div', { class: 'my-hn' });
   const hint = h('div', { class: 'hint', hidden: true });
   const timerBar = h('div', { class: 'timer' }, h('i'));
-  const spotEls = {
-    trips: spot('Trips+', 'trips'), ante: spot('Ante', 'ante'), blind: spot('Blind', 'blind'), play: spot('Play', 'play'),
+  const spotEls: Record<WagerKey, HTMLElement> = {
+    ante: spot('Ante', 'ante'), blind: spot('Blind', 'blind'), play: spot('Play', 'play'),
+    trips: spot('Trips+', 'trips', true), pairs: spot('Ultimate Pairs', 'pairs', true), badBeat: spot('Bad Beat', 'badBeat', true),
+    progressive: spot('$5 Progressive', 'progressive', true),
   };
+  spotEls.progressive.title = 'Fixed $5 bet. Tap to add or remove — the chip you have selected does not matter.';
+  // Side bets sit in their own smaller row; on phones they fold into one expandable Bonus bets panel.
+  const bonusToggle = h('button', { class: 'bonus-toggle', 'aria-expanded': 'false', onclick: () => {
+    const open = !bonusPanel.classList.contains('open');
+    bonusPanel.classList.toggle('open', open);
+    bonusToggle.setAttribute('aria-expanded', String(open));
+  } });
+  const bonusPanel = h('div', { class: 'bonus-panel' },
+    bonusToggle,
+    h('div', { class: 'bonus-body' },
+      h('div', { class: 'bonus-spots' }, spotEls.trips, spotEls.pairs, spotEls.badBeat, spotEls.progressive),
+      h('button', { class: 'link paytable-link', onclick: () => view && openPayTables(view.config, view.jackpot?.amount) }, 'Pay tables')));
+  const totals = h('div', { class: 'totals' });
+  const bonusFlash = h('div', { class: 'bonus-flash', hidden: true, role: 'status' });
   const rack = h('div', { class: 'rack', role: 'radiogroup', 'aria-label': 'Chip value' },
     ...CHIPS.map((c) => h('button', { class: `chip ${CHIP_CLASS[c]}`, role: 'radio', 'aria-label': `$${CHIP_LABEL[c]} chip`, 'data-v': c, onclick: () => selectChip(c) }, h('span', {}, CHIP_LABEL[c]))));
   const controls = h('div', { class: 'controls' });
@@ -124,8 +155,10 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     h('div', { class: 'dock-hand' }, h('div', { class: 'cards-row' }, ...myCards), myHandName),
     h('div', { class: 'dock-mid' },
       timerBar, dockMsg,
-      h('div', { class: 'spots' }, spotEls.trips, spotEls.ante, spotEls.blind, spotEls.play),
-      hint, result),
+      h('div', { class: 'bet-layout' },
+        h('div', { class: 'spots' }, spotEls.ante, spotEls.blind, spotEls.play),
+        bonusPanel),
+      totals, bonusFlash, hint, result),
     h('div', { class: 'dock-right' }, rack, controls));
 
   // Side panel
@@ -147,15 +180,20 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
   selectChip(chip);
 
   // ---------------------------------------------------------------- builders
-  function spot(label: string, key: string) {
-    return h('button', { class: `spot spot-${key}`, 'data-k': key, onclick: () => onSpot(key as 'ante' | 'trips') },
+  function spot(label: string, key: WagerKey, bonus = false) {
+    return h('button', { class: `spot spot-${key} ${bonus ? 'bonus' : ''}`, 'data-k': key, 'aria-label': label, onclick: () => onSpot(key) },
       h('span', { class: 'spot-label' }, label), h('span', { class: 'spot-amt' }));
   }
 
   function makeSeat(i: number): SeatEls {
     const cards = [cardEl(null, 'empty sm'), cardEl(null, 'empty sm')];
-    const mk = (k: string) => h('div', { class: `mini-spot ms-${k}`, title: k[0].toUpperCase() + k.slice(1) });
-    const spots = { trips: mk('trips'), ante: mk('ante'), blind: mk('blind'), play: mk('play') };
+    const mk = (k: WagerKey, title: string) => h('div', { class: `mini-spot ms-${k}`, title });
+    const spots: Record<WagerKey, HTMLElement> = {
+      ante: mk('ante', 'Ante'), blind: mk('blind', 'Blind'), play: mk('play', 'Play'),
+      trips: mk('trips', 'Trips+'), pairs: mk('pairs', 'Ultimate Pairs'), badBeat: mk('badBeat', 'Bad Beat'),
+      progressive: mk('progressive', '$5 Progressive'),
+    };
+    const gem = h('div', { class: 'gem', hidden: true });
     const avatar = h('div', { class: 'avatar' });
     const name = h('div', { class: 'pname' });
     const bal = h('div', { class: 'pbal' });
@@ -165,8 +203,9 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     const plate = h('div', { class: 'plate' }, avatar, h('div', { class: 'pinfo' }, name, bal), status);
     const root = h('div', { class: 'seat empty-seat', 'data-seat': i },
       h('div', { class: 'cards-row' }, ...cards), handName,
-      h('div', { class: 'mini-spots' }, spots.trips, spots.ante, spots.blind, spots.play),
-      plate, float);
+      h('div', { class: 'mini-bonus' }, spots.trips, spots.pairs, spots.badBeat, spots.progressive),
+      h('div', { class: 'mini-spots' }, spots.ante, spots.blind, spots.play),
+      plate, float, gem);
     root.addEventListener('click', (e) => {
       if (!view) return;
       const seat = Number(root.dataset.realSeat);
@@ -174,7 +213,7 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
       if (!sv && view.you.role === 'spectator') sit(seat);
       else if (sv && sv.playerId !== me.id && (e.target as HTMLElement).closest('.plate')) seatMenu(sv);
     });
-    return { root, plate, avatar, name, bal, status, cards, spots, handName, float };
+    return { root, plate, avatar, name, bal, status, cards, spots, handName, float, gem };
   }
 
   // ---------------------------------------------------------------- socket wiring
@@ -194,6 +233,12 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
   sock.on('hand:analysis', handlers.analysis);
   sock.on('table:closed', handlers.closed);
   sock.on('kicked', handlers.kicked);
+  const onJackpotHit = (p: { tableName: string; playerName: string; hand: string; amount: number; same: boolean }) => {
+    // Linked jackpot: every table hears about it. Your own table already sees it in the hand result.
+    if (p.same) return;
+    toast(`${p.hand === 'Royal Flush' ? 'Jackpot! ' : ''}${p.playerName} hit a ${p.hand} on the progressive at ${p.tableName} — ${money(p.amount)}.`, 'info');
+  };
+  sock.on('jackpot:hit', onJackpotHit);
   const offStatus = onStatus((s) => { statusPill.hidden = s === 'connected'; statusPill.textContent = s === 'offline' ? 'Offline — refresh to retry' : 'Reconnecting…'; });
   setCurrentTable(code);
 
@@ -228,6 +273,7 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     document.removeEventListener('keydown', keyHandler);
     mq.removeEventListener('change', onMq);
     sock.off('table:state', handlers.state);
+    sock.off('jackpot:hit', onJackpotHit);
     sock.off('chat:message', handlers.chat);
     sock.off('chat:history', handlers.history);
     sock.off('chat:reaction', handlers.reaction);
@@ -253,6 +299,7 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     hostBtn.hidden = !v.you.isHost || v.config.solo;
     screen.classList.toggle('solo', v.config.solo);
     screen.dataset.phase = v.phase;
+    renderJackpot(v);
 
     // --- seats
     const n = v.config.maxSeats;
@@ -288,6 +335,8 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     highlight(v);
 
     if (newHand && !first) animateDeal(v);
+    // Bonus bets lock at the deal, so the phone panel folds away to give the table room.
+    if (v.phase !== 'betting' && bonusPanel.classList.contains('open')) { bonusPanel.classList.remove('open'); bonusToggle.setAttribute('aria-expanded', 'false'); }
     if (v.phase === 'settled' && prev?.phase !== 'settled' && !first) onSettled(v);
     if (v.phase === 'betting' && prev && prev.phase !== 'betting') { draft = { ...v.you.pending }; draftDirty = false; result.hidden = true; }
     if (first || (!draftDirty && v.phase === 'betting')) draft = { ...v.you.pending };
@@ -352,16 +401,21 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
       updateCard(el.cards[i], c, flip, i * 120);
     });
     if (!s.cards.length) el.cards.forEach((c) => clearCard(c));
-    el.handName.textContent = s.result ? (s.result.handName === 'Folded' ? '' : s.result.handName) : (s.playerId === me.id ? '' : s.handName ?? '');
+    el.handName.textContent = s.result ? `${s.result.handName}${s.result.outcome === 'fold' ? ' (folded)' : ''}` : (s.playerId === me.id ? '' : s.handName ?? '');
 
     // spots + chip animations on increases
-    for (const k of ['trips', 'ante', 'blind', 'play'] as const) {
-      const amt = s.bet[k];
-      const was = p && p.playerId === s.playerId ? p.bet[k] : 0;
+    for (const k of ALL_WAGERS) {
+      const amt = s.bet[k] ?? 0;
+      const was = p && p.playerId === s.playerId ? (p.bet[k] ?? 0) : 0;
       el.spots[k].textContent = amt ? money(amt) : '';
       el.spots[k].classList.toggle('on', amt > 0);
       if (!first && amt > was && (k !== 'blind')) flyChip(el.plate, el.spots[k], amt);
     }
+    // Bonus gem: visible to everyone only once the result is public; never reveals a folded hand's combination.
+    const hits = s.result?.lines.filter((l) => (l.wager === 'pairs' || l.wager === 'badBeat' || l.wager === 'progressive') && l.result === 'win') ?? [];
+    el.gem.hidden = !hits.length;
+    el.gem.textContent = hits.map((l) => l.wager === 'progressive' ? `Progressive ${money(l.credit)}`
+      : (l.wager === 'pairs' ? 'Pairs' : 'Bad Beat') + (l.multiplier ? ` ${l.multiplier.toLocaleString('en-US')}:1` : '')).join(' · ');
     if (!first && p && s.lastAction && s.lastAction !== p.lastAction && s.lastAction !== 'check' && s.lastAction !== 'fold') sfx.chip();
   }
 
@@ -410,14 +464,20 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     if (v.phase !== 'settled') return;
     const mine = v.you.seat !== null ? v.seats[v.you.seat] : null;
     const r = mine?.result;
-    if (r?.best5 && r.net >= 0 && r.outcome !== 'fold') {
-      const set = new Set(r.best5);
+    if (!r) return;
+    const markMine = () => {
+      const set = new Set(r.best5 ?? []);
       [...community, ...myCards].forEach((c) => { if (set.has(c.dataset.card ?? '')) c.classList.add('hl'); });
-      if (mine) seatEls.find((s) => s.root.dataset.realSeat === String(mine.seat))?.cards.forEach((c) => c.classList.add('hl'));
-    } else if (v.dealer.best5 && r && r.net < 0 && r.outcome !== 'fold') {
-      const set = new Set(v.dealer.best5);
-      [...community, ...dealerCards].forEach((c) => { if (set.has(c.dataset.card ?? '')) c.classList.add('hl-dealer'); });
-    }
+      seatEls.find((x) => x.root.dataset.realSeat === String(mine!.seat))?.cards.forEach((c) => { if (set.has(c.dataset.card ?? '')) c.classList.add('hl'); });
+    };
+    const markDealer = () => {
+      const set = new Set(v.dealer.best5 ?? []);
+      [...community, ...dealerCards].forEach((c) => { if (set.has(c.dataset.card ?? '') && !c.classList.contains('hl')) c.classList.add('hl-dealer'); });
+    };
+    // A Bad Beat highlights both the winning and the losing combination.
+    if (r.lines.some((l) => l.wager === 'badBeat' && l.result === 'win')) { markMine(); markDealer(); return; }
+    if (r.outcome === 'win' || r.outcome === 'push') markMine();
+    else if (r.outcome === 'lose') markDealer();
   }
 
   // ---------------------------------------------------------------- dock
@@ -432,15 +492,34 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
 
     // Spots show either the live hand's bets or the draft during betting
     const betting = v.phase === 'betting' && !!s;
-    const amounts = betting ? { trips: draft.trips, ante: draft.ante, blind: draft.ante, play: 0 } : s ? s.bet : { trips: 0, ante: 0, blind: 0, play: 0 };
-    for (const k of ['trips', 'ante', 'blind', 'play'] as const) {
+    const amounts: Record<WagerKey, number> = betting
+      ? { ante: draft.ante, blind: draft.ante, play: 0, trips: draft.trips, pairs: draft.pairs, badBeat: draft.badBeat, progressive: draft.progressive }
+      : s ? s.bet : { ante: 0, blind: 0, play: 0, trips: 0, pairs: 0, badBeat: 0, progressive: 0 };
+    spotEls.progressive.hidden = !v.config.progressive && !amounts.progressive;
+    const editable = (k: WagerKey) => betting && s!.status !== 'ready' && BETTABLE.includes(k);
+    for (const k of ALL_WAGERS) {
       const el = spotEls[k];
       (el.querySelector('.spot-amt') as HTMLElement).textContent = amounts[k] ? money(amounts[k]) : '';
       el.classList.toggle('on', amounts[k] > 0);
-      el.classList.toggle('clickable', betting && (k === 'ante' || k === 'trips'));
-      (el as HTMLButtonElement).disabled = !(betting && (k === 'ante' || k === 'trips'));
+      el.classList.toggle('clickable', editable(k));
+      (el as HTMLButtonElement).disabled = !editable(k);
     }
+    const sideSum = amounts.trips + amounts.pairs + amounts.badBeat + amounts.progressive;
+    bonusToggle.replaceChildren(h('span', {}, 'Bonus bets'), h('b', {}, sideSum ? money(sideSum) : 'none'));
     rack.hidden = !betting;
+
+    // Committed vs reserved: everything on the table, plus what must stay free for a 1× Play.
+    if (s) {
+      const committed = amounts.ante + amounts.blind + amounts.play + sideSum;
+      const reserve = (betting || (inHand && !s.bet.play && s.status !== 'folded' && !s.result)) ? amounts.ante : 0;
+      totals.hidden = !committed;
+      totals.replaceChildren();
+      append(totals, [
+        h('span', {}, 'On the table ', h('b', {}, money(committed))),
+        reserve ? h('span', {}, 'Reserved for 1× Play ', h('b', {}, money(reserve))) : null,
+        h('span', {}, betting ? 'Free after bets ' : 'Stack ', h('b', {}, money(betting ? s.balance - committed - reserve : s.balance)))]);
+    } else totals.hidden = true;
+    renderPairsFlash(v, s);
 
     // Message line
     let msg = '';
@@ -448,10 +527,10 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
       const free = v.seats.some((x) => !x);
       msg = free ? 'You are watching. Tap an open seat to join the table.' : 'You are watching this table.';
     } else if (v.phase === 'betting') {
-      const need = requiredToStart(Math.max(draft.ante, v.config.minAnte), draft.trips);
+      const need = requiredToStart(Math.max(draft.ante, v.config.minAnte), sideTotal(draft));
       msg = s.status === 'ready' ? 'Ready — waiting for the others.' :
-        s.balance < requiredToStart(v.config.minAnte, 0) ? 'Your stack can’t cover a minimum hand.' :
-        draft.ante ? `Ante ${money(draft.ante)} + Blind ${money(draft.ante)}${draft.trips ? ` + Trips ${money(draft.trips)}` : ''}. Keep ${money(draft.ante)} for the Play bet.` :
+        s.balance < requiredToStart(v.config.minAnte) ? 'Your stack can’t cover a minimum hand.' :
+        draft.ante ? 'Add bonus bets if you like, then deal in. Bonus bets lock when the cards come out.' :
         `Choose a chip, then tap Ante. Limits ${money(v.config.minAnte)}–${money(v.config.maxAnte)}. You need ${money(need)} free.`;
     } else if (s.status === 'waiting-next') msg = 'You’re in from the next hand.';
     else if (v.phase === 'settled') msg = '';
@@ -467,7 +546,7 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     } else if (v.phase === 'betting') {
       if (v.you.canReload) controls.append(h('button', { class: 'btn', onclick: reload }, `Reload ${money(v.config.startingBankroll)}`));
       if (v.you.lastBet && s.status !== 'ready') controls.append(h('button', { class: 'btn', onclick: rebet }, 'Rebet'));
-      if (draft.ante || draft.trips) controls.append(h('button', { class: 'btn', disabled: s.status === 'ready', onclick: clearBets }, 'Clear'));
+      if (draft.ante || sideTotal(draft)) controls.append(h('button', { class: 'btn', disabled: s.status === 'ready', onclick: clearBets }, 'Clear'));
       if (s.status === 'ready') controls.append(h('button', { class: 'btn', onclick: () => setReady(false) }, 'Not ready'));
       else controls.append(h('button', { class: 'btn gold', disabled: !draft.ante, onclick: readyUp }, v.config.solo ? 'Deal' : 'Deal me in'));
     } else if (s.needsToAct) {
@@ -484,7 +563,10 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     // Trainer hint
     const rec = s && s.needsToAct ? trainerAdvice(v, s) : null;
     hint.hidden = !(rec && prefs.get().trainer === 'training');
-    if (rec && !hint.hidden) hint.replaceChildren(h('b', {}, `Suggested: ${DECISION_LABEL[rec.action]}. `), rec.reason);
+    if (rec && !hint.hidden) {
+      const o = outsFor(v.phase as DecisionPhase, (s!.cards as string[]).map(cardToInt), v.community.filter((c): c is string => !!c).map(cardToInt));
+      hint.replaceChildren(h('b', {}, `Suggested: ${DECISION_LABEL[rec.action]}. `), rec.reason, o ? h('div', { class: 'outs' }, outsText(o)) : '');
+    }
   }
 
   let adviceCache: { key: string; a: ReturnType<typeof advise> } | null = null;
@@ -526,19 +608,29 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     rack.querySelectorAll('.chip').forEach((c) => { const on = Number((c as HTMLElement).dataset.v) === v; c.classList.toggle('sel', on); c.setAttribute('aria-checked', String(on)); });
   }
 
-  function onSpot(k: 'ante' | 'trips') {
-    if (!view || view.phase !== 'betting') return;
+  function onSpot(k: WagerKey) {
+    if (!view || view.phase !== 'betting' || !BETTABLE.includes(k)) return;
     const s = myView();
     if (!s || s.status === 'ready') return;
-    const next = { ...draft, [k]: draft[k] + chip };
-    if (k === 'ante' && next.ante > view.config.maxAnte) return toast(`The maximum Ante here is ${money(view.config.maxAnte)}.`, 'error');
-    if (k === 'trips' && next.trips > view.config.maxTrips) return toast(`The maximum Trips+ bet here is ${money(view.config.maxTrips)}.`, 'error');
-    if (requiredToStart(next.ante, next.trips) > s.balance)
-      return toast(`That needs ${money(requiredToStart(next.ante, next.trips))} free: Ante, Blind${next.trips ? ', Trips+' : ''} and a 1× Play reserve.`, 'error');
+    const c = view.config;
+    const key = k as keyof InitialBets;
+    if (k === 'progressive' && !c.progressive) return toast('The progressive is not offered at this table.', 'error');
+    if (k === 'progressive' && draft.progressive) {
+      // Tapping a placed progressive takes it back, as a dealer would before the deal.
+      draft = { ...draft, progressive: 0 }; draftDirty = true; sfx.chip(); renderDock(view); scheduleBetSync(); return;
+    }
+    const add = k === 'progressive' ? PROGRESSIVE.wager : chip;
+    const next: InitialBets = { ...draft, [key]: draft[key] + add };
+    const max: Record<keyof InitialBets, number> = { ante: c.maxAnte, trips: c.maxTrips, pairs: c.maxPairs, badBeat: c.maxBadBeat, progressive: PROGRESSIVE.wager };
+    if (next[key] > max[key]) return toast(`The maximum ${WAGER_NAME[k]} bet here is ${money(max[key])}.`, 'error');
+    if (k === 'badBeat' && !draft.trips && BAD_BEAT_VARIANTS[c.badBeatVariant].requires.includes('trips'))
+      return toast('Bad Beat needs a Trips+ bet at this table. Place Trips+ first.', 'error');
+    const need = requiredToStart(next.ante, sideTotal(next));
+    if (need > s.balance) return toast(`That needs ${money(need)} free: Ante, Blind, bonus bets and a 1× Play reserve.`, 'error');
     draft = next;
     draftDirty = true;
     sfx.chip();
-    flyChip(rack.querySelector('.chip.sel') as HTMLElement, spotEls[k], chip);
+    flyChip(rack.querySelector('.chip.sel') as HTMLElement, spotEls[k], add);
     if (k === 'ante') setTimeout(() => flyChip(rack.querySelector('.chip.sel') as HTMLElement, spotEls.blind, chip), 70);
     renderDock(view);
     scheduleBetSync();
@@ -548,19 +640,20 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     if (betTimer) clearTimeout(betTimer);
     betTimer = window.setTimeout(syncBet, 250);
   }
+  const same = (a: InitialBets, b: InitialBets) => a.ante === b.ante && a.trips === b.trips && a.pairs === b.pairs && a.badBeat === b.badBeat && a.progressive === b.progressive;
   async function syncBet(): Promise<boolean> {
     betTimer = null;
     if (!draftDirty) return true;
-    if (draft.ante === 0 && draft.trips === 0) { draftDirty = false; return (await call('bet:clear', { actionId: actionId() })).ok; }
-    if (draft.ante === 0) { toast('Place an Ante to play. Trips+ is an optional side bet.', 'info'); return false; }
+    if (draft.ante === 0 && sideTotal(draft) === 0) { draftDirty = false; return (await call('bet:clear', { actionId: actionId() })).ok; }
+    if (draft.ante === 0) { toast('Place an Ante to play. Bonus bets ride alongside a hand.', 'info'); return false; }
     const sent = { ...draft };
-    const r = await call('bet:place', { actionId: actionId(), ante: sent.ante, trips: sent.trips });
-    if (draft.ante === sent.ante && draft.trips === sent.trips) draftDirty = false;
-    if (!r.ok) { toast(r.error, 'error'); draft = { ...(view?.you.pending ?? { ante: 0, trips: 0 }) }; draftDirty = false; if (view) renderDock(view); }
+    const r = await call('bet:place', { actionId: actionId(), ...sent });
+    if (same(draft, sent)) draftDirty = false;
+    if (!r.ok) { toast(r.error, 'error'); draft = { ...(view?.you.pending ?? NO_BETS) }; draftDirty = false; if (view) renderDock(view); }
     return r.ok;
   }
   async function clearBets() {
-    draft = { ante: 0, trips: 0 }; draftDirty = false;
+    draft = { ...NO_BETS }; draftDirty = false;
     if (betTimer) clearTimeout(betTimer);
     const r = await call('bet:clear', { actionId: actionId() });
     if (!r.ok) toast(r.error, 'error');
@@ -698,9 +791,21 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
         h('dl', { class: 'kv' },
           h('dt', {}, 'Hands'), h('dd', {}, String(sessionStats.hands)),
           h('dt', {}, 'Result'), h('dd', { class: sessionStats.net < 0 ? 'neg' : 'pos' }, money(sessionStats.net, true)),
+          h('dt', {}, 'Main game'), h('dd', { class: sessionStats.baseNet < 0 ? 'neg' : 'pos' }, money(sessionStats.baseNet, true)),
           h('dt', {}, 'Strategy'), h('dd', {}, acc === null ? '—' : `${acc}% of ${sessionStats.decisions} decisions`),
           h('dt', {}, 'EV given up'), h('dd', {}, sessionStats.evLostCents ? money(-sessionStats.evLostCents) : '—')),
         spark),
+      h('section', {},
+        h('h3', {}, 'Bonus bets this session'),
+        h('table', { class: 'mini-table' },
+          h('tr', {}, h('th', {}), h('th', {}, 'Bets'), h('th', {}, 'Hits'), h('th', {}, 'Net')),
+          ...SIDE_KEYS.map((k) => {
+            const x = sessionStats.side[k];
+            return h('tr', {}, h('td', {}, WAGER_NAME[k]), h('td', { class: 'num' }, String(x.bets)), h('td', { class: 'num' }, String(x.wins)),
+              h('td', { class: `num ${x.net < 0 ? 'neg' : x.net > 0 ? 'pos' : ''}` }, money(x.net, true)));
+          })),
+        h('p', { class: 'muted' }, `Pay tables: ${PAIRS_VARIANTS[v.config.pairsVariant].name}, ${BAD_BEAT_VARIANTS[v.config.badBeatVariant].name}. `,
+          h('button', { class: 'link', onclick: () => openPayTables(v.config) }, 'View'))),
       h('section', {},
         h('h3', {}, 'Players'),
         h('ul', { class: 'plist' }, ...v.seats.filter(Boolean).map((s) => h('li', {},
@@ -711,7 +816,7 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
         v.recent.length ? h('ol', { class: 'recent' }, ...v.recent.map((r) => h('li', {},
           h('div', { class: 'rh' }, h('b', {}, `#${r.handNumber}`), ` Dealer ${r.dealerHand}${r.dealerQualifies ? '' : ' (no qualify)'}`,
             r.players.some((p) => p.name === me.name) ? h('button', { class: 'link', onclick: () => openReplay(r.handId) }, 'Replay') : null),
-          h('div', { class: 'rp' }, ...r.players.map((p) => h('span', { class: p.net > 0 ? 'pos' : p.net < 0 ? 'neg' : '' }, `${p.name} ${p.outcome === 'fold' ? 'folded' : p.handName} ${money(p.net, true)}`))))))
+          h('div', { class: 'rp' }, ...r.players.map((p) => h('span', { class: p.net > 0 ? 'pos' : p.net < 0 ? 'neg' : '' }, `${p.name} ${p.outcome === 'fold' ? `folded ${p.handName}` : p.handName} ${money(p.net, true)}${p.sideHits?.length ? ` · ${p.sideHits.join(', ')}` : ''}`))))))
           : h('p', { class: 'muted' }, 'No hands played yet.')));
   }
 
@@ -733,41 +838,123 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
       el.float.textContent = money(net, true);
       el.float.className = `float show ${net > 0 ? 'pos' : net < 0 ? 'neg' : ''} ${net >= sv.bet.ante * 8 && net > 0 ? 'big' : ''}`;
       setTimeout(() => el.float.classList.remove('show'), 3800 * Math.max(motionScale(), 0.5));
-      const spotsWithStake = (['trips', 'ante', 'blind', 'play'] as const).filter((k) => sv.bet[k] > 0);
-      if (net > 0) spotsWithStake.forEach((k, i) => setTimeout(() => flyChip(tray, el.plate, sv.bet[k], true), 500 + i * 90));
-      else if (net < 0) spotsWithStake.forEach((k, i) => setTimeout(() => flyChip(el.spots[k], tray, sv.bet[k], true), 500 + i * 90));
+      // Each wager pays or is collected on its own spot, side bets included.
+      sv.result.lines.forEach((l, i) => {
+        const spotEl = el.spots[l.wager];
+        if (l.result === 'win') setTimeout(() => { flyChip(tray, spotEl, l.net, true); setTimeout(() => flyChip(spotEl, el.plate, l.credit, true), 380); }, 500 + i * 110);
+        else if (l.result === 'lose') setTimeout(() => flyChip(spotEl, tray, l.stake), 500 + i * 110);
+      });
     });
     if (s?.result) {
       const r = s.result;
-      setTimeout(() => { r.net >= s.bet.ante * 8 ? sfx.bigWin() : r.net > 0 ? sfx.win() : r.net < 0 ? sfx.lose() : sfx.push(); if (r.net) sfx.payout(); }, 450);
+      const rare = r.lines.some((l) => (l.wager === 'badBeat' && (l.multiplier ?? 0) >= 500) || (l.wager === 'pairs' && (l.multiplier ?? 0) >= 100) || (l.wager === 'progressive' && l.credit >= 15_000));
+      setTimeout(() => { rare || r.net >= s.bet.ante * 8 ? sfx.bigWin() : r.net > 0 ? sfx.win() : r.net < 0 ? sfx.lose() : sfx.push(); if (r.net) sfx.payout(); }, 450);
       sessionStats.hands++;
       sessionStats.net += r.net;
+      sessionStats.baseNet += r.baseNet;
+      for (const k of SIDE_KEYS) {
+        const l = r.lines.find((x) => x.wager === k);
+        if (!l) continue;
+        sessionStats.side[k].bets++;
+        if (l.result === 'win') sessionStats.side[k].wins++;
+        sessionStats.side[k].net += l.net;
+      }
       sessionStats.series.push(s.balance);
       if (sessionStats.series.length === 1) sessionStats.series.unshift(s.balance - r.net);
       renderResult(v, s);
     }
   }
 
+  function renderJackpot(v: TableView) {
+    jackpotSign.hidden = !v.config.progressive || !v.jackpot;
+    if (!v.jackpot) return;
+    const target = v.jackpot.amount;
+    if (target === shownJackpot) return;
+    const from = shownJackpot || target;
+    shownJackpot = target;
+    // The meter counts up like the sign over a progressive bank. Display only.
+    if (!motionScale() || from >= target) { jackpotAmt.textContent = money(target); return; }
+    const t0 = performance.now(), dur = 900 * motionScale();
+    const step = (t: number) => {
+      if (shownJackpot !== target) return;
+      const k = Math.min(1, (t - t0) / dur);
+      jackpotAmt.textContent = money(Math.round(from + (target - from) * k));
+      if (k < 1) requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+  }
+
+  /** In-hand Ultimate Pairs indicator and the showdown side-bet banner. Purely visual. */
+  function renderPairsFlash(v: TableView, s: SeatView | null) {
+    let text = '', rare = false, kind = '';
+    const prog = s?.result?.lines.find((l) => l.wager === 'progressive' && l.result === 'win');
+    if (s && v.phase === 'settled' && prog) {
+      text = `Progressive — ${prog.note ?? prog.combo} — ${money(prog.credit)}`;
+      rare = prog.credit >= 15_000; kind = 'progressive';
+    } else if (s && s.bet.progressive > 0 && v.community[2] && s.cards[0] && ['flop', 'river', 'showdown'].includes(v.phase)) {
+      // The progressive is decided on the flop; show it the moment it's known. The settlement is the server's.
+      const hand = progressiveHand((s.cards as string[]).map(cardToInt), (v.community.slice(0, 3) as string[]).map(cardToInt));
+      const row = PROGRESSIVE.rows.find((r) => r.hand === hand);
+      if (row) {
+        text = `Progressive — ${hand} — ${row.kind === 'meter' ? `${row.pct}% of the jackpot` : money(row.amount!)} (paid at the end of the hand)`;
+        rare = row.kind === 'meter' || row.amount! >= 15_000; kind = 'progressive';
+      }
+    }
+    if (text) { /* progressive banner takes priority */ }
+    else if (s && v.phase === 'settled' && s.result) {
+      const bb = s.result.lines.find((l) => l.wager === 'badBeat' && l.result === 'win');
+      const up = s.result.lines.find((l) => l.wager === 'pairs' && l.result === 'win');
+      if (bb) {
+        const who = bb.combo?.startsWith('Dealer') ? 'Dealer’s' : 'Your';
+        text = `Bad Beat! ${who} ${bb.combo?.replace(/^(Dealer|Player) /, '')} beaten — ${bb.multiplier!.toLocaleString('en-US')} to 1`;
+        rare = (bb.multiplier ?? 0) >= 500; kind = 'badbeat';
+      } else if (up) {
+        text = `Ultimate Pairs — ${up.combo} — ${up.multiplier!.toLocaleString('en-US')} to 1`;
+        rare = (up.multiplier ?? 0) >= 100; kind = 'pairs';
+      }
+    } else if (s && s.bet.pairs > 0 && s.cards[0] && ['preflop', 'flop', 'river'].includes(v.phase)) {
+      const pv = previewPairs(PAIRS_VARIANTS[v.config.pairsVariant], (s.cards as string[]).map(cardToInt));
+      if (pv.won) {
+        text = `Ultimate Pairs — ${pv.label} — ${pv.payout.toLocaleString('en-US')} to 1`;
+        if (pv.pendingUpgrade) text += ` (${pv.pendingUpgrade.payout.toLocaleString('en-US')} to 1 if the dealer also holds aces — shown at showdown)`;
+        rare = pv.payout >= 100; kind = 'pairs';
+      }
+    }
+    const changed = bonusFlash.textContent !== text;
+    bonusFlash.hidden = !text;
+    bonusFlash.textContent = text;
+    bonusFlash.className = `bonus-flash ${kind} ${rare ? 'rare' : ''}`;
+    if (changed && text && motionScale()) bonusFlash.animate([{ transform: 'scale(.92)', opacity: 0 }, { transform: 'scale(1)', opacity: 1 }], { duration: (rare ? 700 : 350) * motionScale(), easing: 'cubic-bezier(.2,.7,.25,1)' });
+  }
+
   function renderResult(v: TableView, s: SeatView) {
     const r = s.result!;
-    const title = r.outcome === 'fold' ? 'Folded' : r.net > 0 ? `You win ${money(r.net)}` : r.net < 0 ? `You lose ${money(-r.net)}` : 'Push';
+    const title = r.outcome === 'fold' ? (r.net > 0 ? `Folded — bonus bets pay ${money(r.net)}` : 'Folded') : r.net > 0 ? `You win ${money(r.net)}` : r.net < 0 ? `You lose ${money(-r.net)}` : 'Push';
     const decisions = analysis.get(v.handId!) ?? [];
     const showGrades = prefs.get().trainer !== 'casino';
+    const shown = decisions.filter((d) => showGrades || !d.correct);
+    const hasSide = r.lines.some((l) => (SIDE_KEYS as readonly string[]).includes(l.wager));
+    const lineText = (l: (typeof r.lines)[0]) => l.result === 'push' ? 'Push'
+      : l.wager === 'progressive' && l.result === 'win' ? `${money(l.credit)} (${l.note ?? l.combo ?? ''}; the $5 is not returned)`
+      : l.result === 'win' ? `${money(l.net, true)}${l.multiplier && l.wager !== 'blind' ? ` (${l.multiplier.toLocaleString('en-US')}:1, stake ${money(l.stake)} returned)` : ''}`
+      : money(l.net, true);
     result.hidden = false;
     result.className = `my-result ${r.net > 0 ? 'pos' : r.net < 0 ? 'neg' : ''}`;
     result.replaceChildren();
     append(result, [
       h('div', { class: 'res-title' }, title, h('small', {}, ` ${r.handName} vs dealer ${v.dealer.handName ?? ''}`)),
-      h('ul', { class: 'lines' }, ...r.lines.map((l) => h('li', {},
-        h('span', { title: l.note ?? '' }, `${l.wager === 'trips' ? 'Trips+' : l.wager[0].toUpperCase() + l.wager.slice(1)}`),
-        h('span', { class: l.net > 0 ? 'pos' : l.net < 0 ? 'neg' : '' }, l.result === 'push' ? 'Push' : money(l.net, true))))),
-      showGrades && decisions.length ? h('ul', { class: 'grades' }, ...decisions.map((d) => h('li', { class: d.correct ? 'ok' : 'bad' },
+      h('ul', { class: 'lines' }, ...r.lines.map((l) => h('li', { class: (SIDE_KEYS as readonly string[]).includes(l.wager) ? 'sideline' : '' },
+        h('span', { title: l.note ?? '' }, WAGER_NAME[l.wager]),
+        h('span', { class: l.net > 0 ? 'pos' : l.net < 0 ? 'neg' : '', title: l.note ?? '' }, lineText(l))))),
+      hasSide ? h('p', { class: 'subtotals' }, `Main game ${money(r.baseNet, true)} · Bonus bets ${money(r.sideNet, true)}`) : null,
+      shown.length ? h('ul', { class: 'grades' }, ...shown.map((d) => h('li', { class: d.correct ? 'ok' : 'bad' },
         `${d.correct ? '✓' : '✗'} ${cap(d.phase)}: ${DECISION_LABEL[d.action]}${d.timedOut ? ' (timed out)' : ''}`,
         d.correct ? '' : ` — best was ${DECISION_LABEL[d.recommended]}${d.evCost !== undefined ? `, costing ${d.evCost.toFixed(2)} antes${d.evExact ? '' : ' (est.)'} (${money(d.evCostCents ?? 0)})` : ''}`,
-        d.correct ? null : h('div', { class: 'why' }, d.reason)))) : null,
-      showGrades && decisions.length && r.net > 0 && decisions.some((d) => !d.correct) ? h('p', { class: 'muted' }, 'You won this hand, but the mistake still cost expected value — results and decisions are graded separately.') : null]);
+        d.correct ? null : h('div', { class: 'why' }, d.reason),
+        d.correct ? null : outsEl(d.outs)))) : null,
+      showGrades && decisions.length && r.baseNet > 0 && decisions.some((d) => !d.correct) ? h('p', { class: 'muted' }, 'You won this hand, but the mistake still cost expected value — results and decisions are graded separately.') : null]);
   }
-  const cap = (s: string) => s[0].toUpperCase() + s.slice(1).replace('preflop', 'Pre-flop');
+  const cap = (s: string) => ({ preflop: 'Pre-flop', flop: 'Flop', river: 'River' } as Record<string, string>)[s] ?? s;
 
   function onAnalysis(p: { handId: string; decisions: DecisionRecord[] }) {
     analysis.set(p.handId, p.decisions);
@@ -836,6 +1023,7 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
       num('minAnte', 'Minimum Ante ($)', c.minAnte / 100, { min: 1, step: 1 }),
       num('maxAnte', 'Maximum Ante ($)', c.maxAnte / 100, { min: 1, step: 1 }),
       num('maxTrips', 'Maximum Trips+ ($)', c.maxTrips / 100, { min: 0, step: 1 }),
+      ...sideBetFields(c),
       num('startingBankroll', 'Starting stack for new players ($)', c.startingBankroll / 100, { min: 10, step: 1 }),
       num('decisionSeconds', 'Decision timer (s)', c.decisionSeconds, { min: 5, max: 120 }),
       num('bettingSeconds', 'Betting timer (s)', c.bettingSeconds, { min: 5, max: 120 }),
@@ -849,7 +1037,7 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
       const fd = new FormData(form);
       const dollars = (k: string) => Math.round(Number(fd.get(k)) * 100);
       const r = await call('host:settings', {
-        name: String(fd.get('name')), minAnte: dollars('minAnte'), maxAnte: dollars('maxAnte'), maxTrips: dollars('maxTrips'),
+        name: String(fd.get('name')), minAnte: dollars('minAnte'), maxAnte: dollars('maxAnte'), maxTrips: dollars('maxTrips'), ...readSideBetFields(fd),
         startingBankroll: dollars('startingBankroll'), decisionSeconds: Number(fd.get('decisionSeconds')), bettingSeconds: Number(fd.get('bettingSeconds')),
         maxSeats: Number(fd.get('maxSeats')), isPublic: fd.get('isPublic') === 'on', allowSpectators: fd.get('allowSpectators') === 'on',
       });

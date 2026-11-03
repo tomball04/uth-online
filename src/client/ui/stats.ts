@@ -7,8 +7,11 @@ interface Stats {
   byPhase: { phase: string; action: string; count: number; correct: number }[];
   commonMistakes: { phase: string; action: string; recommended: string; count: number; evCost: number }[];
   trips: { bets: number; wins: number; net: number }; handsWithFriends: number; reloads: number; tables: number;
+  side: Record<'trips' | 'pairs' | 'badBeat' | 'progressive', Side>; baseNet: number; baseWagered: number;
   series: { at: string; cumulative: number }[];
 }
+interface Side { bets: number; wins: number; wagered: number; returned: number; net: number; biggestPayout: number; combos: { combo: string; count: number }[] }
+const SIDE_NAME = { trips: 'Trips+', pairs: 'Ultimate Pairs', badBeat: 'Bad Beat', progressive: '$5 Progressive' } as const;
 const LABEL: Record<string, string> = { play4: 'Play 4×', play3: 'Play 3×', play2: 'Play 2×', play1: 'Play 1×', check: 'Check', fold: 'Fold' };
 const PHASE: Record<string, string> = { preflop: 'Pre-flop', flop: 'Flop', river: 'River' };
 
@@ -40,10 +43,10 @@ export async function mountStats(root: HTMLElement, nav: (p: string) => void) {
       fig('Win rate', pct(s.wins, s.hands)),
       fig('Biggest win', money(s.biggestWin)),
       fig('Best hand', s.bestHand ?? '—'),
-      fig('Return on action', s.totalWagered ? `${((s.net / s.totalWagered) * 100).toFixed(2)}%` : '—'),
+      fig('Main-game return', s.baseWagered ? `${((s.baseNet / s.baseWagered) * 100).toFixed(2)}%` : '—'),
       fig('With friends', `${s.handsWithFriends} hands`)),
     h('section', { class: 'card-sec' }, h('h2', {}, 'Lifetime bankroll'), graph(s.series),
-      h('p', { class: 'muted' }, `Across ${s.tables} table${s.tables === 1 ? '' : 's'} · ${s.reloads} reload${s.reloads === 1 ? '' : 's'}. The house edge on Ultimate Texas Hold’em is about 2.2% of total action with perfect strategy.`)),
+      h('p', { class: 'muted' }, `Across ${s.tables} table${s.tables === 1 ? '' : 's'} · ${s.reloads} reload${s.reloads === 1 ? '' : 's'}. With perfect strategy the house edge is about 2.2% of the Ante per hand, roughly 0.5% of total action.`)),
     h('section', { class: 'card-sec' }, h('h2', {}, 'Strategy'),
       h('p', {}, `${pct(s.correctDecisions, s.decisions)} of your ${s.decisions} decisions matched optimal strategy. Mistakes have cost about `,
         h('b', {}, `${s.evLost.toFixed(2)} antes`), ' of expected value in total.'),
@@ -51,8 +54,7 @@ export async function mountStats(root: HTMLElement, nav: (p: string) => void) {
       h('h3', {}, 'Most common mistakes'),
       s.commonMistakes.length ? h('ol', { class: 'mistakes' }, ...s.commonMistakes.map((m) => h('li', {},
         `${PHASE[m.phase]}: ${LABEL[m.action]} instead of ${LABEL[m.recommended]}`, h('span', { class: 'muted' }, ` — ${m.count}× · ${m.evCost.toFixed(2)} antes`)))) : h('p', { class: 'muted' }, 'None yet.')),
-    h('section', { class: 'card-sec' }, h('h2', {}, 'Trips+ side bet'),
-      h('p', {}, s.trips.bets ? `${s.trips.bets} bets, ${s.trips.wins} paid, net ${money(s.trips.net, true)}.` : 'You haven’t placed a Trips+ bet yet.'))));
+    sideSection(s)));
 }
 
 function graph(series: { cumulative: number }[]) {
@@ -73,3 +75,27 @@ function graph(series: { cumulative: number }[]) {
   </svg>`);
 }
 const escapeXml = (s: string) => s.replace(/[<>&"]/g, (c) => `&#${c.charCodeAt(0)};`);
+
+function sideSection(s: Stats) {
+  const keys = (['trips', 'pairs', 'badBeat', 'progressive'] as const).filter((k) => s.side[k]);
+  const all = keys.map((k) => s.side[k]);
+  const combined = { bets: all.reduce((a, x) => a + x.bets, 0), wagered: all.reduce((a, x) => a + x.wagered, 0), net: all.reduce((a, x) => a + x.net, 0) };
+  const pct = (a: number, b: number) => (b ? `${((a / b) * 100).toFixed(1)}%` : '—');
+  return h('section', { class: 'card-sec' }, h('h2', {}, 'Bonus bets'),
+    h('p', {}, `Main game ${money(s.baseNet, true)} on ${money(s.baseWagered)} wagered. Bonus bets ${money(combined.net, true)} on ${money(combined.wagered)} across ${combined.bets} bets. Strategy and house-edge figures above use the main game only.`),
+    h('table', { class: 'tables side-table' },
+      h('thead', {}, h('tr', {}, h('th', {}, 'Bet'), h('th', {}, 'Bets'), h('th', {}, 'Hits'), h('th', {}, 'Hit rate'), h('th', {}, 'Wagered'),
+        h('th', {}, 'Returned'), h('th', {}, 'Net'), h('th', {}, 'Biggest payout'))),
+      h('tbody', {}, ...keys.map((k) => {
+        const x = s.side[k];
+        return h('tr', {}, h('td', {}, SIDE_NAME[k]), h('td', { class: 'num' }, String(x.bets)), h('td', { class: 'num' }, String(x.wins)),
+          h('td', { class: 'num' }, pct(x.wins, x.bets)), h('td', { class: 'num' }, money(x.wagered)), h('td', { class: 'num' }, money(x.returned)),
+          h('td', { class: `num ${x.net < 0 ? 'neg' : x.net > 0 ? 'pos' : ''}` }, money(x.net, true)), h('td', { class: 'num' }, x.biggestPayout ? money(x.biggestPayout) : '—'));
+      }),
+      h('tr', { class: 'total' }, h('td', {}, 'All bonus bets'), h('td', { class: 'num' }, String(combined.bets)), h('td', { class: 'num' }, String(all.reduce((a, x) => a + x.wins, 0))),
+        h('td', {}), h('td', { class: 'num' }, money(combined.wagered)), h('td', { class: 'num' }, money(all.reduce((a, x) => a + x.returned, 0))),
+        h('td', { class: `num ${combined.net < 0 ? 'neg' : 'pos'}` }, money(combined.net, true)), h('td', {})))),
+    h('div', { class: 'phase-grid' }, ...keys.map((k) => h('div', { class: 'phase-card' }, h('h3', {}, `${SIDE_NAME[k]} winning hands`),
+      s.side[k].combos.length ? h('ul', {}, ...s.side[k].combos.map((c) => h('li', {}, h('span', {}, c.combo), h('span', { class: 'num' }, `${c.count}×`))))
+        : h('p', { class: 'muted' }, s.side[k].bets ? 'No hits yet.' : 'No bets yet.')))));
+}

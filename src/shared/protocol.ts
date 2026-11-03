@@ -2,8 +2,11 @@
 // only what that viewer is authorized to see. Hidden cards are represented as null.
 
 import type { CardStr } from './cards.js';
-import type { Decision, DecisionPhase, Settlement } from './rules.js';
-import type { Advice } from './strategy.js';
+import type { Decision, DecisionPhase, InitialBets, Settlement } from './rules.js';
+import type { BadBeatVariant, PairsVariant } from './sidebets.js';
+
+export type WagerKey = 'ante' | 'blind' | 'play' | 'trips' | 'pairs' | 'badBeat' | 'progressive';
+import type { Advice, Outs } from './strategy.js';
 
 export type Phase = 'waiting' | 'betting' | 'preflop' | 'flop' | 'river' | 'showdown' | 'settled';
 
@@ -15,6 +18,11 @@ export interface TableConfig {
   minAnte: number;             // cents
   maxAnte: number;             // cents
   maxTrips: number;            // cents
+  maxPairs: number;            // cents, Ultimate Pairs limit
+  maxBadBeat: number;          // cents, Bad Beat limit
+  pairsVariant: PairsVariant['id'];     // complete pay table, never mixed
+  badBeatVariant: BadBeatVariant['id'];
+  progressive: boolean;        // $5 Five Card Progressive offered at this table
   startingBankroll: number;    // cents
   decisionSeconds: number;     // 0 = no timer (solo only)
   bettingSeconds: number;      // countdown once someone is ready
@@ -30,7 +38,7 @@ export interface SeatView {
   connected: boolean;
   isHost: boolean;
   status: 'sitting-out' | 'betting' | 'ready' | 'in-hand' | 'waiting-next' | 'folded';
-  bet: { ante: number; blind: number; trips: number; play: number };
+  bet: { ante: number; blind: number; trips: number; play: number; pairs: number; badBeat: number; progressive: number };
   acted: boolean;              // has submitted decision for current phase (or doesn't need to)
   needsToAct: boolean;
   lastAction?: Decision;
@@ -45,7 +53,9 @@ export interface SeatResult {
   net: number;
   handName: string;
   best5?: CardStr[];
-  lines: { wager: 'ante' | 'blind' | 'play' | 'trips'; result: string; net: number; note?: string }[];
+  lines: { wager: WagerKey; result: string; net: number; stake: number; credit: number; note?: string; multiplier?: number; combo?: string; variant?: string }[];
+  baseNet: number;
+  sideNet: number;
 }
 
 export interface TableView {
@@ -68,12 +78,14 @@ export interface TableView {
     isHost: boolean;
     legal: Decision[];             // decisions you may submit right now
     canBet: boolean;
-    pending: { ante: number; trips: number };
-    lastBet: { ante: number; trips: number } | null;
+    pending: InitialBets;
+    lastBet: InitialBets | null;
     canReload: boolean;
     timeoutPolicy: 'default' | 'strategy';
   };
   recent: HandSummary[];
+  /** Linked jackpot meter shared by every table on this server (cents). */
+  jackpot: { amount: number; wager: number };
 }
 
 export interface HandSummary {
@@ -82,7 +94,7 @@ export interface HandSummary {
   at: number;
   dealerHand: string;
   dealerQualifies: boolean;
-  players: { name: string; net: number; outcome: string; handName: string }[];
+  players: { name: string; net: number; outcome: string; handName: string; sideHits?: string[] }[];
 }
 
 export interface ChatMessage {
@@ -107,6 +119,8 @@ export interface DecisionRecord {
   evCost?: number;        // ante units
   evExact?: boolean;
   evCostCents?: number;
+  /** River: dealer's single-card outs + exact beating hands. Flop: your outs to improve. Pre-flop: none. */
+  outs?: Outs;
 }
 
 // ------------------------- client -> server -------------------------
@@ -114,7 +128,7 @@ export interface ClientToServer {
   'table:join': (p: { code: string; asSpectator?: boolean }, ack: (r: Ack<{ seat: number | null }>) => void) => void;
   'table:sit': (p: { seat?: number }, ack: (r: Ack<{ seat: number }>) => void) => void;
   'table:leave': (ack: (r: Ack) => void) => void;
-  'bet:place': (p: { actionId: string; ante: number; trips: number }, ack: (r: Ack) => void) => void;
+  'bet:place': (p: { actionId: string; ante: number; trips: number; pairs?: number; badBeat?: number; progressive?: number }, ack: (r: Ack) => void) => void;
   'bet:clear': (p: { actionId: string }, ack: (r: Ack) => void) => void;
   'player:ready': (p: { actionId: string; ready: boolean }, ack: (r: Ack) => void) => void;
   'player:decide': (p: { actionId: string; handId: string; phase: DecisionPhase; decision: Decision }, ack: (r: Ack) => void) => void;
@@ -136,6 +150,7 @@ export interface ServerToClient {
   'chat:reaction': (p: { playerId: string; seat: number | null; reaction: Reaction }) => void;
   'hand:analysis': (p: { handId: string; decisions: DecisionRecord[] }) => void;
   'kicked': (p: { reason: string }) => void;
+  'jackpot:hit': (p: { tableName: string; playerName: string; hand: string; amount: number; same: boolean }) => void;
 }
 
 export type Ack<T = object> = ({ ok: true } & T) | { ok: false; error: string };

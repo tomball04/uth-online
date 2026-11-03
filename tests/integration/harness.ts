@@ -99,7 +99,7 @@ export class TC {
     throw new Error(`${this.name}: timed out waiting for ${label}; last phase=${this.state?.phase}`);
   }
   join(code: string, asSpectator = false) { return this.emit('table:join', { code, asSpectator }); }
-  bet(ante: number, trips = 0) { return this.emit('bet:place', { actionId: aid(), ante, trips }); }
+  bet(ante: number, trips = 0, pairs = 0, badBeat = 0, progressive = 0) { return this.emit('bet:place', { actionId: aid(), ante, trips, pairs, badBeat, progressive }); }
   ready() { return this.emit('player:ready', { actionId: aid(), ready: true }); }
   async decide(phase: string, decision: string, actionId = aid()) {
     const v = await this.waitState((s) => s.phase === phase && s.you.legal.length > 0, 8000, `${phase} legal`);

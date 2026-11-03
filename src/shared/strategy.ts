@@ -229,3 +229,60 @@ export function mistakeCost(phase: DecisionPhase, hole: number[], community: num
   const k = (d: Decision) => ev[d as 'play4' | 'play3' | 'check'];
   return { recommended: rec.action, cost: Math.max(0, k(rec.action) - k(actual)), exact: false, ev };
 }
+
+// ------------------------------------------------------------------ Outs (shown when a decision is graded)
+import { intToCard as _intToCard } from './cards.js';
+
+export interface Outs {
+  kind: 'dealer' | 'improve';
+  count: number;
+  cards: string[];          // the out cards, e.g. ["Kh","Kd",...]
+  byRank: { rank: string; count: number }[];
+  /** river: exact dealer hands (of 990) that beat you */
+  beatingHands?: number; combos?: number;
+  /** flop: chance of hitting at least one out by the river */
+  hitByRiver?: number;
+}
+
+const RANK_ORDER = 'AKQJT98765432';
+function groupByRank(cards: number[]) {
+  const m = new Map<string, number>();
+  for (const c of cards) { const r = _intToCard(c)[0]; m.set(r, (m.get(r) ?? 0) + 1); }
+  return [...m].map(([rank, count]) => ({ rank: rank === 'T' ? '10' : rank, count }))
+    .sort((a, b) => RANK_ORDER.indexOf(a.rank === '10' ? 'T' : a.rank) - RANK_ORDER.indexOf(b.rank === '10' ? 'T' : b.rank));
+}
+
+/**
+ * River "dealer outs": single unseen cards that beat you if the dealer holds one of them (the standard
+ * counting shortcut — play 1x with fewer than 21). Uses only the player's own cards and the board.
+ */
+export function dealerOuts(hole: number[], board: number[]): Outs {
+  const known = new Set([...hole, ...board]);
+  const mine = evaluate([...hole, ...board]);
+  const outs: number[] = [];
+  for (let c = 0; c < 52; c++) if (!known.has(c) && evaluate([...board, c]) > mine) outs.push(c);
+  const exact = riverAdvice(hole, board).detail!;
+  return { kind: 'dealer', count: outs.length, cards: outs.map(_intToCard), byRank: groupByRank(outs), beatingHands: exact.losses, combos: exact.combos };
+}
+
+/** Flop: turn cards that improve your hand to a better category using at least one hole card. */
+export function improvementOuts(hole: number[], flop: number[]): Outs {
+  const known = new Set([...hole, ...flop]);
+  const nowCat = categoryOf(evaluate([...hole, ...flop]));
+  const outs: number[] = [];
+  for (let c = 0; c < 52; c++) {
+    if (known.has(c)) continue;
+    const all = categoryOf(evaluate([...hole, ...flop, c]));
+    const boardOnly = categoryOf(evaluate([...flop, c]));
+    if (all > nowCat && all > boardOnly) outs.push(c);
+  }
+  const unseen = 47, n = outs.length;
+  const miss = ((unseen - n) * (unseen - n - 1)) / (unseen * (unseen - 1));
+  return { kind: 'improve', count: n, cards: outs.map(_intToCard), byRank: groupByRank(outs), hitByRiver: 1 - miss };
+}
+
+export function outsFor(phase: DecisionPhase, hole: number[], community: number[]): Outs | undefined {
+  if (phase === 'river') return dealerOuts(hole, community.slice(0, 5));
+  if (phase === 'flop') return improvementOuts(hole, community.slice(0, 3));
+  return undefined;
+}
