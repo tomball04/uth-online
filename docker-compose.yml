@@ -1,0 +1,20 @@
+# Local PostgreSQL for development:  docker compose up -d db
+# Full stack (app + db):             docker compose up --build
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: uth
+    ports: ["5432:5432"]
+    volumes: [uth-data:/var/lib/postgresql/data]
+  app:
+    build: .
+    depends_on: [db]
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@db:5432/uth
+      PORT: "3000"
+    ports: ["3000:3000"]
+    profiles: [app]
+volumes:
+  uth-data:
