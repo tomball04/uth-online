@@ -3,13 +3,31 @@
 What was actually run, where, and what it proved — and what was not tested.
 
 **Environment:** Linux, Node.js 22.23, PostgreSQL 16 (local), Google Chrome for Testing 153, run on 2 November 2026.
-**Result:** 43 of 43 automated tests passed. The unit + integration suites were run twice back to back with identical results; the browser suite was run twice.
+**Result:** 102 of 102 automated tests passed.
 
 ```
 npx tsc --noEmit                 → no type errors (client, server, shared, tests)
-npm test  (Vitest)               → 2 files, 40 tests passed   (21 unit + 19 multiplayer integration)
-npm run test:e2e (Playwright)    → 3 tests passed in real Chrome against the production build
+npm test  (Vitest)               → 6 files, 98 tests passed   (60 unit + 38 multiplayer integration)
+npm run test:e2e (Playwright)    → 4 tests passed in real Chrome against the production build
 ```
+
+Update 3 November 2026: casino rounding, cards face up after the round, $5 Five Card Progressive — section 1d.
+
+## 1d. Rounding, face-up cards, progressive
+
+**Blind rounding (unit).** The 3:2 flush payout rounds down to the dollar: $1 → $1, $20 → $30, $25 → $37; asserted that no Blind payout is ever a fraction of a dollar. This fixes the "50 cents" flush payouts.
+
+**Folded hands shown after settlement (integration).** Folded Eli's 3♠ 5♦ and "High Card" are in every other player's view once the hand settles, and in the replay; during the hand they are still `null` for other viewers (existing redaction test still passes). Folded Ace's A♥ A♦ Ultimate Pairs combination is announced to everyone after the round.
+
+**Progressive — unit (6).** Hole + flop only (turn/river ignored); fixed table $1,500/$250/$200/$150/$45 and nothing for two pair; Royal + Straight Flush at one table in seat order with both Envy bonuses, meter reset and the 67¢ rounding remainder carried into the new meter; Straight Flush floored at the seed; settles as a non-returned wager that survives a fold; only exactly $5 accepted, refused where the table has it off, and included in affordability.
+
+**Progressive — integration (6 × 2 stores: PostgreSQL and in-memory).** Two tables on one server share one $10,000 meter; three $5 bets raise it by $10.50 at both tables; rigged hand: Kim A♠K♠ + Q♠J♠10♠ (Royal) → $10,010 + $1,500 envy; Ace 9♠8♠ (Straight Flush) → $1,000 + $5,000 envy; Jo folds 2♣3♦ → $6,500 envy; meter ends at exactly $10,000; ledger sums equal balances; `progressive_hits` has two rows; chat says "JACKPOT! Kim hits a Royal Flush…"; the other table gets `jackpot:hit` with `same: false` and sees the reset meter; stats show the bet and "Envy bonus"; host switching it off rejects new $5 bets. Crash-recovery test now also asserts the voided hand's $3.50 contribution is removed from the meter.
+
+**By eye (Chrome, desktop + iPhone size).** Jackpot sign in the top bar; $5 Progressive circle toggles a fixed $5 regardless of chip; Royal banner, result line "$10,007 (Royal Flush — 100% of the jackpot; the $5 is not returned)", envy banner for the folded player, folded cards face up at Ace's seat after the round.
+
+Update 2 November 2026 (later): table outline no longer crosses name plates; felt and card-back colours; outs on mistakes — section 1c.
+
+Update 2 November 2026: Ultimate Pairs and Bad Beat side bets (addendum §22) added — sections 1b, 2b and browser test 4 below.
 
 ## 1. Rules engine — unit tests (21)
 
@@ -30,6 +48,47 @@ npm run test:e2e (Playwright)    → 3 tests passed in real Chrome against the p
 | Flop rules, 8 cases | Hidden pair, board-only pair, two pair with hole card, pocket 2s, set of 2s, four-flush with hidden 10 vs 9, straight draw |
 | River solver | Enumerates exactly 990 dealer hands; wins + ties + losses = 990; nuts → play, board-plays → fold |
 | EV estimates / mistake cost | Correct ordering for strong and weak hands; optimal actions cost nothing |
+
+## 1c. Outs (3 unit tests + integration assertions)
+
+* River dealer outs match the strategy chart: A♦3♣ on K♠9♦7♣4♥2♠ = 15 outs (pairing any board card); 6♦3♣ on the same board = 35 (adds any A, Q, J, 10, 8), and the exact solver agrees (play / fold).
+* Flop: A♣8♣ on K♣7♣2♦ = 15 outs (9 clubs, 3 aces, 3 eights), 54.1% to hit by the river; board-only improvements never count; no outs pre-flop.
+* Integration: Fay's timed-out river fold with pocket tens is recorded as a mistake carrying the dealer's outs (990 combinations); her flop decision carries her improvement outs. Outs are saved with each decision (migration `003_decision_outs.sql`) and shown in replays.
+* Visual checks in Chrome: name plates above the rail line on desktop and iPhone; sapphire felt + navy backs applied across the table and in the Settings preview; a folded A♥A♦ hand listing its pre-flop, flop (4 outs: A×2, 9×2) and river (2 dealer outs, 96 of 990 hands) mistakes.
+
+## 1b. Side-bet rules — unit tests (30)
+
+| Addendum §22.8 requirement | Test |
+|---|---|
+| A♥A♦ pays 100:1 (either order); only the highest line pays | Bonus 4: `A♥ A♦` → 100, never 100 + 30 |
+| Other pocket aces 30:1 | A♠A♣, A♥A♠, A♦A♣, A♥A♣ → 30 |
+| Suited / unsuited ace-face | A-K/Q/J suited → 20; unsuited → 10 |
+| Lower pocket pairs | 2-2, 7-7, 10-10, K-K → 4 |
+| Non-qualifying hands | K-Q suited, A-9 suited, A-10, 7-2, K-J → lose |
+| Settlement after folding | Folded A♠A♣ with $5 Ultimate Pairs → +$150, net −$20 + $150 |
+| Alternate player-and-dealer aces payout | Bonus 2: player AA + dealer AA → 1,000; player AA alone → 30; all eight Bonus 2 lines; Bonus 4 never pays 1,000 |
+| Dealer-dependent payout not revealed early | In-hand preview shows 30:1 with the 1,000:1 marked "pending", never confirmed |
+| Player loses with Three of a Kind / Straight / Full House | 9:1 / 20:1 / 40:1, losing hand named |
+| Dealer loses with Three of a Kind / Four of a Kind | 9:1 / 500:1 |
+| Qualifying tie pays nothing | Both full houses tie → Bad Beat loses ("Tied hands") |
+| Losing hand below Three of a Kind | Two pair loses to trips → no payout |
+| Folding with the side bet active | Folded trips beaten → pays; folded full house beating dealer trips → pays; folded weak hand → loses ("a fold is not a bad beat") |
+| Dealer non-qualification | Dealer high card: Ante pushes, Bad Beat loses, Trips+ still pays |
+| Trips+ eligibility | Bad Beat without Trips+ rejected; with Trips+ accepted; limits and affordability enforced |
+| Large payouts | $25 losing straight flush → exactly $250,000 (Bonus 01) and $187,500 (Bonus 02), integer cents |
+| Main game loses, side bets win | Base −$30; Trips+ +$40, Pairs +$20, Bad Beat +$200; net +$230 = credit − stake |
+| Variant registry | Every variant has a source URL, companions, fold handling and ≥ 4 lines |
+
+## 2b. Side bets at a multiplayer table — integration tests (7, real Postgres)
+
+1. Selected pay tables are in the table state before anyone bets.
+2. Bad Beat without Trips+, negative, string, fractional and over-limit side bets are rejected by the server.
+3. Three players, one rigged hand: Kim (all three bonus bets) +$185, Ace (Ultimate Pairs only, **folded**, A♥A♦) +$480, Jo (Trips+ and Bad Beat, one pair) −$40. Each line asserted: stake, multiplier, combination, credit. A duplicated `bet:place` is applied once; side bets are locked after the deal; Ace disconnects and reconnects mid-hand and still receives exactly one payout row. Ledger sums equal balances for every player.
+4. Hand history stores each player's side-bet stakes, combinations, multipliers, nets and the hand's pay-table ids.
+5. Chat announces "Bad Beat! Dealer's Three of a Kind beaten — 9:1 for Kim" and "Ace wins the Ultimate Pairs bonus" without revealing the folded A♥A♦; other players' views omit the folded seat's combination.
+6. Statistics report each side bet separately (bets, hits, wagered, returned, net, biggest payout, winning combinations) and the main-game result apart from them.
+7. Host switches to Bonus 2 / Bonus 02 between hands (announced in chat, effective next hand); an unknown pay table is refused; switching during a hand is refused.
+8. Separate table on Bonus 2: player A♠A♣ vs dealer A♥A♦ — dealer cards hidden until showdown, then 1,000:1 = +$5,000, ledger reconciles.
 
 ## 2. Multiplayer integration — real server, real Socket.IO clients, real PostgreSQL (19)
 
@@ -72,6 +131,8 @@ The test harness runs `npm run build`, boots `node dist/server/server/index.js` 
 2. **Refresh mid-hand.** After a 4× raise, the page is reloaded: same seat, same two hole cards, same $20 Play wager shown.
 3. **Solo with Training mode.** Training hint and a highlighted recommended action are shown each street; following the recommendations ends with no graded mistakes.
 
+4. **Side bets in the browser.** Pay tables shown before betting; Bad Beat without Trips+ shows an error; desktop places all three bonus bets and sees "On the table $65 · Reserved for 1× Play $25"; on the iPhone the bonus circles stay hidden until the Bonus bets panel is opened; the other player sees the bonus amount on the felt; bonus circles are disabled after the deal and the phone panel collapses; the result lists every wager and a separate "Main game / Bonus bets" subtotal; the displayed balance equals $1,000 − $50 + the bonus-bet result.
+
 Screenshots from these runs (desktop and iPhone, settled hand) are in `docs/screenshots/`.
 
 ## Not tested / limitations
@@ -81,6 +142,8 @@ Screenshots from these runs (desktop and iPhone, settled hand) are in `docs/scre
 * **Docker image.** The Dockerfile was written but not built here (no Docker daemon available).
 * **Load.** No load or soak testing. Expect a single instance to handle many concurrent tables, but this hasn't been measured.
 * **Audio and animation.** Exercised in the browser runs without errors, but quality is judged by eye and ear, not by tests.
+* **Side-bet animations** (the Ultimate Pairs ribbon, the Bad Beat banner with both hands highlighted, the larger shimmer for 100:1+ payouts) were checked by eye on a rigged hand in Chrome, not by automated assertions. A real 10,000:1 straight-flush bad beat was tested in settlement code, not played through the UI.
+* **Side-bet privacy choice:** other players see a folded seat's bonus-bet amounts and whether each won, but never the combination. Tell me if you'd rather hide folded seats' bonus results entirely.
 * **Pre-flop and flop EV costs** are estimates (Monte Carlo / sampled runouts) and labelled "est." in the UI. River EV is exact.
 * **Deck commitment.** Each hand stores a SHA-256 of the shuffled deck for audit, but the full deck order isn't stored, so it can't be independently re-verified later; the dealt cards themselves are stored.
 * **Not implemented:** registered accounts and a friends list (guest identities only, as the brief allowed); a cross-table hand-history browser (replays are reached from a table's "Table & history" panel, last 15 hands); horizontal scaling across multiple server instances.

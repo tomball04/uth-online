@@ -85,9 +85,56 @@ See **DEPLOY.md** for Render, Railway, Docker, custom domains and HTTPS/WSS.
 | Blind | paytable on straight+, otherwise push | push | lose | lose |
 | Trips+ | paytable on the player's own hand regardless of the dealer — **including after a fold** |
 
-Blind: Royal 500:1, Straight Flush 50:1, Quads 10:1, Full House 3:1, Flush 3:2, Straight 1:1.
+Blind: Royal 500:1, Straight Flush 50:1, Quads 10:1, Full House 3:1, Flush 3:2, Straight 1:1. **Casino breakage:** the 3:2 flush payout is rounded down to the whole dollar, as at a real table ($25 Blind → $37, $5 → $7, $1 → $1). No payout anywhere is ever a fraction of a dollar.
 Trips+: Royal 50:1, Straight Flush 40:1, Quads 30:1, Full House 8:1, Flush 6:1, Straight 5:1, Trips 3:1.
 Both tables are unchanged from the prototype.
+
+### Bonus bets: Ultimate Pairs and Bad Beat
+
+Players can place Trips+, Ultimate Pairs and Bad Beat in any combination before the deal; they lock when the cards come out. Each is settled on its own, stays live after a fold, and is paid as stake returned plus profit.
+
+| Bet | Pays on | Companion wagers | Ties |
+|---|---|---|---|
+| Ultimate Pairs | The player's two hole cards (one variant also uses the dealer's) — only the highest line pays | Ante + Blind | — |
+| Bad Beat | The **losing** hand at showdown, Three of a Kind or better, whether the player's or the dealer's; full 7-card comparison with kickers | Ante + Blind + **Trips+** | Lose |
+
+Each table uses one complete pay table per bonus bet, chosen at creation (or by the host between hands — every change is announced in chat). Defaults are marked.
+
+| Variant | Lines |
+|---|---|
+| **Ultimate Pairs Bonus 4** (default) | A♥A♦ 100:1 · other AA 30:1 · A-K/Q/J suited 20:1 · A-K/Q/J unsuited 10:1 · 2-2 to K-K 4:1 |
+| Ultimate Pairs Bonus 2 | Player **and dealer** AA 1,000:1 · AA 30:1 · AKs 25:1 · AQs/AJs 20:1 · AKo 15:1 · JJ–KK 10:1 · AQo/AJo 5:1 · 22–TT 3:1 |
+| **Bad Beat Bonus 01** (default) | Losing straight flush 10,000:1 · quads 500:1 · full house 40:1 · flush 25:1 · straight 20:1 · trips 9:1 |
+| Bad Beat Bonus 02 | Losing straight flush 7,500:1 · quads 500:1 · full house 50:1 · flush 30:1 · straight 20:1 · trips 9:1 |
+
+Sources: Ultimate Pairs = Maryland Lottery and Gaming Control Agency, *Ultimate Texas Hold'Em Poker Standard Rules v1.5*, Paytables D and B; Bad Beat = California Bureau of Gambling Control *Ultimate Texas Hold'em Bad Beat Bonus* options sheet, Options 1 and 2 (also MLGCA Paytables A and B). Neither source specifies companion wagers or fold handling, so those follow the project addendum (§22). Every variant — id, rows, multipliers, companions, fold handling, limits, source — is defined in one place: `src/shared/sidebets.ts`.
+
+Privacy: the Bonus 2 dealer-aces line is never previewed or confirmed before the dealer's cards are shown. Nobody sees another player's hole cards while a hand is live.
+
+**Cards face up after the round.** Once a hand is settled every seat's cards are turned face up for everyone at the table — folded hands included — with the hand name, the bonus-bet combinations and the replay. This mirrors a dealer spreading the cards at the end of a real hand.
+
+### $5 Five Card Progressive (linked jackpot)
+
+An optional, fixed **$5** bet scored on the player's **two hole cards plus the three flop cards**. One meter is shared by every table on the server and stored in the database (`progressive_meter`), so it survives restarts and grows with play at any table.
+
+| Hand (hole + flop) | Pays |
+|---|---|
+| Royal Flush | 100% of the jackpot |
+| Straight Flush | 10% of the jackpot |
+| Four of a Kind | $1,500 |
+| Full House | $250 |
+| Flush | $200 |
+| Straight | $150 |
+| Three of a Kind | $45 |
+
+* **Envy bonus:** every *other* progressive bettor at the table receives $5,000 for each Royal and $1,500 for each Straight Flush hit there.
+* Awards are paid instead of the $5 — the wager is not returned (standard for progressives).
+* Meter: seeded at **$10,000**; **$3.50 of each $5 (70%)** is added when the cards are dealt. A Royal resets the meter to the seed (cents lost to rounding carry into the new meter); a Straight Flush can't take the meter below the seed. Percentage awards are paid in whole dollars, rounded down. Multiple hits at one table are paid in seat order.
+* The bet is decided on the flop, so it **stays live if the player later folds**. Hosts can switch the progressive off for their table between hands (announced in chat).
+* Concurrency and exactly-once: the meter row is locked `FOR UPDATE` inside the settlement transaction, the award is computed against the locked value, and every meter-paid award is written to `progressive_hits` (unique per hand + player). Two tables can never both collect the same jackpot. A hand voided by a crash refunds the $5 and removes its contribution from the meter.
+* A Royal or Straight Flush hit is announced in chat at the table and as a notice at every other table.
+
+Sources: Hollywood Casino at Penn National Race Course, *Ultimate Texas Hold'em progressive table guide* (Five Card Progressive pay table and Envy amounts); Washington State Gambling Commission, *Ultimate Texas Hold'em* rules, Multi-Game Link jackpot Paytable 01 (the same table per $1, hole cards + flop, seed at least the largest fixed award, fold eligibility at the operator's discretion). The seed, the 70% meter rate and fold handling are this project's operator choices. Defined in `src/shared/progressive.ts`.
 
 ### Bugs fixed from the prototype
 
@@ -105,6 +152,8 @@ Both tables are unchanged from the prototype.
 * **Money.** Integer cents everywhere. Every balance change is a ledger row with a unique `tx_key`; stacks have `CHECK (balance >= 0)`; settlement locks the hand row and refuses to settle twice. `ledgerSum(player, table)` always equals the stack balance.
 * **Crash recovery.** On boot, any hand still `active` (interrupted by a restart) is voided and every committed stake is refunded exactly once via the ledger. Tables reload from the database when someone rejoins by code.
 * **Identity.** Guests get a 256-bit random bearer token (stored client-side; only its SHA-256 is stored server-side). Refreshing or reopening the link restores the same player, seat and stack.
+* **Progressive.** Contributions are added in the deal transaction; awards are resolved by a callback the store runs inside the settlement transaction with the meter locked (`SettlementBuilder`), so the meter value used is the one written back (migration `004_progressive.sql`).
+* **Side bets.** Ultimate Pairs and Bad Beat are debited with the Ante, Blind and Trips+ in the deal transaction and paid in the settlement transaction, so they share the same exactly-once guarantees. Each hand row records the pay tables in force; each player row records stake, combination, multiplier and net per bonus bet (migration `002_side_bets.sql`). Strategy, EV and the main-game return figures exclude side bets.
 * **Bankrolls.** Each player has a stack per table, created at that table's starting bankroll on first sit. Once the stack can't cover a minimum hand (3× the minimum Ante) and no hand is in progress, the player may **Reload** back to the starting bankroll; reloads are counted in statistics.
 * **Scaling.** Live table state is in one Node process. Run exactly **one instance**; it comfortably hosts many concurrent tables.
 
@@ -113,6 +162,7 @@ Both tables are unchanged from the prototype.
 * **Create a private table** → copy the invite link (`/table/XXXXXXXX`) → friends open it, pick a name, and land in a free seat.
 * **Public tables** appear in the lobby when the host ticks "List in public tables".
 * **Practice solo** creates a one-seat table with no decision clock, using the same engine.
-* **Settings** (per device): strategy trainer (Casino / Training / Challenge), effects and ambience volume, full / fast / reduced motion, four-colour deck; per table: timeout policy and sit-out.
+* **Settings** (per device): strategy trainer (Casino / Training / Challenge), effects and ambience volume, full / fast / reduced motion, felt colour (emerald, sapphire, burgundy, charcoal, royal purple, teal), card backs (burgundy, navy, black, forest green, purple, gold), four-colour deck; per table: timeout policy and sit-out.
+* **Outs on mistakes**: every wrongly played street is listed after the hand in all modes. River mistakes show the dealer's single-card outs (the "fewer than 21" rule of thumb) and the exact number of the 990 dealer hands that beat you; flop mistakes show your outs to improve and the chance of hitting by the river. Training mode shows the same outs before you act. Pre-flop has no outs; it shows the reason and the EV cost.
 * **Host controls**: edit limits/timers/visibility between hands, remove a player, close the table. The host has no access to cards, the shuffle, payouts or anyone's chips.
 * **Keyboard**: 4 / 3 / 2 / 1 to play, C check, F fold, Enter to deal in.
