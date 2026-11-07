@@ -23,6 +23,14 @@ import { PROGRESSIVE, type ProgressiveAward } from './progressive.js';
 export const CHIP_DENOMINATIONS = [100, 500, 2500, 10000, 50000] as const; // $1 $5 $25 $100 $500
 
 /** Blind pays only when the player WINS with a straight or better. [numerator, denominator] */
+/**
+ * Rules version. Bumped whenever any pay table, rounding rule or eligibility rule changes; every hand
+ * records the version it was played under. 2026.11: Blind 3:2 rounded down to the dollar; Trips+ (WoO standard);
+ * Ultimate Pairs and Bad Beat per the selected table variant; $5 Five Card Progressive (hole + flop,
+ * live after a fold, Envy to other $5 bettors at the same table).
+ */
+export const RULES_VERSION = '2026.11';
+
 export const BLIND_PAYTABLE: Partial<Record<HandName, [number, number]>> = {
   'Royal Flush': [500, 1],
   'Straight Flush': [50, 1],
@@ -229,18 +237,22 @@ export interface TableLimits {
   progressiveEnabled?: boolean;
 }
 
-export interface InitialBets { ante: number; trips: number; pairs: number; badBeat: number; progressive: number }
-export const NO_BETS: InitialBets = { ante: 0, trips: 0, pairs: 0, badBeat: 0, progressive: 0 };
-export const sideTotal = (b: { trips: number; pairs?: number; badBeat?: number; progressive?: number }) =>
-  b.trips + (b.pairs ?? 0) + (b.badBeat ?? 0) + (b.progressive ?? 0);
+/** Opening bets. UTH uses ante/trips/pairs/badBeat/progressive; Three Card Poker uses ante/pairPlus/sixCard. */
+export interface InitialBets { ante: number; trips: number; pairs: number; badBeat: number; progressive: number; pairPlus: number; sixCard: number }
+export const NO_BETS: InitialBets = { ante: 0, trips: 0, pairs: 0, badBeat: 0, progressive: 0, pairPlus: 0, sixCard: 0 };
+export const sideTotal = (b: { trips: number; pairs?: number; badBeat?: number; progressive?: number; pairPlus?: number; sixCard?: number }) =>
+  b.trips + (b.pairs ?? 0) + (b.badBeat ?? 0) + (b.progressive ?? 0) + (b.pairPlus ?? 0) + (b.sixCard ?? 0);
+export type GameId = 'uth' | 'tcp';
+export const GAME_NAME: Record<GameId, string> = { uth: 'Ultimate Texas Hold’em', tcp: 'Three Card Poker' };
 
 /** Amount that must be available to start a hand: Ante + Blind + every side bet + a reserved 1x Play. */
 export function requiredToStart(ante: number, sideBets = 0): number {
   return ante * 3 + sideBets;
 }
 
-export function validateInitialBet(input: Omit<InitialBets, 'progressive'> & { progressive?: number }, balance: number, limits: TableLimits): string | null {
-  const b: InitialBets = { ...input, progressive: input.progressive ?? 0 };
+export function validateInitialBet(input: Omit<InitialBets, 'progressive' | 'pairPlus' | 'sixCard'> & { progressive?: number; pairPlus?: number; sixCard?: number }, balance: number, limits: TableLimits): string | null {
+  const b: InitialBets = { ...input, progressive: input.progressive ?? 0, pairPlus: input.pairPlus ?? 0, sixCard: input.sixCard ?? 0 };
+  if (b.pairPlus || b.sixCard) return 'Pair Plus and Six Card Bonus are Three Card Poker bets.';
   const vals = [b.ante, b.trips, b.pairs, b.badBeat, b.progressive];
   if (!vals.every((x) => typeof x === 'number' && Number.isSafeInteger(x))) return 'Bets must be whole amounts.';
   if (vals.some((x) => x < 0)) return 'Bets cannot be negative.';
@@ -260,18 +272,36 @@ export function validateInitialBet(input: Omit<InitialBets, 'progressive'> & { p
 }
 
 export type Decision = 'check' | 'fold' | 'play4' | 'play3' | 'play2' | 'play1';
-export type DecisionPhase = 'preflop' | 'flop' | 'river';
+export type DecisionPhase = 'preflop' | 'flop' | 'river' | 'decide';
 
 export const LEGAL_DECISIONS: Record<DecisionPhase, Decision[]> = {
   preflop: ['play4', 'play3', 'check'],
   flop: ['play2', 'check'],
   river: ['play1', 'fold'],
+  decide: ['play1', 'fold'],          // Three Card Poker: one decision, Play 1x or Fold
 };
 
 export const PLAY_MULTIPLIER: Partial<Record<Decision, number>> = { play4: 4, play3: 3, play2: 2, play1: 1 };
 
 /** Decision applied when the server-side timer expires. */
-export const TIMEOUT_DEFAULT: Record<DecisionPhase, Decision> = { preflop: 'check', flop: 'check', river: 'fold' };
+export const TIMEOUT_DEFAULT: Record<DecisionPhase, Decision> = { preflop: 'check', flop: 'check', river: 'fold', decide: 'fold' };
+
+/** Three Card Poker opening bets: Ante (required), Pair Plus and Six Card Bonus (optional), plus a 1x Play reserve. */
+export function validateTcpBet(b: InitialBets, balance: number, limits: { minAnte: number; maxAnte: number; maxPairPlus: number; maxSixCard: number }): string | null {
+  const vals = [b.ante, b.pairPlus, b.sixCard];
+  if (!vals.every((x) => typeof x === 'number' && Number.isSafeInteger(x))) return 'Bets must be whole amounts.';
+  if (vals.some((x) => x < 0)) return 'Bets cannot be negative.';
+  if (vals.some((x) => x % 100 !== 0)) return 'Bets must be in whole dollars.';
+  if (b.trips || b.pairs || b.badBeat || b.progressive) return 'Trips+, Ultimate Pairs, Bad Beat and the Progressive are Ultimate Texas Hold’em bets.';
+  if (b.ante < limits.minAnte) return `Minimum Ante is $${limits.minAnte / 100}.`;
+  if (b.ante > limits.maxAnte) return `Maximum Ante is $${limits.maxAnte / 100}.`;
+  if (b.pairPlus > limits.maxPairPlus) return `Maximum Pair Plus is $${limits.maxPairPlus / 100}.`;
+  if (b.sixCard > limits.maxSixCard) return `Maximum Six Card Bonus is $${limits.maxSixCard / 100}.`;
+  const need = b.ante * 2 + b.pairPlus + b.sixCard;
+  if (need > balance) return `You need $${need / 100} available (Ante + side bets + a 1x Play reserve).`;
+  return null;
+}
+export const tcpRequiredToStart = (ante: number) => ante * 2;
 
 export function decisionLabel(d: Decision): string {
   return ({ check: 'Check', fold: 'Fold', play4: 'Play 4x', play3: 'Play 3x', play2: 'Play 2x', play1: 'Play 1x' })[d];

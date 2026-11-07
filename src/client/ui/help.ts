@@ -1,7 +1,8 @@
-import { BLIND_PAYTABLE, TRIPS_PAYTABLE } from '../../shared/rules.js';
+import { BLIND_PAYTABLE, RULES_VERSION, TRIPS_PAYTABLE } from '../../shared/rules.js';
 import type { TableConfig } from '../../shared/protocol.js';
 import { BAD_BEAT_VARIANTS, PAIRS_VARIANTS, type BadBeatVariant, type PairsVariant } from '../../shared/sidebets.js';
 import { PROGRESSIVE } from '../../shared/progressive.js';
+import { ANTE_BONUS, PAIR_PLUS, SIX_CARD, TCP_RULES_VERSION, TCP_SOURCES } from '../../shared/tcp.js';
 import { h, modal, money } from '../dom.js';
 
 export function openHelp() {
@@ -35,6 +36,14 @@ export function openHelp() {
     h('div', { class: 'pay-grid' }, progressiveTable()),
     h('h3', {}, 'After the round'),
     h('p', {}, 'Once a hand is settled every player’s cards are turned face up, folded hands included, the way a dealer spreads them at a real table. Nobody sees another player’s cards while the hand is being played.'),
+    h('h3', {}, 'Three Card Poker'),
+    h('p', {}, 'The host can switch the table to Three Card Poker between hands. Everyone keeps their seat and chips.'),
+    h('ol', { class: 'steps' },
+      h('li', {}, 'Place an Ante. Pair Plus and Six Card Bonus are optional. Keep enough free for a Play bet equal to your Ante.'),
+      h('li', {}, 'You and the dealer each get three cards. Decide once: Play 1× or Fold. Standard strategy: play Queen-6-4 or better.'),
+      h('li', {}, 'The dealer qualifies with Queen high or better. If not, your Ante pays 1:1 and Play pushes. If so, the higher hand wins Ante and Play 1:1; a tie pushes.'),
+      h('li', {}, 'Three-card ranks: Straight Flush, Three of a Kind, Straight, Flush, Pair, High Card — a straight beats a flush. A-2-3 is the lowest straight, A-K-Q the highest.')),
+    h('div', { class: 'pay-grid' }, ...tcpTables()),
     h('h3', {}, 'Timers'),
     h('p', {}, 'At multiplayer tables the server runs a decision clock. If yours runs out you check pre-flop and on the flop, and fold on the river (or play basic strategy, if you turn that on in Settings). Disconnecting doesn’t stop the table; your seat is held for two minutes.'),
     h('h3', {}, 'Keyboard'),
@@ -44,6 +53,16 @@ export function openHelp() {
 }
 
 const n = (x: number) => x.toLocaleString('en-US');
+/** Three Card Poker pay tables: Ante Bonus, Pair Plus, Six Card Bonus. */
+export function tcpTables() {
+  const rows = (o: Partial<Record<string, number>>) => Object.entries(o).map(([k, v]) => [k, `${v!.toLocaleString('en-US')} to 1`] as [string, string]);
+  return [
+    h('div', {}, h('h4', {}, 'Ante Bonus'), payRows(rows(ANTE_BONUS)), h('p', { class: 'muted tiny' }, 'Automatic with a Play bet, paid on the Ante even if the dealer wins. Not after a fold.')),
+    h('div', {}, h('h4', {}, 'Pair Plus'), payRows(rows(PAIR_PLUS)), h('p', { class: 'muted tiny' }, 'Your three cards only. Pays even if you fold.')),
+    h('div', {}, h('h4', {}, 'Six Card Bonus'), payRows(rows(SIX_CARD)), h('p', { class: 'muted tiny' }, 'Best five of your three + the dealer’s three, normal poker ranks. Pays even if you fold.')),
+  ];
+}
+
 const payRows = (rows: [string, string][]) => h('table', { class: 'paytable' }, ...rows.map(([a, b]) => h('tr', {}, h('td', {}, a), h('td', {}, b))));
 const sourceLine = (v: PairsVariant | BadBeatVariant) => h('p', { class: 'muted tiny' }, 'Source: ',
   h('a', { href: v.source.url, target: '_blank', rel: 'noopener' }, v.source.title), `, ${v.source.section}.`);
@@ -71,13 +90,22 @@ export function progressiveTable(jackpot?: number) {
 
 /** The pay tables in force at one table — shown before anyone bets. */
 export function openPayTables(c: TableConfig, jackpot?: number) {
+  if (c.game === 'tcp') {
+    modal(`Pay tables at ${c.name}`, h('div', { class: 'help' },
+      h('p', {}, h('b', {}, 'Three Card Poker. '), 'Dealer qualifies with Queen high or better. Not qualified: Ante pays 1:1, Play pushes. Otherwise higher hand wins Ante and Play 1:1; a tie pushes.'),
+      h('div', { class: 'pay-grid' }, ...tcpTables()),
+      h('p', { class: 'muted' }, `Bonus limits: Pair Plus up to $${c.maxPairPlus / 100}, Six Card Bonus up to $${c.maxSixCard / 100}. The Hold’em progressive doesn’t run during Three Card Poker; its jackpot is kept for when the table switches back.`),
+      h('p', { class: 'muted tiny' }, `Rules ${TCP_RULES_VERSION}. Sources: `, ...TCP_SOURCES.flatMap((s, i) => [i ? ' · ' : '', h('a', { href: s.url, target: '_blank', rel: 'noopener' }, s.title)]))), { wide: true });
+    return;
+  }
   modal(`Pay tables at ${c.name}`, h('div', { class: 'help' },
     h('div', { class: 'pay-grid' },
       h('div', {}, h('h4', {}, 'Blind'), payRows(Object.entries(BLIND_PAYTABLE).map(([k, [a, b]]) => [k, `${a} to ${b}`]))),
       h('div', {}, h('h4', {}, 'Trips+'), payRows(Object.entries(TRIPS_PAYTABLE).map(([k, x]) => [k, `${x} to 1`])))),
     h('div', { class: 'pay-grid' }, pairsTable(PAIRS_VARIANTS[c.pairsVariant]), badBeatTable(BAD_BEAT_VARIANTS[c.badBeatVariant])),
     c.progressive ? h('div', { class: 'pay-grid' }, progressiveTable(jackpot)) : h('p', { class: 'muted' }, 'The progressive is switched off at this table.'),
-    h('p', { class: 'muted' }, `Blind flush (3 to 2) is rounded down to the dollar. Bonus limits: Trips+ up to $${c.maxTrips / 100}, Ultimate Pairs up to $${c.maxPairs / 100}, Bad Beat up to $${c.maxBadBeat / 100}. Pay tables only change between hands, and every change is announced in chat.`)),
+    h('p', { class: 'muted' }, `Blind flush (3 to 2) is rounded down to the dollar. Bonus limits: Trips+ up to $${c.maxTrips / 100}, Ultimate Pairs up to $${c.maxPairs / 100}, Bad Beat up to $${c.maxBadBeat / 100}. Pay tables only change between hands, and every change is announced in chat.`),
+    h('p', { class: 'muted tiny' }, `Rules version ${RULES_VERSION}. Every hand records the rules version and pay tables it was played under.`)),
     { wide: true });
 }
 

@@ -5,6 +5,8 @@
 //   * a hand is settled at most once.
 
 import type { DecisionRecord, TableConfig } from '../shared/protocol.js';
+import type { NightHand } from '../shared/recap.js';
+import type { GameId } from '../shared/rules.js';
 
 export interface PlayerRow { id: string; name: string; avatar: string }
 export interface StackRow { balance: number; reloads: number; debt: number }
@@ -13,12 +15,17 @@ export interface TableRow { code: string; hostId: string; config: TableConfig; h
 export interface HandStartPlayer {
   playerId: string; seat: number; name: string; hole: string[];
   ante: number; blind: number; trips: number; pairs: number; badBeat: number; progressive: number;
+  pairPlus?: number; sixCard?: number;
 }
 export interface HandStart {
   id: string; tableCode: string; handNumber: number; deckCommitment: string;
   dealerCards: string[]; community: string[]; players: HandStartPlayer[];
   pairsVariant: string; badBeatVariant: string;
+  nightId: string; rulesVersion: string;
+  game?: GameId;
 }
+export interface DebtEvent { id: number; playerId: string; name: string; kind: 'marker' | 'payoff'; amount: number; debtAfter: number; item: string; at: number }
+export interface NightRow { id: string; tableCode: string; startedAt: number; endedAt: number | null; hands: number }
 export interface PlayerSettlementRow {
   playerId: string; credit: number; net: number; outcome: string; handName: string; handRank: number;
   tripsNet: number; play: number; folded: boolean; settlement: unknown;
@@ -26,6 +33,7 @@ export interface PlayerSettlementRow {
   pairsMultiplier: number | null; badBeatMultiplier: number | null;
   pairsVariant: string | null; badBeatVariant: string | null; baseNet: number;
   progressiveNet: number; progressiveHand: string | null;
+  pairPlusNet?: number; sixCardNet?: number; anteBonusNet?: number; pairPlusHand?: string | null; sixCardHand?: string | null;
 }
 
 export interface SideBetStats {
@@ -41,7 +49,8 @@ export interface PlayerStats {
   commonMistakes: { phase: string; action: string; recommended: string; count: number; evCost: number }[];
   evLost: number;
   trips: { bets: number; wins: number; net: number };
-  side: { trips: SideBetStats; pairs: SideBetStats; badBeat: SideBetStats; progressive: SideBetStats };
+  side: { trips: SideBetStats; pairs: SideBetStats; badBeat: SideBetStats; progressive: SideBetStats; pairPlus: SideBetStats; sixCard: SideBetStats };
+  game: GameId | null;
   baseNet: number; baseWagered: number;
   handsWithFriends: number; reloads: number; tables: number; debt: number;
   series: { at: string; cumulative: number }[];
@@ -51,10 +60,10 @@ export interface ReplayData {
   handId: string; tableCode: string; handNumber: number; startedAt: string; settledAt: string | null;
   status: string; dealer: string[]; community: string[]; dealerHand: string | null; dealerQualifies: boolean | null;
   deckCommitment: string;
-  pairsVariant: string | null; badBeatVariant: string | null;
+  pairsVariant: string | null; badBeatVariant: string | null; rulesVersion: string | null; game: GameId;
   players: {
     playerId: string; name: string; seat: number; hole: string[] | null; folded: boolean;
-    ante: number; blind: number; trips: number; pairs: number; badBeat: number; progressive: number; play: number; net: number | null; outcome: string | null;
+    ante: number; blind: number; trips: number; pairs: number; badBeat: number; progressive: number; pairPlus: number; sixCard: number; play: number; net: number | null; outcome: string | null;
     handName: string | null; settlement: unknown;
   }[];
   decisions: (DecisionRecord & { playerId: string; at: string })[];
@@ -78,7 +87,11 @@ export interface Store {
 
   getStack(playerId: string, code: string): Promise<StackRow | null>;
   createStack(playerId: string, code: string, amount: number): Promise<StackRow>;
-  reloadStack(playerId: string, code: string, amount: number): Promise<StackRow>;
+  reloadStack(playerId: string, code: string, amount: number, pawn?: { name: string; item: string }): Promise<StackRow>;
+  /** Pays back up to `amount` of the stack's debt from its balance. Returns the new stack and what was paid. */
+  payDebt(playerId: string, code: string, amount: number, pawn: { name: string; item: (debtAfter: number) => string }): Promise<StackRow & { paid: number }>;
+  /** The table's pawn-shop log, newest first. */
+  debtEvents(code: string, limit: number): Promise<DebtEvent[]>;
 
   /** Atomically records the hand, debits every initial wager, and adds progressive contributions to the meter. */
   startHand(h: HandStart): Promise<{ balances: Map<string, number>; jackpot: number }>;
@@ -97,9 +110,23 @@ export interface Store {
   /** Startup recovery: refund every committed stake of hands interrupted by a restart. */
   voidActiveHands(): Promise<{ hands: number; refunds: number }>;
 
-  playerStats(playerId: string): Promise<PlayerStats>;
+  /** Statistics for one game, or all games when `game` is omitted. The bankroll series always covers every game. */
+  playerStats(playerId: string, game?: GameId): Promise<PlayerStats>;
   recentHands(code: string, limit: number): Promise<RecentHandRow[]>;
   handReplay(handId: string): Promise<ReplayData | null>;
+  /**
+   * The table's open night. Opens a new one (closing the old) when there is none, when the last settled
+   * hand is older than `idleMs`, or when `fresh` is set by the host.
+   */
+  openNight(code: string, idleMs: number, fresh: boolean): Promise<NightRow>;
+  /** Closes the open night; returns it, or null if none was open. */
+  endNight(code: string): Promise<NightRow | null>;
+  getNight(id: string): Promise<NightRow | null>;
+  listNights(code: string, limit: number): Promise<NightRow[]>;
+  /** Settled hands of a night, oldest first. */
+  nightHands(nightId: string): Promise<NightHand[]>;
+  /** Ledger totals by kind for one stack (signed cents): buyin, wager, payout, refund, reload. */
+  ledgerSummary(playerId: string, code: string): Promise<Record<string, number>>;
   /** Sum of ledger amounts for a stack — used to reconcile balances in tests and audits. */
   ledgerSum(playerId: string, code: string): Promise<number>;
 }

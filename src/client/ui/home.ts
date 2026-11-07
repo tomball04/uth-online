@@ -1,5 +1,5 @@
 import type { PublicTableListing } from '../../shared/protocol.js';
-import { api, session, signIn } from '../api.js';
+import { api, restoreWithCode, session, signIn } from '../api.js';
 import { cardEl } from '../cardView.js';
 import { h, modal, money, toast } from '../dom.js';
 import { resetSocket } from '../net.js';
@@ -28,6 +28,7 @@ export function mountHome(root: HTMLElement, nav: (path: string) => void, opts: 
     });
     root.replaceChildren(h('main', { class: 'home' }, h('section', { class: 'hero' }, fan, h('h1', {}, 'Ultimate Texas Hold’em'),
       h('p', { class: 'lede' }, 'Pull up a chair with up to five friends. Everyone plays their own hand against one dealer.'), form,
+      h('button', { class: 'link restore-link', onclick: () => restoreFromCode(() => { resetSocket(); if (opts.joinCode) nav(`/table/${opts.joinCode}`); else mountHome(root, nav); }) }, 'Have a restore code?'),
       h('p', { class: 'fine' }, 'Virtual chips only. Nothing here can be bought, won or cashed out.'))));
     setTimeout(() => input.focus(), 50);
     return;
@@ -63,9 +64,9 @@ export function mountHome(root: HTMLElement, nav: (path: string) => void, opts: 
     try {
       const { tables } = await api<{ tables: PublicTableListing[] }>('/api/tables');
       publicList.replaceChildren(tables.length ? h('table', { class: 'tables' },
-        h('thead', {}, h('tr', {}, h('th', {}, 'Table'), h('th', {}, 'Seats'), h('th', {}, 'Ante'), h('th', {}, 'Status'), h('th', {}))),
+        h('thead', {}, h('tr', {}, h('th', {}, 'Table'), h('th', {}, 'Game'), h('th', {}, 'Seats'), h('th', {}, 'Ante'), h('th', {}, 'Status'), h('th', {}))),
         h('tbody', {}, ...tables.map((t) => h('tr', {},
-          h('td', {}, t.name), h('td', { class: 'num' }, `${t.seated} / ${t.maxSeats}`),
+          h('td', {}, t.name), h('td', {}, t.game === 'tcp' ? 'Three Card Poker' : 'Ultimate Hold’em'), h('td', { class: 'num' }, `${t.seated} / ${t.maxSeats}`),
           h('td', { class: 'num' }, `${money(t.minAnte)}–${money(t.maxAnte)}`),
           h('td', {}, t.inHand ? 'Hand in progress' : 'Between hands'),
           h('td', {}, t.seated < t.maxSeats ? h('button', { class: 'btn small gold', onclick: () => nav(`/table/${t.code}`) }, 'Sit down')
@@ -130,4 +131,18 @@ function openCreate(nav: (p: string) => void) {
       nav(`/table/${code}`);
     } catch (err: any) { toast(err.message, 'error'); }
   });
+}
+
+/** Sign in on this device with the restore code copied from another one. */
+function restoreFromCode(done: () => void) {
+  const input = h('input', { placeholder: 'Paste your restore code', 'aria-label': 'Restore code', autocomplete: 'off' }) as HTMLInputElement;
+  const form = h('form', { class: 'stack' },
+    h('p', { class: 'muted' }, 'Find it on your other device under Settings → Use another device.'),
+    input, h('button', { class: 'btn gold' }, 'Restore'));
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    try { await restoreWithCode(input.value); m.close(); toast('Welcome back.', 'success'); done(); }
+    catch (err) { toast((err as Error).message, 'error'); }
+  });
+  const m = modal('Restore your player', form);
 }
