@@ -64,9 +64,9 @@ export function mountHome(root: HTMLElement, nav: (path: string) => void, opts: 
     try {
       const { tables } = await api<{ tables: PublicTableListing[] }>('/api/tables');
       publicList.replaceChildren(tables.length ? h('table', { class: 'tables' },
-        h('thead', {}, h('tr', {}, h('th', {}, 'Table'), h('th', {}, 'Seats'), h('th', {}, 'Ante'), h('th', {}, 'Status'), h('th', {}))),
+        h('thead', {}, h('tr', {}, h('th', {}, 'Table'), h('th', {}, 'Game'), h('th', {}, 'Seats'), h('th', {}, 'Ante'), h('th', {}, 'Status'), h('th', {}))),
         h('tbody', {}, ...tables.map((t) => h('tr', {},
-          h('td', {}, t.name), h('td', { class: 'num' }, `${t.seated} / ${t.maxSeats}`),
+          h('td', {}, t.name), h('td', {}, t.game === 'tcp' ? 'Three Card Poker' : 'Ultimate Hold’em'), h('td', { class: 'num' }, `${t.seated} / ${t.maxSeats}`),
           h('td', { class: 'num' }, `${money(t.minAnte)}–${money(t.maxAnte)}`),
           h('td', {}, t.inHand ? 'Hand in progress' : 'Between hands'),
           h('td', {}, t.seated < t.maxSeats ? h('button', { class: 'btn small gold', onclick: () => nav(`/table/${t.code}`) }, 'Sit down')

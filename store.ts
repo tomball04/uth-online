@@ -6,6 +6,7 @@
 
 import type { DecisionRecord, TableConfig } from '../shared/protocol.js';
 import type { NightHand } from '../shared/recap.js';
+import type { GameId } from '../shared/rules.js';
 
 export interface PlayerRow { id: string; name: string; avatar: string }
 export interface StackRow { balance: number; reloads: number; debt: number }
@@ -14,12 +15,14 @@ export interface TableRow { code: string; hostId: string; config: TableConfig; h
 export interface HandStartPlayer {
   playerId: string; seat: number; name: string; hole: string[];
   ante: number; blind: number; trips: number; pairs: number; badBeat: number; progressive: number;
+  pairPlus?: number; sixCard?: number;
 }
 export interface HandStart {
   id: string; tableCode: string; handNumber: number; deckCommitment: string;
   dealerCards: string[]; community: string[]; players: HandStartPlayer[];
   pairsVariant: string; badBeatVariant: string;
   nightId: string; rulesVersion: string;
+  game?: GameId;
 }
 export interface DebtEvent { id: number; playerId: string; name: string; kind: 'marker' | 'payoff'; amount: number; debtAfter: number; item: string; at: number }
 export interface NightRow { id: string; tableCode: string; startedAt: number; endedAt: number | null; hands: number }
@@ -30,6 +33,7 @@ export interface PlayerSettlementRow {
   pairsMultiplier: number | null; badBeatMultiplier: number | null;
   pairsVariant: string | null; badBeatVariant: string | null; baseNet: number;
   progressiveNet: number; progressiveHand: string | null;
+  pairPlusNet?: number; sixCardNet?: number; anteBonusNet?: number; pairPlusHand?: string | null; sixCardHand?: string | null;
 }
 
 export interface SideBetStats {
@@ -45,7 +49,8 @@ export interface PlayerStats {
   commonMistakes: { phase: string; action: string; recommended: string; count: number; evCost: number }[];
   evLost: number;
   trips: { bets: number; wins: number; net: number };
-  side: { trips: SideBetStats; pairs: SideBetStats; badBeat: SideBetStats; progressive: SideBetStats };
+  side: { trips: SideBetStats; pairs: SideBetStats; badBeat: SideBetStats; progressive: SideBetStats; pairPlus: SideBetStats; sixCard: SideBetStats };
+  game: GameId | null;
   baseNet: number; baseWagered: number;
   handsWithFriends: number; reloads: number; tables: number; debt: number;
   series: { at: string; cumulative: number }[];
@@ -55,10 +60,10 @@ export interface ReplayData {
   handId: string; tableCode: string; handNumber: number; startedAt: string; settledAt: string | null;
   status: string; dealer: string[]; community: string[]; dealerHand: string | null; dealerQualifies: boolean | null;
   deckCommitment: string;
-  pairsVariant: string | null; badBeatVariant: string | null; rulesVersion: string | null;
+  pairsVariant: string | null; badBeatVariant: string | null; rulesVersion: string | null; game: GameId;
   players: {
     playerId: string; name: string; seat: number; hole: string[] | null; folded: boolean;
-    ante: number; blind: number; trips: number; pairs: number; badBeat: number; progressive: number; play: number; net: number | null; outcome: string | null;
+    ante: number; blind: number; trips: number; pairs: number; badBeat: number; progressive: number; pairPlus: number; sixCard: number; play: number; net: number | null; outcome: string | null;
     handName: string | null; settlement: unknown;
   }[];
   decisions: (DecisionRecord & { playerId: string; at: string })[];
@@ -105,7 +110,8 @@ export interface Store {
   /** Startup recovery: refund every committed stake of hands interrupted by a restart. */
   voidActiveHands(): Promise<{ hands: number; refunds: number }>;
 
-  playerStats(playerId: string): Promise<PlayerStats>;
+  /** Statistics for one game, or all games when `game` is omitted. The bankroll series always covers every game. */
+  playerStats(playerId: string, game?: GameId): Promise<PlayerStats>;
   recentHands(code: string, limit: number): Promise<RecentHandRow[]>;
   handReplay(handId: string): Promise<ReplayData | null>;
   /**

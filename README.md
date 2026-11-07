@@ -157,6 +157,23 @@ Sources: Hollywood Casino at Penn National Race Course, *Ultimate Texas Hold'em 
 * **Bankrolls.** Each player has a stack per table, created at that table's starting bankroll on first sit. Once the stack can't cover a minimum hand (3× the minimum Ante) and no hand is in progress, the player may **Reload** back to the starting bankroll; reloads are counted in statistics.
 * **Scaling.** Live table state is in one Node process. Run exactly **one instance**; it comfortably hosts many concurrent tables.
 
+## Three Card Poker (scope addendum §23)
+
+The same table, room, players, chat, chips and history can play **Three Card Poker**. The host picks the game in **Host controls → Casino game** (confirmation: *Switch this table to Three Card Poker? Everyone will remain seated…*). During a hand the switch is queued and applied only after that hand has fully settled; uncommitted bets, Ready states, Rebet and Same-bet presets are released; everyone sees "Tom changed the table to Three Card Poker." The server owns the game mode (`TableConfig.game`), shown in the lobby and invitation view.
+
+* **Deal:** one 52-card deck, one card at a time to each player then the dealer, three rounds. No community cards. Your cards are private until settlement; the dealer's are hidden until the reveal.
+* **Bets:** Ante (required), Pair Plus and Six Card Bonus (optional, limits set by the host). You need Ante × 2 + side bets free (the 1× Play reserve).
+* **Decision:** one, simultaneous: **Play 1×** or **Fold**. Timeout folds. Reconnecting players keep their wagers and cards.
+* **Dealer qualifies with Queen high or better.** Not qualified: Ante 1:1, Play pushes. Qualified: higher hand wins Ante and Play 1:1, lower loses both, exact tie pushes both.
+* **Three-card ranks** (`src/shared/tcp.ts`, `evaluate3`): Straight Flush > Three of a Kind > Straight > Flush > Pair > High Card. A-K-Q highest straight, A-2-3 lowest.
+* **Ante Bonus** (automatic, needs Play, paid even if the dealer wins): Straight Flush 5:1, Trips 4:1, Straight 1:1.
+* **Pair Plus** (your three cards only, live after a fold): 40 / 30 / 6 / 3 / 1.
+* **Six Card Bonus** (best five of your three + the dealer's three, standard five-card ranks via the existing evaluator, live after a fold): Royal 1,000, Straight Flush 200, Quads 100, Full House 20, Flush 15, Straight 10, Trips 7.
+* **Strategy trainer:** Queen-6-4 or better plays. Training mode also shows the exact EV of Play vs Fold over all 18,424 possible dealer hands (never the real hidden cards); mistakes are priced exactly after the hand.
+* **Isolation:** Hold'em side bets are refused in Three Card Poker and vice versa (server-checked). The Hold'em progressive gets no contributions, awards or resets during Three Card Poker; its meter and history are untouched.
+* **One bankroll, separate statistics:** chips carry over between games. Every hand stores `hands.game` and its rules version (`tcp-2026.11` or `2026.11`). Statistics have *All games / Ultimate Hold'em / Three Card Poker* tabs; the bankroll graph is combined. Replays, Tonight and recaps handle both games.
+* Sources: [Wizard of Odds — Three Card Poker](https://wizardofodds.com/games/three-card-poker/), [Wizard of Odds — Six Card Bonus](https://wizardofodds.com/games/three-card-poker/six-card-bonus/). Migration `008_three_card_poker.sql`.
+
 ## Using it
 
 * **Create a private table** → copy the invite link (`/table/XXXXXXXX`) → friends open it, pick a name, and land in a free seat.

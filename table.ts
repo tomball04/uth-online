@@ -4,6 +4,8 @@ import { REACTIONS } from '../../shared/protocol.js';
 import { BLIND_PAYTABLE, NO_BETS, TRIPS_PAYTABLE, requiredToStart, sideTotal, type Decision, type DecisionPhase, type InitialBets } from '../../shared/rules.js';
 import { BAD_BEAT_VARIANTS, PAIRS_VARIANTS, previewPairs } from '../../shared/sidebets.js';
 import { PROGRESSIVE, progressiveHand } from '../../shared/progressive.js';
+import { tcpAdvice } from '../../shared/tcp.js';
+import { GAME_NAME, tcpRequiredToStart, type GameId } from '../../shared/rules.js';
 import { pawnFor } from '../../shared/debt.js';
 import type { WagerKey } from '../../shared/protocol.js';
 import { advise } from '../../shared/strategy.js';
@@ -43,11 +45,16 @@ const LAYOUTS_TALL: Record<number, [number, number][]> = {
   6: [[12, 57], [12, 77], [33, 92], [67, 92], [88, 77], [88, 57]],
 };
 
-const ALL_WAGERS: WagerKey[] = ['ante', 'blind', 'play', 'trips', 'pairs', 'badBeat', 'progressive'];
-const BETTABLE: WagerKey[] = ['ante', 'trips', 'pairs', 'badBeat', 'progressive'];
-const SIDE_KEYS = ['trips', 'pairs', 'badBeat', 'progressive'] as const;
-const WAGER_NAME: Record<WagerKey, string> = { ante: 'Ante', blind: 'Blind', play: 'Play', trips: 'Trips+', pairs: 'Ultimate Pairs', badBeat: 'Bad Beat', progressive: '$5 Progressive' };
+const ALL_WAGERS: WagerKey[] = ['ante', 'blind', 'play', 'trips', 'pairs', 'badBeat', 'progressive', 'pairPlus', 'sixCard'];
+const BETTABLE: WagerKey[] = ['ante', 'trips', 'pairs', 'badBeat', 'progressive', 'pairPlus', 'sixCard'];
+const SIDE_KEYS = ['trips', 'pairs', 'badBeat', 'progressive', 'pairPlus', 'sixCard'] as const;
+/** Bonus bets offered by each game; the other game's circles are hidden and refused by the server. */
+const GAME_SIDES: Record<GameId, readonly (typeof SIDE_KEYS)[number][]> = { uth: ['trips', 'pairs', 'badBeat', 'progressive'], tcp: ['pairPlus', 'sixCard'] };
+const WAGER_NAME: Record<WagerKey, string> = { ante: 'Ante', blind: 'Blind', play: 'Play', trips: 'Trips+', pairs: 'Ultimate Pairs', badBeat: 'Bad Beat',
+  progressive: '$5 Progressive', anteBonus: 'Ante Bonus', pairPlus: 'Pair Plus', sixCard: 'Six Card Bonus' };
 
+/** Chips you need free to open a hand: Ante + Blind + 1x Play reserve in Hold'em, Ante + 1x Play reserve in Three Card Poker. */
+const needFor = (game: GameId, ante: number, sides: number) => (game === 'tcp' ? tcpRequiredToStart(ante) : requiredToStart(ante)) + sides;
 const narrowScreen = () => matchMedia('(max-width: 760px)').matches;
 const DECISION_LABEL: Record<Decision, string> = { play4: 'Play 4×', play3: 'Play 3×', play2: 'Play 2×', play1: 'Play 1×', check: 'Check', fold: 'Fold' };
 const MULT: Partial<Record<Decision, number>> = { play4: 4, play3: 3, play2: 2, play1: 1 };
@@ -71,7 +78,8 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
   const muted = new Set<string>(JSON.parse(localStorage.getItem('uth.muted') ?? '[]'));
   const analysis = new Map<string, DecisionRecord[]>();
   const sessionStats = { hands: 0, net: 0, baseNet: 0, decisions: 0, correct: 0, evLostCents: 0, series: [] as number[],
-    side: { trips: { bets: 0, wins: 0, net: 0 }, pairs: { bets: 0, wins: 0, net: 0 }, badBeat: { bets: 0, wins: 0, net: 0 }, progressive: { bets: 0, wins: 0, net: 0 } } };
+    side: { trips: { bets: 0, wins: 0, net: 0 }, pairs: { bets: 0, wins: 0, net: 0 }, badBeat: { bets: 0, wins: 0, net: 0 }, progressive: { bets: 0, wins: 0, net: 0 },
+      pairPlus: { bets: 0, wins: 0, net: 0 }, sixCard: { bets: 0, wins: 0, net: 0 } } };
   let panel: 'chat' | 'table' | 'night' = 'chat';
   let panelOpenMobile = false;
   let unread = 0;
@@ -123,17 +131,29 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
   }
 
   // Gold lettering printed on the felt, as on a real layout. Separate artwork for the wide and tall tables.
-  const feltPrint = svg(`<svg class="felt-print fp-wide" viewBox="0 0 1000 562" aria-hidden="true">
+  const feltPrint = svg(`<svg class="felt-print fp-wide g-uth" viewBox="0 0 1000 562" aria-hidden="true">
     <defs><path id="arcW" d="M 190 328 Q 500 458 810 328" /></defs>
     <text class="fp-big"><textPath href="#arcW" startOffset="50%" text-anchor="middle">ULTIMATE TEXAS HOLD'EM</textPath></text>
     <text class="fp-small" x="500" y="166" text-anchor="middle">DEALER QUALIFIES WITH A PAIR OR BETTER</text>
   </svg>`);
-  const feltPrintTall = svg(`<svg class="felt-print fp-tall" viewBox="0 0 1000 980" aria-hidden="true">
+  const feltPrintTall = svg(`<svg class="felt-print fp-tall g-uth" viewBox="0 0 1000 980" aria-hidden="true">
     <defs><path id="arcT" d="M 70 585 Q 500 770 930 585" /></defs>
     <text class="fp-big"><textPath href="#arcT" startOffset="50%" text-anchor="middle">ULTIMATE TEXAS HOLD'EM</textPath></text>
   </svg>`);
+  // Three Card Poker layout: the same felt and rail, its own printing — name across the middle, qualifier under the dealer.
+  const tcpPrint = svg(`<svg class="felt-print fp-wide g-tcp" viewBox="0 0 1000 562" aria-hidden="true">
+    <defs><path id="arcW3" d="M 210 300 Q 500 420 790 300" /></defs>
+    <text class="fp-big"><textPath href="#arcW3" startOffset="50%" text-anchor="middle">THREE CARD POKER</textPath></text>
+    <text class="fp-small" x="500" y="238" text-anchor="middle">DEALER QUALIFIES WITH QUEEN HIGH OR BETTER</text>
+    <text class="fp-small" x="500" y="374" text-anchor="middle">PAIR PLUS · ANTE BONUS · SIX CARD BONUS</text>
+  </svg>`);
+  const tcpPrintTall = svg(`<svg class="felt-print fp-tall g-tcp" viewBox="0 0 1000 980" aria-hidden="true">
+    <defs><path id="arcT3" d="M 110 470 Q 500 640 890 470" /></defs>
+    <text class="fp-big"><textPath href="#arcT3" startOffset="50%" text-anchor="middle">THREE CARD POKER</textPath></text>
+    <text class="fp-small" x="500" y="300" text-anchor="middle">DEALER QUALIFIES WITH QUEEN HIGH OR BETTER</text>
+  </svg>`);
 
-  const dealerCards = [cardEl(null, 'empty'), cardEl(null, 'empty')];
+  const dealerCards = [cardEl(null, 'empty'), cardEl(null, 'empty'), cardEl(null, 'empty g-tcp')];
   const dealerName = h('div', { class: 'hand-name dealer-hn' });
   const dealerBubble = h('div', { class: 'bubble' });
   const community = Array.from({ length: 5 }, () => cardEl(null, 'empty'));
@@ -142,15 +162,15 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
   const phaseLine = h('div', { class: 'phase-line' });
 
   const felt = h('div', { class: 'felt' },
-    feltPrint, feltPrintTall, tray, shoe,
+    feltPrint, feltPrintTall, tcpPrint, tcpPrintTall, tray, shoe,
     h('div', { class: 'dealer-zone' }, dealerBubble, h('div', { class: 'cards-row' }, ...dealerCards), dealerName),
-    h('div', { class: 'community' }, h('div', { class: 'cards-row' }, ...community), phaseLine));
+    h('div', { class: 'community' }, h('div', { class: 'cards-row g-uth' }, ...community), phaseLine));
   const seatEls: SeatEls[] = Array.from({ length: 6 }, (_, i) => makeSeat(i));
   seatEls.forEach((s) => felt.append(s.root));
   const tableEl = h('div', { class: 'rail' }, felt);
 
   // Dock: my hand + controls
-  const myCards = [cardEl(null, 'empty big'), cardEl(null, 'empty big')];
+  const myCards = [cardEl(null, 'empty big'), cardEl(null, 'empty big'), cardEl(null, 'empty big g-tcp')];
   const myHandName = h('div', { class: 'my-hn' });
   const hint = h('div', { class: 'hint', hidden: true });
   const timerBar = h('div', { class: 'timer' }, h('i'));
@@ -158,7 +178,14 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     ante: spot('Ante', 'ante'), blind: spot('Blind', 'blind'), play: spot('Play', 'play'),
     trips: spot('Trips+', 'trips', true), pairs: spot('Ultimate Pairs', 'pairs', true), badBeat: spot('Bad Beat', 'badBeat', true),
     progressive: spot('$5 Progressive', 'progressive', true),
+    pairPlus: spot('Pair Plus', 'pairPlus', true), sixCard: spot('Six Card Bonus', 'sixCard', true),
+    anteBonus: spot('Ante Bonus', 'anteBonus'),
   };
+  // Which circles belong to which game.
+  spotEls.anteBonus.classList.add('never');
+  spotEls.blind.classList.add('g-uth');
+  for (const k of GAME_SIDES.uth) spotEls[k].classList.add('g-uth');
+  for (const k of GAME_SIDES.tcp) spotEls[k].classList.add('g-tcp');
   spotEls.progressive.title = 'Fixed $5 bet. Tap to add or remove — the chip you have selected does not matter.';
   // Side bets sit in their own smaller row; on phones they fold into one expandable Bonus bets panel.
   const bonusToggle = h('button', { class: 'bonus-toggle', 'aria-expanded': 'false', onclick: () => {
@@ -169,7 +196,7 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
   const bonusPanel = h('div', { class: 'bonus-panel' },
     bonusToggle,
     h('div', { class: 'bonus-body' },
-      h('div', { class: 'bonus-spots' }, spotEls.trips, spotEls.pairs, spotEls.badBeat, spotEls.progressive),
+      h('div', { class: 'bonus-spots' }, spotEls.trips, spotEls.pairs, spotEls.badBeat, spotEls.progressive, spotEls.pairPlus, spotEls.sixCard),
       h('button', { class: 'link paytable-link', onclick: () => view && openPayTables(view.config, view.jackpot?.amount) }, 'Pay tables')));
   const totals = h('div', { class: 'totals' });
   const autoRow = h('div', { class: 'auto-row', hidden: true });
@@ -216,12 +243,13 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
   }
 
   function makeSeat(i: number): SeatEls {
-    const cards = [cardEl(null, 'empty sm'), cardEl(null, 'empty sm')];
-    const mk = (k: WagerKey, title: string) => h('div', { class: `mini-spot ms-${k}`, title });
+    const cards = [cardEl(null, 'empty sm'), cardEl(null, 'empty sm'), cardEl(null, 'empty sm g-tcp')];
+    const mk = (k: WagerKey, title: string) => h('div', { class: `mini-spot ms-${k} ${k === 'blind' || (GAME_SIDES.uth as readonly string[]).includes(k) ? 'g-uth' : (GAME_SIDES.tcp as readonly string[]).includes(k) ? 'g-tcp' : k === 'anteBonus' ? 'never' : ''}`, title });
     const spots: Record<WagerKey, HTMLElement> = {
       ante: mk('ante', 'Ante'), blind: mk('blind', 'Blind'), play: mk('play', 'Play'),
       trips: mk('trips', 'Trips+'), pairs: mk('pairs', 'Ultimate Pairs'), badBeat: mk('badBeat', 'Bad Beat'),
       progressive: mk('progressive', '$5 Progressive'),
+      pairPlus: mk('pairPlus', 'Pair Plus'), sixCard: mk('sixCard', 'Six Card Bonus'), anteBonus: mk('anteBonus', 'Ante Bonus'),
     };
     const gem = h('div', { class: 'gem', hidden: true });
     const avatar = h('div', { class: 'avatar' });
@@ -233,7 +261,7 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     const plate = h('div', { class: 'plate' }, avatar, h('div', { class: 'pinfo' }, name, bal), status);
     const root = h('div', { class: 'seat empty-seat', 'data-seat': i },
       h('div', { class: 'cards-row' }, ...cards), handName,
-      h('div', { class: 'mini-bonus' }, spots.trips, spots.pairs, spots.badBeat, spots.progressive),
+      h('div', { class: 'mini-bonus' }, spots.trips, spots.pairs, spots.badBeat, spots.progressive, spots.pairPlus, spots.sixCard),
       h('div', { class: 'mini-spots' }, spots.ante, spots.blind, spots.play),
       plate, float, gem);
     root.addEventListener('click', (e) => {
@@ -336,6 +364,9 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     hostBtn.hidden = !v.you.isHost || v.config.solo;
     screen.classList.toggle('solo', v.config.solo);
     screen.dataset.phase = v.phase;
+    // The table transforms with the game: printing, card counts, betting circles.
+    const game: GameId = v.config.game;
+    if (screen.dataset.game !== game) { screen.dataset.game = game; if (!first) adviceCache = null; }
     setTableTheme({ felt: v.config.felt, cardBack: v.config.cardBack });
     renderJackpot(v);
 
@@ -395,7 +426,9 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
       case 'preflop': return 'Pre-flop · check or play 3× / 4×';
       case 'flop': return 'Flop · check or play 2×';
       case 'river': return 'River · play 1× or fold';
-      case 'showdown': case 'settled': return v.dealer.handName ? `Dealer: ${v.dealer.handName}` : 'Showdown';
+      case 'decide': return 'Play 1× or fold';
+      case 'showdown': case 'settled': return v.dealer.handName
+        ? `Dealer: ${v.dealer.handName}${v.config.game === 'tcp' && v.dealer.qualifies === false ? ' — no qualify: Ante pays, Play pushes' : ''}` : 'Showdown';
     }
   }
 
@@ -451,17 +484,18 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
 
     // spots + chip animations on increases
     for (const k of ALL_WAGERS) {
-      const amt = s.bet[k] ?? 0;
-      const was = p && p.playerId === s.playerId ? (p.bet[k] ?? 0) : 0;
+      const amt = (s.bet as Record<string, number>)[k] ?? 0;
+      const was = p && p.playerId === s.playerId ? ((p.bet as Record<string, number>)[k] ?? 0) : 0;
       el.spots[k].textContent = amt ? money(amt) : '';
       el.spots[k].classList.toggle('on', amt > 0);
       if (!first && amt > was && (k !== 'blind')) flyChip(el.plate, el.spots[k], amt);
     }
     // Bonus gem: visible to everyone only once the result is public; never reveals a folded hand's combination.
-    const hits = s.result?.lines.filter((l) => (l.wager === 'pairs' || l.wager === 'badBeat' || l.wager === 'progressive') && l.result === 'win') ?? [];
+    const GEM: Partial<Record<WagerKey, string>> = { pairs: 'Pairs', badBeat: 'Bad Beat', pairPlus: 'Pair Plus', sixCard: 'Six Card' };
+    const hits = s.result?.lines.filter((l) => (GEM[l.wager] || l.wager === 'progressive') && l.result === 'win') ?? [];
     el.gem.hidden = !hits.length;
     el.gem.textContent = hits.map((l) => l.wager === 'progressive' ? `Progressive ${money(l.credit)}`
-      : (l.wager === 'pairs' ? 'Pairs' : 'Bad Beat') + (l.multiplier ? ` ${l.multiplier.toLocaleString('en-US')}:1` : '')).join(' · ');
+      : GEM[l.wager]! + (l.multiplier ? ` ${l.multiplier.toLocaleString('en-US')}:1` : '')).join(' · ');
     if (!first && p && s.lastAction && s.lastAction !== p.lastAction && s.lastAction !== 'check' && s.lastAction !== 'fold') sfx.chip();
   }
 
@@ -547,8 +581,9 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     // Spots show either the live hand's bets or the draft during betting
     const betting = v.phase === 'betting' && !!s;
     const amounts: Record<WagerKey, number> = betting
-      ? { ante: draft.ante, blind: draft.ante, play: 0, trips: draft.trips, pairs: draft.pairs, badBeat: draft.badBeat, progressive: draft.progressive }
-      : s ? s.bet : { ante: 0, blind: 0, play: 0, trips: 0, pairs: 0, badBeat: 0, progressive: 0 };
+      ? { ante: draft.ante, blind: v.config.game === 'tcp' ? 0 : draft.ante, play: 0, trips: draft.trips, pairs: draft.pairs, badBeat: draft.badBeat,
+          progressive: draft.progressive, pairPlus: draft.pairPlus, sixCard: draft.sixCard, anteBonus: 0 }
+      : s ? { ...s.bet, anteBonus: 0 } : { ante: 0, blind: 0, play: 0, trips: 0, pairs: 0, badBeat: 0, progressive: 0, pairPlus: 0, sixCard: 0, anteBonus: 0 };
     spotEls.progressive.hidden = !v.config.progressive && !amounts.progressive;
     const editable = (k: WagerKey) => betting && s!.status !== 'ready' && BETTABLE.includes(k);
     for (const k of ALL_WAGERS) {
@@ -558,7 +593,7 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
       el.classList.toggle('clickable', editable(k));
       (el as HTMLButtonElement).disabled = !editable(k);
     }
-    const sideSum = amounts.trips + amounts.pairs + amounts.badBeat + amounts.progressive;
+    const sideSum = amounts.trips + amounts.pairs + amounts.badBeat + amounts.progressive + amounts.pairPlus + amounts.sixCard;
     bonusToggle.replaceChildren(h('span', {}, narrowScreen() ? 'Bonus' : 'Bonus bets'), h('b', {}, sideSum ? money(sideSum) : narrowScreen() ? '+' : 'none'));
     rack.hidden = !betting;
 
@@ -583,10 +618,10 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
       const free = v.seats.some((x) => !x);
       msg = free ? 'You are watching. Tap an open seat to join the table.' : 'You are watching this table.';
     } else if (v.phase === 'betting') {
-      const need = requiredToStart(Math.max(draft.ante, v.config.minAnte), sideTotal(draft));
+      const need = needFor(v.config.game, Math.max(draft.ante, v.config.minAnte), sideTotal(draft));
       msg = s.status === 'sitting-out' ? (s.awayByHost ? 'The host set you away. Tap Sit back in to play the next hand.' : 'You’re sitting out. Your seat and chips are saved — tap Sit back in when you’re ready.') :
         s.status === 'ready' ? 'Ready — waiting for the others.' :
-        s.balance < requiredToStart(v.config.minAnte) ? 'Your stack can’t cover a minimum hand.' :
+        s.balance < needFor(v.config.game, v.config.minAnte, 0) ? 'Your stack can’t cover a minimum hand.' :
         draft.ante ? 'Add bonus bets if you like, then deal in. Bonus bets lock when the cards come out.' :
         `Choose a chip, then tap Ante. Limits ${money(v.config.minAnte)}–${money(v.config.maxAnte)}. You need ${money(need)} free.`;
     } else if (s.standingUp) msg = 'The host is moving you to the spectators after this hand. Your chips stay with you.';
@@ -594,7 +629,7 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     else if (s.sitOut && inHand && v.phase !== 'settled') msg = 'You’ll sit out after this hand.';
     else if (s.status === 'waiting-next') msg = 'You’re in from the next hand.';
     else if (v.phase === 'settled') msg = '';
-    else if (s.needsToAct) msg = v.phase === 'river' ? 'Play 1× or fold.' : v.phase === 'flop' ? 'Play 2× or check.' : 'Play 4×, 3× or check.';
+    else if (s.needsToAct) msg = v.phase === 'decide' ? 'Play 1× (a bet equal to your Ante) or fold. Queen-6-4 or better is the standard play.' : v.phase === 'river' ? 'Play 1× or fold.' : v.phase === 'flop' ? 'Play 2× or check.' : 'Play 4×, 3× or check.';
     else if (inHand) msg = s.bet.play ? `Your ${money(s.bet.play)} Play bet is in. Waiting for the others.` : s.status === 'folded' ? 'You folded.' : 'Waiting for the others.';
     dockMsg.textContent = msg;
 
@@ -634,17 +669,25 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     const rec = s && s.needsToAct ? trainerAdvice(v, s) : null;
     hint.hidden = !(rec && prefs.get().trainer === 'training');
     if (rec && !hint.hidden) {
-      const o = outsFor(v.phase as DecisionPhase, (s!.cards as string[]).map(cardToInt), v.community.filter((c): c is string => !!c).map(cardToInt));
+      const o = v.phase === 'decide' ? null : outsFor(v.phase as DecisionPhase, (s!.cards as string[]).map(cardToInt), v.community.filter((c): c is string => !!c).map(cardToInt));
       hint.replaceChildren(h('b', {}, `Suggested: ${DECISION_LABEL[rec.action]}. `), rec.reason, o ? h('div', { class: 'outs' }, outsText(o)) : '');
     }
   }
 
   let adviceCache: { key: string; a: ReturnType<typeof advise> } | null = null;
   function trainerAdvice(v: TableView, s: SeatView) {
-    if (prefs.get().trainer === 'casino' || !s.cards[0] || !['preflop', 'flop', 'river'].includes(v.phase)) return null;
+    if (prefs.get().trainer === 'casino' || !s.cards[0] || !['preflop', 'flop', 'river', 'decide'].includes(v.phase)) return null;
     const key = `${v.handId}|${v.phase}`;
     if (adviceCache?.key === key) return adviceCache.a;
     const hole = (s.cards as string[]).map(cardToInt);
+    if (v.phase === 'decide') {
+      // Exact: all 18,424 dealer hands from the 49 unseen cards.
+      const t = tcpAdvice(hole, true);
+      const ev = t.ev!;
+      const a = { phase: 'river' as DecisionPhase, action: t.action, reason: `${t.reason} Exact EV: Play ${ev.play >= 0 ? '+' : ''}${ev.play.toFixed(3)} vs Fold −1.000 Antes.` } as ReturnType<typeof advise>;
+      adviceCache = { key, a };
+      return a;
+    }
     const comm = v.community.filter((c): c is string => !!c).map(cardToInt);
     const a = advise(v.phase as DecisionPhase, hole, comm);
     adviceCache = { key, a };
@@ -697,17 +740,19 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     }
     const add = k === 'progressive' ? PROGRESSIVE.wager : chip;
     const next: InitialBets = { ...draft, [key]: draft[key] + add };
-    const max: Record<keyof InitialBets, number> = { ante: c.maxAnte, trips: c.maxTrips, pairs: c.maxPairs, badBeat: c.maxBadBeat, progressive: PROGRESSIVE.wager };
+    if ((GAME_SIDES[c.game === 'tcp' ? 'uth' : 'tcp'] as readonly string[]).includes(k)) return toast(`${WAGER_NAME[k]} isn’t offered in ${GAME_NAME[c.game]}.`, 'error');
+    const max: Record<keyof InitialBets, number> = { ante: c.maxAnte, trips: c.maxTrips, pairs: c.maxPairs, badBeat: c.maxBadBeat, progressive: PROGRESSIVE.wager,
+      pairPlus: c.maxPairPlus, sixCard: c.maxSixCard };
     if (next[key] > max[key]) return toast(`The maximum ${WAGER_NAME[k]} bet here is ${money(max[key])}.`, 'error');
     if (k === 'badBeat' && !draft.trips && BAD_BEAT_VARIANTS[c.badBeatVariant].requires.includes('trips'))
       return toast('Bad Beat needs a Trips+ bet at this table. Place Trips+ first.', 'error');
-    const need = requiredToStart(next.ante, sideTotal(next));
-    if (need > s.balance) return toast(`That needs ${money(need)} free: Ante, Blind, bonus bets and a 1× Play reserve.`, 'error');
+    const need = needFor(c.game, next.ante, sideTotal(next));
+    if (need > s.balance) return toast(`That needs ${money(need)} free: Ante${c.game === 'tcp' ? '' : ', Blind'}, bonus bets and a 1× Play reserve.`, 'error');
     draft = next;
     draftDirty = true;
     sfx.chip();
     flyChip(rack.querySelector('.chip.sel') as HTMLElement, spotEls[k], add);
-    if (k === 'ante') setTimeout(() => flyChip(rack.querySelector('.chip.sel') as HTMLElement, spotEls.blind, chip), 70);
+    if (k === 'ante' && c.game === 'uth') setTimeout(() => flyChip(rack.querySelector('.chip.sel') as HTMLElement, spotEls.blind, chip), 70);
     renderDock(view);
     scheduleBetSync();
   }
@@ -983,12 +1028,12 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
         h('h3', {}, 'Bonus bets this session'),
         h('table', { class: 'mini-table' },
           h('tr', {}, h('th', {}), h('th', {}, 'Bets'), h('th', {}, 'Hits'), h('th', {}, 'Net')),
-          ...SIDE_KEYS.map((k) => {
+          ...GAME_SIDES[v.config.game].map((k) => {
             const x = sessionStats.side[k];
             return h('tr', {}, h('td', {}, WAGER_NAME[k]), h('td', { class: 'num' }, String(x.bets)), h('td', { class: 'num' }, String(x.wins)),
               h('td', { class: `num ${x.net < 0 ? 'neg' : x.net > 0 ? 'pos' : ''}` }, money(x.net, true)));
           })),
-        h('p', { class: 'muted' }, `Pay tables: ${PAIRS_VARIANTS[v.config.pairsVariant].name}, ${BAD_BEAT_VARIANTS[v.config.badBeatVariant].name}. `,
+        h('p', { class: 'muted' }, v.config.game === 'tcp' ? 'Pay tables: Pair Plus 40-30-6-3-1, Six Card Bonus 1000-200-100-20-15-10-7. ' : `Pay tables: ${PAIRS_VARIANTS[v.config.pairsVariant].name}, ${BAD_BEAT_VARIANTS[v.config.badBeatVariant].name}. `,
           h('button', { class: 'link', onclick: () => openPayTables(v.config) }, 'View'))),
       h('section', {},
         h('h3', {}, 'Players'),
@@ -1120,8 +1165,9 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     const hasSide = r.lines.some((l) => (SIDE_KEYS as readonly string[]).includes(l.wager));
     // Compact: one chip per wager with its net; details for winning bonus bets go on one short line below.
     const lineText = (l: (typeof r.lines)[0]) => l.result === 'push' ? 'Push' : money(l.net, true);
-    const details = r.lines.filter((l) => l.result === 'win' && (SIDE_KEYS as readonly string[]).includes(l.wager)).map((l) =>
-      l.wager === 'progressive' ? `Progressive: ${l.note ?? l.combo ?? ''} pays ${money(l.credit)} (the $5 is kept)`
+    const details = r.lines.filter((l) => l.result === 'win' && ((SIDE_KEYS as readonly string[]).includes(l.wager) || l.wager === 'anteBonus')).map((l) =>
+      l.wager === 'anteBonus' ? `Ante Bonus: ${l.combo} pays ${l.multiplier}:1`
+      : l.wager === 'progressive' ? `Progressive: ${l.note ?? l.combo ?? ''} pays ${money(l.credit)} (the $5 is kept)`
         : `${WAGER_NAME[l.wager]}: ${l.combo ?? ''}${l.multiplier ? ` ${l.multiplier.toLocaleString('en-US')}:1` : ''}, ${money(l.stake)} stake back`);
     result.hidden = false;
     const fresh = result.dataset.hand !== v.handId;
@@ -1144,7 +1190,7 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
         d.correct ? null : outsEl(d.outs)))) : null,
       showGrades && decisions.length && r.baseNet > 0 && decisions.some((d) => !d.correct) ? h('p', { class: 'muted' }, 'You won this hand, but the mistake still cost expected value — results and decisions are graded separately.') : null]);
   }
-  const cap = (s: string) => ({ preflop: 'Pre-flop', flop: 'Flop', river: 'River' } as Record<string, string>)[s] ?? s;
+  const cap = (s: string) => ({ preflop: 'Pre-flop', flop: 'Flop', river: 'River', decide: 'Play or fold' } as Record<string, string>)[s] ?? s;
 
   function onAnalysis(p: { handId: string; decisions: DecisionRecord[] }) {
     analysis.set(p.handId, p.decisions);
@@ -1161,7 +1207,7 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     if (!ms) return;
     const order: HTMLElement[] = [];
     const seatsInHand = v.seats.filter((s) => s && s.cards.length).map((s) => seatEls.find((e) => e.root.dataset.realSeat === String(s!.seat))!);
-    for (const round of [0, 1]) {
+    for (const round of v.config.game === 'tcp' ? [0, 1, 2] : [0, 1]) {
       seatsInHand.forEach((e) => order.push(e.cards[round]));
       order.push(dealerCards[round]);
     }
@@ -1213,6 +1259,8 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
       num('minAnte', 'Minimum Ante ($)', c.minAnte / 100, { min: 1, step: 1 }),
       num('maxAnte', 'Maximum Ante ($)', c.maxAnte / 100, { min: 1, step: 1 }),
       num('maxTrips', 'Maximum Trips+ ($)', c.maxTrips / 100, { min: 0, step: 1 }),
+      num('maxPairPlus', 'Maximum Pair Plus ($) — Three Card Poker', c.maxPairPlus / 100, { min: 0, step: 1 }),
+      num('maxSixCard', 'Maximum Six Card Bonus ($) — Three Card Poker', c.maxSixCard / 100, { min: 0, step: 1 }),
       ...sideBetFields(c),
       num('startingBankroll', 'Starting stack for new players ($)', c.startingBankroll / 100, { min: 10, step: 1 }),
       num('decisionSeconds', 'Decision timer (s)', c.decisionSeconds, { min: 5, max: 120 }),
@@ -1228,13 +1276,25 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
       const dollars = (k: string) => Math.round(Number(fd.get(k)) * 100);
       const r = await call('host:settings', {
         name: String(fd.get('name')), minAnte: dollars('minAnte'), maxAnte: dollars('maxAnte'), maxTrips: dollars('maxTrips'), ...readSideBetFields(fd),
+        maxPairPlus: dollars('maxPairPlus'), maxSixCard: dollars('maxSixCard'),
         startingBankroll: dollars('startingBankroll'), decisionSeconds: Number(fd.get('decisionSeconds')), bettingSeconds: Number(fd.get('bettingSeconds')),
         maxSeats: Number(fd.get('maxSeats')), isPublic: fd.get('isPublic') === 'on', allowSpectators: fd.get('allowSpectators') === 'on',
       });
       if (r.ok) { toast('Settings saved.', 'success'); m.close(); } else toast(r.error, 'error');
     });
     const others = view.seats.filter((s): s is SeatView => !!s && s.playerId !== me.id);
+    const pending = view.pendingGame;
+    const gameSection = c.solo ? null : h('section', { class: 'game-pick' },
+      h('h3', {}, 'Casino game'),
+      h('p', {}, 'Current game: ', h('b', {}, GAME_NAME[c.game]), pending ? h('span', { class: 'muted' }, ` — switching to ${GAME_NAME[pending]} after this hand`) : ''),
+      h('div', { class: 'game-options' }, ...(['uth', 'tcp'] as GameId[]).map((g) => h('button', {
+        class: `game-option ${g === (pending ?? c.game) ? 'on' : ''}`, disabled: g === (pending ?? c.game),
+        onclick: () => { m.close(); confirmGame(g); },
+      }, h('b', {}, GAME_NAME[g]), h('small', {}, g === 'uth' ? 'Two cards, five on the board, raise 4×/3×/2×/1×' : 'Three cards, one decision: Play 1× or Fold')))),
+      pending ? h('button', { class: 'link', onclick: async () => { m.close(); const r = await call('host:game', { game: c.game }); if (!r.ok) toast(r.error, 'error'); } },
+        `Cancel — stay with ${GAME_NAME[c.game]}`) : null);
     const body = h('div', { class: 'stack' },
+      gameSection,
       form,
       h('h3', {}, 'Players'),
       others.length ? h('ul', { class: 'plist host-plist' }, ...others.map((s) => h('li', {},
@@ -1251,6 +1311,21 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
         const r = await call('host:close'); if (!r.ok) toast(r.error, 'error'); else m.close();
       } }, 'Close table'));
     const m = modal('Host controls', body, { wide: true });
+  }
+
+  /** Host picks the game: everyone stays seated with the same chips; the switch waits for any hand in progress. */
+  function confirmGame(g: GameId) {
+    const body = h('div', { class: 'stack' },
+      h('p', {}, `Switch this table to ${GAME_NAME[g]}? Everyone will remain seated and keep their existing virtual-chip balances. The new rules and betting options will apply starting with the next hand.`),
+      h('div', { class: 'row' },
+        h('button', { class: 'btn gold', onclick: async () => {
+          m.close();
+          const r = await call<{ queued: boolean }>('host:game', { game: g });
+          if (!r.ok) return toast(r.error, 'error');
+          toast(r.queued ? `${GAME_NAME[g]} starts after this hand.` : `The table is now playing ${GAME_NAME[g]}.`, 'success');
+        } }, `Switch to ${GAME_NAME[g]}`),
+        h('button', { class: 'btn', onclick: () => m.close() }, 'Cancel')));
+    const m = modal('Change the game', body);
   }
 
   void BLIND_PAYTABLE; void TRIPS_PAYTABLE;

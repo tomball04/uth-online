@@ -352,3 +352,79 @@ test('restore code moves a guest to another device', async ({ browser }) => {
   expect(await b.page.evaluate(() => JSON.parse(localStorage.getItem('uth.me') ?? '{}').name)).toBe('Rosa');
   expect([...a.errors, ...b.errors]).toEqual([]);
 });
+
+test('six players: host switches to Three Card Poker, two hands, then back to Hold’em', async ({ browser }) => {
+  test.setTimeout(240_000);
+  const names = ['Hal', 'Ida', 'Jon', 'Kat', 'Lu', 'Mo'];
+  const kinds: ('desktop' | 'iphone')[] = ['iphone', 'desktop', 'desktop', 'iphone', 'desktop', 'desktop'];
+  const ps = await Promise.all(names.map((n, i) => newPlayer(browser, n, kinds[i])));
+  const host = ps[0].page;
+  await signIn(host, 'Hal');
+  await host.getByRole('button', { name: 'Create a private table' }).click();
+  await host.getByRole('button', { name: 'Create table' }).click();
+  await host.waitForURL(/\/table\/[A-Z0-9]{8}$/);
+  const path = new URL(host.url()).pathname;
+  for (let i = 1; i < 6; i++) await signIn(ps[i].page, names[i], path);
+  for (const p of ps) await expect(p.page.locator('.seat:not(.empty-seat) .pname')).toHaveCount(6, { timeout: 15000 });
+  const stacks = (p: Page) => p.locator('.seat:not(.empty-seat)').evaluateAll((els) => els.map((e) =>
+    `${e.querySelector('.pname')?.textContent}=${e.querySelector('.pbal')?.textContent}`).sort());
+  const before = await stacks(ps[1].page);
+
+  // Host: ☰ → Host controls → Three Card Poker → confirm.
+  await host.getByRole('button', { name: 'Table menu' }).click();
+  await host.getByRole('button', { name: /Host controls/ }).click();
+  await host.locator('.game-option', { hasText: 'Three Card Poker' }).click();
+  await expect(host.getByText('Everyone will remain seated and keep their existing virtual-chip balances.')).toBeVisible();
+  await host.getByRole('button', { name: 'Switch to Three Card Poker' }).click();
+  for (const { page } of ps) await expect(page.locator('.table-screen')).toHaveAttribute('data-game', 'tcp', { timeout: 10000 });
+  await expect(ps[1].page.locator('.chat-list')).toContainText('Hal changed the table to Three Card Poker.');
+  expect(await stacks(ps[1].page)).toEqual(before);                         // same six seats, same chips
+  await expect(ps[1].page.locator('.spot-blind')).toBeHidden();
+  await expect(ps[1].page.locator('.spot-trips')).toBeHidden();
+  await expect(ps[1].page.locator('.spot-pairPlus')).toBeVisible();
+
+  for (let hand = 0; hand < 2; hand++) {
+    await Promise.all(ps.map(async ({ page }, i) => {
+      await expect(page.getByRole('button', { name: 'Deal me in' })).toBeVisible({ timeout: 20000 });
+      await page.locator('.rack .chip.c5').click();
+      await page.locator('.spot-ante').click();
+      if (i % 2 === 0) { if (kinds[i] === 'iphone') await page.locator('.bonus-toggle').click(); await page.locator('.spot-pairPlus').click(); }
+      if (i === 1) await page.locator('.spot-sixCard').click();
+      await page.getByRole('button', { name: 'Deal me in' }).click();
+    }));
+    for (const { page } of ps) {
+      await expect(page.getByRole('button', { name: /^Play 1×/ })).toBeVisible({ timeout: 20000 });
+      await expect(page.locator('.dock-hand .card:not(.back):not(.empty)')).toHaveCount(3);
+      await expect(page.locator('.seat:not(.mine):not(.empty-seat) .card.back')).toHaveCount(15);   // others' cards hidden
+      await expect(page.locator('.community .card:visible')).toHaveCount(0);                         // no board
+    }
+    await Promise.all(ps.map(({ page }, i) => page.getByRole('button', { name: i % 3 === 2 ? /^Fold/ : /^Play 1×/ }).click()));
+    for (const { page } of ps) await expect(page.locator('.my-result')).toBeVisible({ timeout: 25000 });
+    await ps[0].page.waitForTimeout(1200);
+    const ref = await stacks(ps[0].page);
+    for (const { page } of ps) {
+      expect(await stacks(page)).toEqual(ref);
+      await expect(page.locator('.dealer-zone .card:not(.back):not(.empty)')).toHaveCount(3);
+      await expect(page.locator('.seat:not(.empty-seat) .cards-row .card:not(.back):not(.empty)')).toHaveCount(18);
+    }
+    if (hand === 0) await expect(ps[1].page.getByRole('button', { name: 'Deal me in' })).toBeVisible({ timeout: 20000 });
+  }
+
+  // Switch back between hands: Hold'em circles return; chips carry over.
+  await expect(host.getByRole('button', { name: 'Deal me in' })).toBeVisible({ timeout: 20000 });
+  const mid = await stacks(ps[2].page);
+  await host.getByRole('button', { name: 'Table menu' }).click();
+  await host.getByRole('button', { name: /Host controls/ }).click();
+  await host.locator('.game-option', { hasText: 'Ultimate Texas Hold’em' }).click();
+  await host.getByRole('button', { name: 'Switch to Ultimate Texas Hold’em' }).click();
+  for (const { page } of ps) await expect(page.locator('.table-screen')).toHaveAttribute('data-game', 'uth', { timeout: 10000 });
+  expect(await stacks(ps[2].page)).toEqual(mid);
+  await expect(ps[2].page.locator('.spot-blind')).toBeVisible();
+  await expect(ps[2].page.locator('.spot-pairPlus')).toBeHidden();
+  await Promise.all(ps.slice(0, 2).map(async ({ page }) => {
+    await page.locator('.rack .chip.c5').click(); await page.locator('.spot-ante').click();
+    await page.getByRole('button', { name: 'Deal me in' }).click();
+  }));
+  await expect(ps[1].page.locator('.dock-msg')).toContainText(/Ready|waiting/i);
+  for (const p of ps) expect(p.errors, p.name).toEqual([]);
+});

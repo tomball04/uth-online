@@ -92,7 +92,7 @@ describe('same bet every hand, and sit out / sit back in', () => {
     await lou.bet($(15), $(5), 0, 0, $(5));
     expect((await lou.emit('player:prefs', { autoRebet: true })).ok).toBe(true);
     let v = await lou.waitState((x) => x.seats[1]!.status === 'ready');
-    expect(v.you.autoRebet).toEqual({ ante: $(15), trips: $(5), pairs: 0, badBeat: 0, progressive: $(5) });
+    expect(v.you.autoRebet).toEqual({ ante: $(15), trips: $(5), pairs: 0, badBeat: 0, progressive: $(5), pairPlus: 0, sixCard: 0 });
     await kim.bet($(10)); await kim.ready();
     await lou.waitState((x) => x.phase === 'preflop');
     for (const ph of ['preflop', 'flop', 'river'] as const) { await kim.decide(ph, ph === 'river' ? 'fold' : 'check'); await lou.decide(ph, ph === 'river' ? 'fold' : 'check'); }

@@ -767,3 +767,25 @@ label.radio small { color: var(--muted); font-size: 14px; }
 .debt-pill { display: inline-flex; gap: 6px; align-items: baseline; font-size: 14px; color: var(--muted); }
 .debt-pill b { color: #ff8f80; }
 .debt-pill .link { font-size: 13px; }
+
+/* ---------- Game-specific layout: Ultimate Texas Hold'em vs Three Card Poker ---------- */
+.never { display: none !important; }
+.table-screen[data-game=tcp] .g-uth, .table-screen:not([data-game=tcp]) .g-tcp { display: none !important; }
+.table-screen[data-game=tcp] .community { top: 49%; }
+.table-screen[data-game=tcp] .dealer-zone { --cw: clamp(30px, 6.2cqi, 74px); }
+.table-screen[data-game=tcp] .mini-spot.ms-pairPlus.on { border-style: solid; background: radial-gradient(circle, #f2d6a8, #b9822f); }
+.table-screen[data-game=tcp] .mini-spot.ms-sixCard.on { border-style: solid; background: radial-gradient(circle, #cfe0f7, #4f78b0); }
+.spot.spot-pairPlus { background: radial-gradient(circle, rgba(185, 130, 47, .38), rgba(8, 51, 34, .95)); }
+.spot.spot-sixCard { background: radial-gradient(circle, rgba(79, 120, 176, .4), rgba(8, 51, 34, .95)); }
+@media (max-width: 760px) {
+  .table-screen[data-game=tcp] .community { top: 40%; }
+  .table-screen[data-game=tcp] .dock-hand { --cw: 40px; }
+  .table-screen[data-game=tcp] .seat { --cw: clamp(14px, 5.6cqi, 26px); }
+}
+.game-options { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 8px; }
+.game-option { display: flex; flex-direction: column; gap: 3px; text-align: left; padding: 12px 14px; border-radius: 10px; cursor: pointer;
+  background: rgba(201, 164, 92, .07); border: 1px solid rgba(201, 164, 92, .25); color: var(--text); }
+.game-option b { color: var(--brass-hi); font-weight: 600; }
+.game-option small { color: var(--muted); font-size: 13px; }
+.game-option.on { border-color: var(--brass-hi); background: rgba(201, 164, 92, .16); cursor: default; }
+.game-tabs { display: flex; gap: 4px; margin: 0 0 16px; flex-wrap: wrap; }

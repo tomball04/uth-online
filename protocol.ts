@@ -2,14 +2,14 @@
 // only what that viewer is authorized to see. Hidden cards are represented as null.
 
 import type { CardStr } from './cards.js';
-import type { Decision, DecisionPhase, InitialBets, Settlement } from './rules.js';
+import type { Decision, DecisionPhase, GameId, InitialBets, Settlement } from './rules.js';
 import type { BadBeatVariant, PairsVariant } from './sidebets.js';
 import type { CardBack, FeltColor } from './themes.js';
 
-export type WagerKey = 'ante' | 'blind' | 'play' | 'trips' | 'pairs' | 'badBeat' | 'progressive';
+export type WagerKey = 'ante' | 'blind' | 'play' | 'trips' | 'pairs' | 'badBeat' | 'progressive' | 'anteBonus' | 'pairPlus' | 'sixCard';
 import type { Advice, Outs } from './strategy.js';
 
-export type Phase = 'waiting' | 'betting' | 'preflop' | 'flop' | 'river' | 'showdown' | 'settled';
+export type Phase = 'waiting' | 'betting' | 'preflop' | 'flop' | 'river' | 'decide' | 'showdown' | 'settled';
 
 export interface TableConfig {
   name: string;
@@ -24,6 +24,10 @@ export interface TableConfig {
   pairsVariant: PairsVariant['id'];     // complete pay table, never mixed
   badBeatVariant: BadBeatVariant['id'];
   progressive: boolean;        // $5 Five Card Progressive offered at this table
+  /** Which casino game the table plays. The server switches it between hands only. */
+  game: GameId;
+  maxPairPlus: number;         // cents, Three Card Poker
+  maxSixCard: number;          // cents, Three Card Poker
   felt: FeltColor;             // host's choice, shown to everyone
   cardBack: CardBack;
   startingBankroll: number;    // cents
@@ -41,7 +45,7 @@ export interface SeatView {
   connected: boolean;
   isHost: boolean;
   status: 'sitting-out' | 'betting' | 'ready' | 'in-hand' | 'waiting-next' | 'folded';
-  bet: { ante: number; blind: number; trips: number; play: number; pairs: number; badBeat: number; progressive: number };
+  bet: { ante: number; blind: number; trips: number; play: number; pairs: number; badBeat: number; progressive: number; pairPlus: number; sixCard: number };
   acted: boolean;              // has submitted decision for current phase (or doesn't need to)
   needsToAct: boolean;
   lastAction?: Decision;
@@ -100,6 +104,8 @@ export interface TableView {
   /** Open table night (running tab), null before the first hand of a night. */
   nightId: string | null;
   rulesVersion: string;
+  /** A game switch the host queued until the current hand settles. */
+  pendingGame: GameId | null;
 }
 
 export interface HandSummary {
@@ -142,7 +148,7 @@ export interface ClientToServer {
   'table:join': (p: { code: string; asSpectator?: boolean }, ack: (r: Ack<{ seat: number | null }>) => void) => void;
   'table:sit': (p: { seat?: number }, ack: (r: Ack<{ seat: number }>) => void) => void;
   'table:leave': (ack: (r: Ack) => void) => void;
-  'bet:place': (p: { actionId: string; ante: number; trips: number; pairs?: number; badBeat?: number; progressive?: number }, ack: (r: Ack) => void) => void;
+  'bet:place': (p: { actionId: string; ante: number; trips: number; pairs?: number; badBeat?: number; progressive?: number; pairPlus?: number; sixCard?: number }, ack: (r: Ack) => void) => void;
   'bet:clear': (p: { actionId: string }, ack: (r: Ack) => void) => void;
   'player:ready': (p: { actionId: string; ready: boolean }, ack: (r: Ack) => void) => void;
   'player:decide': (p: { actionId: string; handId: string; phase: DecisionPhase; decision: Decision }, ack: (r: Ack) => void) => void;
@@ -160,6 +166,7 @@ export interface ClientToServer {
   /** Move a seated player to the rail as a spectator; their stack is kept for when they sit again. */
   'host:standUp': (p: { playerId: string }, ack: (r: Ack) => void) => void;
   'host:endNight': (ack: (r: Ack) => void) => void;
+  'host:game': (p: { game: GameId }, ack: (r: Ack<{ queued: boolean }>) => void) => void;
   'host:settings': (p: Partial<TableConfig>, ack: (r: Ack) => void) => void;
 }
 
@@ -187,6 +194,7 @@ export interface PublicTableListing {
   maxAnte: number;
   inHand: boolean;
   allowSpectators: boolean;
+  game: GameId;
 }
 
 export type { Advice };

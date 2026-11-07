@@ -3,15 +3,27 @@
 What was actually run, where, and what it proved — and what was not tested.
 
 **Environment:** Linux, Node.js 22.23, PostgreSQL 16 (local), Google Chrome for Testing 153, run on 2 November 2026.
-**Result:** 123 of 123 automated tests passed (6 November 2026).
+**Result:** 142 of 142 automated tests passed (6 November 2026).
 
 ```
 npx tsc --noEmit                 → no type errors (client, server, shared, tests)
-npm test  (Vitest)               → 11 files, 116 tests passed   (65 unit + 51 multiplayer integration)
-npm run test:e2e (Playwright)    → 7 tests passed in real Chrome against the production build
+npm test  (Vitest)               → 13 files, 134 tests passed   (78 unit + 56 multiplayer integration)
+npm run test:e2e (Playwright)    → 8 tests passed in real Chrome against the production build
 ```
 
 Update 6 November 2026: refinement pass — Progressive/Envy audit under concurrency, rules version, Sit Out / Sit Back In, same bet every hand, decision countdowns and action tags, Tonight running tab and night recap, chips check, results presentation, six-browser test, restore code — section 1f.
+
+## 1g. Three Card Poker (scope addendum §23)
+
+**Unit (13).** Three-card evaluator: every category; Straight beats Flush; Flush beats Pair; Trips beat a Straight; A-K-Q highest and A-2-3 lowest straight; no wrap-around; steel wheel lowest straight flush; trips by rank, pair then kicker, flush and high card by descending ranks, exact ties. Dealer Queen high qualifies, Jack high does not, A-2-3 counts as a straight. Settlement: non-qualifying dealer (Ante 1:1, Play push), win / loss / tie; Ante Bonus after a dealer win (5:1, 4:1, 1:1) and never after a fold; every Pair Plus category including after a fold; every Six Card Bonus category on the best five of six with five-card ranks, two pair losing, and a case where three-card ranks would differ. Strategy: Q-6-4 plays, Q-6-3 folds, and exact enumeration over exactly 18,424 dealer hands puts Q-6-4 above −1 Ante and Q-6-3 below. Display names ("Queen High", "Pair of Kings").
+
+**Integration (5, PostgreSQL).** Non-host and unknown-game switches refused; a switch requested mid-hand is queued (`pendingGame`), a second conflicting switch refused, the Hold'em hand finishes under Hold'em rules, then the table switches: same three seats, same balances (no new bankroll), Rebet presets cleared, chat line exact, jackpot unchanged. In Three Card Poker: Trips+ and Progressive refused; three unique cards each, dealer and others face down, empty board, only Play 1× / Fold legal, a Hold'em street or 4× refused; settlement of a straight losing to dealer trips with the Ante Bonus still paid, a Q-6-4 loss, and a folded pair with Pair Plus 1:1 and Six Card full house 20:1 (no Ante Bonus); folded cards face up afterwards; ledgers reconcile; jackpot untouched; `hands.game='tcp'`, `rules_version='tcp-2026.11'`. Jack-high dealer: Ante pays, Play pushes; the trainer grades fold-with-Q-6-4 and play-with-9-5-2 as mistakes with exact EV. Disconnect during the decision: reconnect restores cards and wagers; the timer folds the absent players; trips earn the 4:1 Ante Bonus. Switching back between hands releases an uncommitted TCP bet; TCP bets refused and UTH bets accepted; jackpot intact; statistics split (1 UTH + 3 TCP = 4 hands, nets add up, TCP decisions all phase `decide`, progressive only in UTH), one combined bankroll series; replays of both games keep their own rules (TCP has no board).
+
+**Browser (Playwright, 2 iPhone + 4 desktop).** Host switches via ☰ → Host controls → Three Card Poker with the exact confirmation text; all six screens switch; chat shows the change; same six seats and stacks; Blind and Hold'em bonus circles hidden, Pair Plus shown. Two full hands: everyone bets at once (Pair Plus, Six Card), each player sees exactly three own cards, 15 face-down cards of the other five, no board; simultaneous Play/Fold; every screen agrees on stacks, the dealer's three cards and all 18 player cards face up. Then back to Hold'em between hands: stacks unchanged, Blind circle back, Pair Plus hidden, two players deal in. No page errors.
+
+**By eye.** Phone (393×659) and desktop, 3 and 6 players: THREE CARD POKER printing and qualifier on the felt, three dealer cards, three cards per seat without overlaps, Play 1× / Fold buttons, Bonus circle with Pair Plus and Six Card, results with Ante Bonus and side-bet detail lines.
+
+**Not verified:** Three Card Poker on a real iPhone/Safari; host settings form for Pair Plus / Six Card limits beyond typecheck (the server limits are tested through bet validation only by code review); a 6-seat TCP layout with the longest names; Ante/Play house edge (≈3.37% of the Ante) is quoted, not recomputed. Pair Plus 40-30-6-3-1 (7.276%) and Six Card Bonus 1000-200-100-20-15-10-7 (8.561%, all 20,358,520 six-card hands) were computed here by full enumeration with the shipped evaluators. Note: the scope's Pair Plus table pays a flush 3:1; the more widely used table pays 4:1 and has a much lower house edge (about 2.3%) — say if you'd like that instead.
 
 ## 1f. Refinement pass (6 November 2026)
 

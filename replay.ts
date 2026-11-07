@@ -10,8 +10,8 @@ import { outsEl } from './outs.js';
 interface Replay {
   hand: {
     handId: string; handNumber: number; status: string; dealer: string[]; community: string[]; dealerHand: string | null;
-    dealerQualifies: boolean | null; deckCommitment: string; pairsVariant: string | null; badBeatVariant: string | null; rulesVersion?: string | null;
-    players: { playerId: string; name: string; seat: number; hole: string[] | null; folded: boolean; ante: number; blind: number; trips: number; pairs: number; badBeat: number; progressive?: number; play: number; net: number | null; outcome: string | null; handName: string | null;
+    dealerQualifies: boolean | null; deckCommitment: string; pairsVariant: string | null; badBeatVariant: string | null; rulesVersion?: string | null; game?: 'uth' | 'tcp';
+    players: { playerId: string; name: string; seat: number; hole: string[] | null; folded: boolean; ante: number; blind: number; trips: number; pairs: number; badBeat: number; progressive?: number; pairPlus?: number; sixCard?: number; play: number; net: number | null; outcome: string | null; handName: string | null;
       settlement: { [k: string]: { stake: number; result: string; net: number; credit?: number; note?: string; multiplier?: number; combo?: string } } | null }[];
     decisions: { phase: string; action: string; recommended: string; correct: boolean; reason: string; timedOut: boolean; evCost?: number; evExact?: boolean; outs?: Outs }[];
   };
@@ -26,6 +26,9 @@ export async function openReplay(handId: string) {
   try { data = await api<Replay>(`/api/hands/${encodeURIComponent(handId)}`); }
   catch (e: any) { toast(e.message, 'error'); return; }
   const r = data.hand;
+  const tcp = r.game === 'tcp';
+  // Three Card Poker has no board: deal, the one decision, showdown.
+  const STEPS_FOR = tcp ? (['Deal', 'Play or fold', 'Showdown'] as const) : STEPS;
   let step = 0;
   const stage = h('div', { class: 'replay-stage' });
   const stepLabel = h('span', { class: 'step-label' });
@@ -33,19 +36,19 @@ export async function openReplay(handId: string) {
   const nextBtn = h('button', { class: 'btn small gold', onclick: () => go(step + 1) }, 'Next');
 
   function go(s: number) {
-    step = Math.max(0, Math.min(STEPS.length - 1, s));
-    stepLabel.textContent = `${step + 1} / ${STEPS.length} · ${STEPS[step]}`;
+    step = Math.max(0, Math.min(STEPS_FOR.length - 1, s));
+    stepLabel.textContent = `${step + 1} / ${STEPS_FOR.length} · ${STEPS_FOR[step]}`;
     (prevBtn as HTMLButtonElement).disabled = step === 0;
-    (nextBtn as HTMLButtonElement).disabled = step === STEPS.length - 1;
+    (nextBtn as HTMLButtonElement).disabled = step === STEPS_FOR.length - 1;
     const shown = step === 0 ? 0 : step === 1 ? 3 : 5;
-    const showdown = step === 3;
-    const phase = ['preflop', 'flop', 'river'][Math.min(step, 2)];
+    const showdown = step === STEPS_FOR.length - 1;
+    const phase = tcp ? 'decide' : ['preflop', 'flop', 'river'][Math.min(step, 2)];
     stage.replaceChildren(
       h('div', { class: 'rp-row' }, h('span', { class: 'rp-who' }, 'Dealer'),
         h('div', { class: 'cards-row' }, ...r.dealer.map((c) => cardEl(showdown ? c : null, 'sm'))),
         showdown ? h('span', { class: 'rp-hand' }, `${r.dealerHand ?? ''}${r.dealerQualifies === false ? ' — no qualify' : ''}`) : null),
-      h('div', { class: 'rp-row' }, h('span', { class: 'rp-who' }, 'Board'),
-        h('div', { class: 'cards-row' }, ...r.community.map((c, i) => cardEl(i < shown ? c : null, 'sm')))),
+      ...(tcp ? [] : [h('div', { class: 'rp-row' }, h('span', { class: 'rp-who' }, 'Board'),
+        h('div', { class: 'cards-row' }, ...r.community.map((c, i) => cardEl(i < shown ? c : null, 'sm'))))]),
       ...r.players.map((p) => {
         const mine = p.playerId === data.you;
         const visible = mine || (showdown && p.hole);
@@ -53,9 +56,9 @@ export async function openReplay(handId: string) {
           h('div', { class: 'cards-row' }, ...(p.hole ?? [null, null]).map((c) => cardEl(visible ? c : null, 'sm'))),
           showdown ? h('span', { class: `rp-hand ${(p.net ?? 0) > 0 ? 'pos' : (p.net ?? 0) < 0 ? 'neg' : ''}` },
             `${p.folded ? 'Folded' : p.handName ?? ''} · ${p.net === null ? '' : money(p.net, true)}`, sideLine(p)) : h('span', { class: 'rp-hand muted' },
-            `Ante ${money(p.ante)}${p.trips ? ` · Trips+ ${money(p.trips)}` : ''}${p.pairs ? ` · Pairs ${money(p.pairs)}` : ''}${p.badBeat ? ` · Bad Beat ${money(p.badBeat)}` : ''}${p.progressive ? ` · Progressive ${money(p.progressive)}` : ''}`));
+            `Ante ${money(p.ante)}${p.pairPlus ? ` · Pair Plus ${money(p.pairPlus)}` : ''}${p.sixCard ? ` · Six Card ${money(p.sixCard)}` : ''}${p.trips ? ` · Trips+ ${money(p.trips)}` : ''}${p.pairs ? ` · Pairs ${money(p.pairs)}` : ''}${p.badBeat ? ` · Bad Beat ${money(p.badBeat)}` : ''}${p.progressive ? ` · Progressive ${money(p.progressive)}` : ''}`));
       }),
-      h('ul', { class: 'grades' }, ...r.decisions.filter((d) => d.phase === phase || (showdown && true)).filter((d) => showdown || d.phase === phase).map((d) =>
+      h('ul', { class: 'grades' }, ...r.decisions.filter((d) => showdown || (d.phase === phase && (!tcp || step >= 1))).map((d) =>
         h('li', { class: d.correct ? 'ok' : 'bad' }, `${d.correct ? '✓' : '✗'} You: ${LABEL[d.action]}${d.timedOut ? ' (timed out)' : ''}`,
           d.correct ? '' : ` — best: ${LABEL[d.recommended]}${d.evCost !== undefined ? ` (−${d.evCost.toFixed(2)} antes${d.evExact ? '' : ', est.'})` : ''}`,
           h('div', { class: 'why' }, d.reason), d.correct ? null : outsEl(d.outs)))));
@@ -66,11 +69,12 @@ export async function openReplay(handId: string) {
       h('p', { class: 'muted tiny' }, `Pay tables: ${r.pairsVariant ? PAIRS_VARIANTS[r.pairsVariant as keyof typeof PAIRS_VARIANTS]?.name ?? r.pairsVariant : 'Ultimate Pairs (default)'}, ${r.badBeatVariant ? BAD_BEAT_VARIANTS[r.badBeatVariant as keyof typeof BAD_BEAT_VARIANTS]?.name ?? r.badBeatVariant : 'Bad Beat (default)'}. ${r.rulesVersion ? ` Rules ${r.rulesVersion}.` : ''} Deck commitment ${r.deckCommitment.slice(0, 16)}…`)), { wide: true });
 }
 
-const SIDE = { trips: 'Trips+', pairs: 'Ultimate Pairs', badBeat: 'Bad Beat', progressive: 'Progressive' } as const;
+const SIDE = { anteBonus: 'Ante Bonus', pairPlus: 'Pair Plus', sixCard: 'Six Card Bonus', trips: 'Trips+', pairs: 'Ultimate Pairs', badBeat: 'Bad Beat', progressive: 'Progressive' } as const;
 function sideLine(p: Replay['hand']['players'][0]) {
   if (!p.settlement) return null;
-  const parts = (Object.keys(SIDE) as (keyof typeof SIDE)[]).filter((k) => p.settlement![k]?.stake > 0).map((k) => {
+  const parts = (Object.keys(SIDE) as (keyof typeof SIDE)[]).filter((k) => p.settlement![k]?.stake > 0 || (k === 'anteBonus' && p.settlement![k]?.result === 'win')).map((k) => {
     const w = p.settlement![k];
+    if (k === 'anteBonus') return `Ante Bonus: ${w.combo} ${w.multiplier}:1, ${money(w.net, true)}`;
     if (k === 'progressive') return `${SIDE[k]} ${money(w.stake)}: ${w.result === 'win' ? `${w.note ?? w.combo ?? ''}, paid ${money(w.credit ?? 0)}` : 'lost'}`;
     return `${SIDE[k]} ${money(w.stake)}: ${w.result === 'win' ? `${w.combo ?? ''} ${w.multiplier ?? ''}:1, returned ${money(w.stake)} + ${money(w.net)}` : 'lost'}`;
   });

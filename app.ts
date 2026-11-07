@@ -261,7 +261,10 @@ export async function createApp(opts: AppOptions) {
     if (!t) { res.status(404).json({ error: 'Table not found or closed.' }); return; }
     res.json({ table: { ...t.listing(), solo: t.config.solo } });
   }));
-  app.get('/api/stats/me', requireAuth, wrap(async (_req, res) => { res.json({ stats: await store.playerStats(res.locals.player.id) }); }));
+  app.get('/api/stats/me', requireAuth, wrap(async (req, res) => {
+    const g = req.query.game === 'uth' || req.query.game === 'tcp' ? req.query.game : undefined;
+    res.json({ stats: await store.playerStats(res.locals.player.id, g) });
+  }));
   // ---- table nights: running tab and recaps
   const nightAccess = async (code: string, me: string) => {
     const t = await store.loadTable(code);
@@ -388,7 +391,7 @@ export async function createApp(opts: AppOptions) {
     on('bet:place', async (e, p) => {
       const x = obj(p);
       // Raw values go to the engine; validateInitialBet rejects anything that isn't a whole, non-negative number.
-      await e.placeBet(socket.data.player.id, x.actionId, { ante: x.ante, trips: x.trips ?? 0, pairs: x.pairs ?? 0, badBeat: x.badBeat ?? 0, progressive: x.progressive ?? 0 });
+      await e.placeBet(socket.data.player.id, x.actionId, { ante: x.ante, trips: x.trips ?? 0, pairs: x.pairs ?? 0, badBeat: x.badBeat ?? 0, progressive: x.progressive ?? 0, pairPlus: x.pairPlus ?? 0, sixCard: x.sixCard ?? 0 });
     });
     on('bet:clear', async (e, p) => e.clearBet(socket.data.player.id, obj(p).actionId));
     on('player:ready', async (e, p) => e.setReady(socket.data.player.id, obj(p).actionId, obj(p).ready !== false));
@@ -404,6 +407,7 @@ export async function createApp(opts: AppOptions) {
     on('host:theme', async (e, p) => e.setTheme(socket.data.player.id, obj(p)));
     on('host:away', async (e, p) => e.setAway(socket.data.player.id, String(obj(p).playerId), obj(p).away !== false));
     on('host:endNight', async (e) => e.endNight(socket.data.player.id));
+    on('host:game', async (e, p) => e.setGame(socket.data.player.id, obj(p).game));
     on('host:standUp', async (e, p) => e.standUp(socket.data.player.id, String(obj(p).playerId)));
     on('host:settings', async (e, p) => e.updateSettings(socket.data.player.id, obj(p)));
 

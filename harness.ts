@@ -127,3 +127,15 @@ export function rigDeck(players: string[], dealer: string, community: string): n
 }
 
 export const $ = (d: number) => d * 100;
+
+/** Three Card Poker deal order: one card each to every player then the dealer, three times. */
+export function rigTcp(players: string[], dealer: string): number[] {
+  const P = players.map((p) => p.split(' ').map(cardToInt));
+  const D = dealer.split(' ').map(cardToInt);
+  const used = new Set([...P.flat(), ...D]);
+  if (used.size !== P.length * 3 + 3) throw new Error('rigTcp: duplicate cards');
+  const filler = Array.from({ length: 52 }, (_, i) => i).filter((c) => !used.has(c));
+  const deck: number[] = [];
+  for (let r = 0; r < 3; r++) { deck.push(...P.map((p) => p[r]), D[r]); }
+  return [...deck, ...filler];
+}

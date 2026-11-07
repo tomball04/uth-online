@@ -12,22 +12,23 @@ export interface NightHandPlayer {
   tripsNet: number; pairsNet: number; badBeatNet: number; progressiveNet: number;
   pairsCombo: string | null; badBeatCombo: string | null; progressiveHand: string | null;
   pairsMultiplier: number | null; badBeatMultiplier: number | null;
+  pairPlusNet?: number; sixCardNet?: number; anteBonusNet?: number; sixCardHand?: string | null;
 }
 export interface NightHand {
-  handId: string; handNumber: number; startedAt: number; settledAt: number; community: string[]; dealerHand: string;
+  handId: string; handNumber: number; startedAt: number; settledAt: number; community: string[]; dealerHand: string; game?: 'uth' | 'tcp';
   players: NightHandPlayer[];
   decisions: { playerId: string; phase: string; correct: boolean }[];
 }
 
 export interface RecapMoment {
-  playerId: string; name: string; amount: number; handName: string; handId: string; handNumber: number; hole: string[]; community: string[];
+  playerId: string; name: string; amount: number; handName: string; handId: string; handNumber: number; hole: string[]; community: string[]; game?: 'uth' | 'tcp';
 }
 export interface RecapPlayer {
   playerId: string; name: string; net: number; hands: number; wins: number; losses: number; pushes: number; folds: number;
   biggestWin: number; biggestLoss: number; bestHand: string | null; bestStreak: number;
   decisions: number; correct: number; debt: number;
 }
-export interface RecapBonus { playerId: string; name: string; bet: 'Trips+' | 'Ultimate Pairs' | 'Bad Beat' | 'Progressive'; detail: string; amount: number; handId: string; handNumber: number }
+export interface RecapBonus { playerId: string; name: string; bet: 'Trips+' | 'Ultimate Pairs' | 'Bad Beat' | 'Progressive' | 'Ante Bonus' | 'Pair Plus' | 'Six Card Bonus'; detail: string; amount: number; handId: string; handNumber: number }
 export interface NightRecap {
   nightId: string; tableName: string; startedAt: number; endedAt: number | null; lastHandAt: number | null;
   hands: number; players: RecapPlayer[];
@@ -62,7 +63,7 @@ export function buildRecap(
       else { r.streak = 0; if (p.net < 0) r.losses++; else r.pushes++; }
       r.biggestWin = Math.max(r.biggestWin, p.net);
       r.biggestLoss = Math.min(r.biggestLoss, p.net);
-      const moment = { playerId: p.playerId, name: p.name, amount: p.net, handName: p.handName, handId: h.handId, handNumber: h.handNumber, hole: p.hole, community: h.community };
+      const moment = { playerId: p.playerId, name: p.name, amount: p.net, handName: p.handName, handId: h.handId, handNumber: h.handNumber, hole: p.hole, community: h.community, game: h.game ?? 'uth' };
       if (p.net > 0 && (!biggestWin || p.net > biggestWin.amount)) biggestWin = moment;
       if (p.net < 0 && (!biggestLoss || p.net < biggestLoss.amount)) biggestLoss = moment;
       if (!p.folded) {
@@ -76,6 +77,9 @@ export function buildRecap(
       bonus('Ultimate Pairs', p.pairsNet, `${p.pairsCombo ?? ''}${p.pairsMultiplier ? ` ${p.pairsMultiplier}:1` : ''}`.trim());
       bonus('Bad Beat', p.badBeatNet, `${p.badBeatCombo ?? ''}${p.badBeatMultiplier ? ` ${p.badBeatMultiplier}:1` : ''}`.trim());
       bonus('Progressive', p.progressiveNet, p.progressiveHand ?? '');
+      bonus('Ante Bonus', p.anteBonusNet ?? 0, p.handName);
+      bonus('Pair Plus', p.pairPlusNet ?? 0, p.handName);
+      bonus('Six Card Bonus', p.sixCardNet ?? 0, p.sixCardHand ?? '');
     }
     for (const d of h.decisions) {
       const r = byPlayer.get(d.playerId);

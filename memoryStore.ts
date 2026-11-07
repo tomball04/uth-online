@@ -5,6 +5,7 @@ import type { DecisionRecord, TableConfig } from '../shared/protocol.js';
 import { handNameRank, type HandName } from '../shared/evaluator.js';
 import { PROGRESSIVE } from '../shared/progressive.js';
 import type { NightHand } from '../shared/recap.js';
+import type { GameId } from '../shared/rules.js';
 import {
   InsufficientFunds, type HandStart, type SettlementBuilder, type PlayerRow, type PlayerSettlementRow, type PlayerStats,
   type DebtEvent, type NightRow, type RecentHandRow, type ReplayData, type StackRow, type Store, type TableRow,
@@ -12,7 +13,7 @@ import {
 
 interface HP {
   playerId: string; seat: number; name: string; hole: string[]; ante: number; blind: number; trips: number; play: number;
-  pairs: number; badBeat: number; progressive: number; row: PlayerSettlementRow | null;
+  pairs: number; badBeat: number; progressive: number; pairPlus: number; sixCard: number; row: PlayerSettlementRow | null;
   folded: boolean; outcome: string | null; handName: string | null; handRank: number | null; net: number | null;
   tripsNet: number | null; settlement: unknown; settled: boolean;
 }
@@ -20,7 +21,7 @@ interface H {
   id: string; tableCode: string; handNumber: number; status: 'active' | 'settled' | 'voided'; deckCommitment: string;
   dealer: string[]; community: string[]; participants: number; dealerHand: string | null; dealerQualifies: boolean | null;
   startedAt: Date; settledAt: Date | null; players: HP[]; pairsVariant: string; badBeatVariant: string;
-  nightId: string; rulesVersion: string;
+  nightId: string; rulesVersion: string; game: GameId;
 }
 interface L { key: string; playerId: string; code: string; handId?: string; kind: string; amount: number; after: number }
 
@@ -125,7 +126,7 @@ export class MemoryStore implements Store {
   }
 
   async startHand(h: HandStart) {
-    const total = (p: HandStart['players'][0]) => p.ante + p.blind + p.trips + p.pairs + p.badBeat + p.progressive;
+    const total = (p: HandStart['players'][0]) => p.ante + p.blind + p.trips + p.pairs + p.badBeat + p.progressive + (p.pairPlus ?? 0) + (p.sixCard ?? 0);
     for (const p of h.players) {
       const s = this.stacks.get(this.sk(p.playerId, h.tableCode));
       if (!s || s.balance < total(p)) throw new InsufficientFunds('Insufficient balance');
@@ -133,9 +134,9 @@ export class MemoryStore implements Store {
     this.hands.set(h.id, {
       id: h.id, tableCode: h.tableCode, handNumber: h.handNumber, status: 'active', deckCommitment: h.deckCommitment,
       dealer: h.dealerCards, community: h.community, participants: h.players.length, dealerHand: null, dealerQualifies: null,
-      nightId: h.nightId, rulesVersion: h.rulesVersion,
+      nightId: h.nightId, rulesVersion: h.rulesVersion, game: h.game ?? 'uth',
       startedAt: new Date(), settledAt: null, pairsVariant: h.pairsVariant, badBeatVariant: h.badBeatVariant,
-      players: h.players.map((p) => ({ ...p, play: 0, folded: false, row: null, outcome: null, handName: null, handRank: null, net: null, tripsNet: null, settlement: null, settled: false })),
+      players: h.players.map((p) => ({ ...p, pairPlus: p.pairPlus ?? 0, sixCard: p.sixCard ?? 0, play: 0, folded: false, row: null, outcome: null, handName: null, handRank: null, net: null, tripsNet: null, settlement: null, settled: false })),
     });
     const t = this.tables.get(h.tableCode);
     if (t) t.handCounter = h.handNumber;
@@ -207,13 +208,14 @@ export class MemoryStore implements Store {
     return { hands, refunds };
   }
 
-  async playerStats(pid: string): Promise<PlayerStats> {
-    const rows: { hp: HP; h: H }[] = [];
-    for (const h of this.hands.values()) for (const hp of h.players) if (hp.playerId === pid && hp.settled) rows.push({ hp, h });
-    rows.sort((a, b) => a.h.settledAt!.getTime() - b.h.settledAt!.getTime());
-    const ds = this.decisions.filter((d) => d.playerId === pid);
+  async playerStats(pid: string, game?: GameId): Promise<PlayerStats> {
+    const all: { hp: HP; h: H }[] = [];
+    for (const h of this.hands.values()) for (const hp of h.players) if (hp.playerId === pid && hp.settled) all.push({ hp, h });
+    all.sort((a, b) => a.h.settledAt!.getTime() - b.h.settledAt!.getTime());
+    const rows = game ? all.filter((r) => r.h.game === game) : all;
+    const ds = this.decisions.filter((d) => d.playerId === pid && (!game || this.hands.get(d.handId)?.game === game));
     const nets = rows.map((r) => r.hp.net!);
-    const best = rows.reduce<string | null>((b, r) => (!b || handNameRank(r.hp.handName as HandName) > handNameRank(b as HandName) ? r.hp.handName : b), null);
+    const best = rows.reduce<{ name: string; rank: number } | null>((b, r) => (!b || (r.hp.handRank ?? -1) > b.rank ? { name: r.hp.handName!, rank: r.hp.handRank ?? -1 } : b), null)?.name ?? null;
     const group = <K extends string>(arr: typeof ds, key: (d: (typeof ds)[0]) => K) => {
       const m = new Map<K, typeof ds>();
       for (const d of arr) { const k = key(d); m.set(k, [...(m.get(k) ?? []), d]); }
@@ -233,7 +235,7 @@ export class MemoryStore implements Store {
       wins: rows.filter((r) => r.hp.outcome === 'win').length, losses: rows.filter((r) => r.hp.outcome === 'lose').length,
       pushes: rows.filter((r) => r.hp.outcome === 'push').length, folds: rows.filter((r) => r.hp.outcome === 'fold').length,
       biggestWin: Math.max(0, ...nets), biggestLoss: Math.min(0, ...nets), bestHand: best,
-      totalWagered: rows.reduce((s, r) => s + r.hp.ante + r.hp.blind + r.hp.trips + r.hp.play, 0),
+      totalWagered: rows.reduce((s, r) => s + r.hp.ante + r.hp.blind + r.hp.trips + r.hp.play + r.hp.pairs + r.hp.badBeat + r.hp.progressive + r.hp.pairPlus + r.hp.sixCard, 0),
       decisions: ds.length, correctDecisions: ds.filter((d) => d.correct).length,
       evLost: ds.reduce((s, d) => s + (d.evCost ?? 0), 0),
       byPhase, commonMistakes,
@@ -243,12 +245,15 @@ export class MemoryStore implements Store {
         pairs: sideStats(rows.map((r) => ({ stake: r.hp.pairs, net: r.hp.row?.pairsNet ?? 0, combo: r.hp.row?.pairsCombo ?? null }))),
         badBeat: sideStats(rows.map((r) => ({ stake: r.hp.badBeat, net: r.hp.row?.badBeatNet ?? 0, combo: r.hp.row?.badBeatCombo ?? null }))),
         progressive: sideStats(rows.map((r) => ({ stake: r.hp.progressive, net: r.hp.row?.progressiveNet ?? 0, combo: r.hp.row?.progressiveHand ?? null }))),
+        pairPlus: sideStats(rows.map((r) => ({ stake: r.hp.pairPlus, net: r.hp.row?.pairPlusNet ?? 0, combo: r.hp.row?.pairPlusHand ?? null }))),
+        sixCard: sideStats(rows.map((r) => ({ stake: r.hp.sixCard, net: r.hp.row?.sixCardNet ?? 0, combo: r.hp.row?.sixCardHand ?? null }))),
       },
+      game: game ?? null,
       baseNet: rows.reduce((s, r) => s + (r.hp.row?.baseNet ?? 0), 0),
       baseWagered: rows.reduce((s, r) => s + r.hp.ante + r.hp.blind + r.hp.play, 0),
       handsWithFriends: rows.filter((r) => r.h.participants > 1).length,
       reloads: stacks.reduce((s, [, v]) => s + v.reloads, 0), tables: stacks.length, debt: stacks.reduce((s, [, v]) => s + v.debt, 0),
-      series: rows.slice(-500).map((r) => ({ at: r.h.settledAt!.toISOString(), cumulative: (cum += r.hp.net!) })),
+      series: all.slice(-500).map((r) => ({ at: r.h.settledAt!.toISOString(), cumulative: (cum += r.hp.net!) })),
     };
   }
 
@@ -274,9 +279,9 @@ export class MemoryStore implements Store {
       handId: h.id, tableCode: h.tableCode, handNumber: h.handNumber, status: h.status,
       startedAt: h.startedAt.toISOString(), settledAt: h.settledAt?.toISOString() ?? null,
       dealer: h.dealer, community: h.community, dealerHand: h.dealerHand, dealerQualifies: h.dealerQualifies, deckCommitment: h.deckCommitment,
-      pairsVariant: h.pairsVariant, badBeatVariant: h.badBeatVariant, rulesVersion: h.rulesVersion ?? null,
+      pairsVariant: h.pairsVariant, badBeatVariant: h.badBeatVariant, rulesVersion: h.rulesVersion ?? null, game: h.game,
       players: h.players.map((p) => ({ playerId: p.playerId, name: p.name, seat: p.seat, hole: p.hole, folded: p.folded, ante: p.ante,
-        blind: p.blind, trips: p.trips, pairs: p.pairs, badBeat: p.badBeat, progressive: p.progressive, play: p.play, net: p.net, outcome: p.outcome, handName: p.handName, settlement: p.settlement })),
+        blind: p.blind, trips: p.trips, pairs: p.pairs, badBeat: p.badBeat, progressive: p.progressive, pairPlus: p.pairPlus, sixCard: p.sixCard, play: p.play, net: p.net, outcome: p.outcome, handName: p.handName, settlement: p.settlement })),
       decisions: this.decisions.filter((d) => d.handId === handId).map((d) => ({ ...d, at: d.at.toISOString() })),
     };
   }
@@ -310,13 +315,14 @@ export class MemoryStore implements Store {
     return [...this.hands.values()].filter((h) => h.nightId === nightId && h.status === 'settled').sort((a, b) => a.handNumber - b.handNumber)
       .map((h) => ({
         handId: h.id, handNumber: h.handNumber, startedAt: h.startedAt.getTime(), settledAt: h.settledAt!.getTime(), community: h.community,
-        dealerHand: h.dealerHand ?? '',
+        dealerHand: h.dealerHand ?? '', game: h.game,
         players: [...h.players].sort((a, b) => a.seat - b.seat).map((p) => ({
           playerId: p.playerId, name: p.name, seat: p.seat, hole: p.hole, folded: p.folded, net: p.net ?? 0, outcome: p.outcome ?? '',
           handName: p.handName ?? '', handRank: p.handRank ?? 0, tripsNet: p.tripsNet ?? 0, pairsNet: p.row?.pairsNet ?? 0,
           badBeatNet: p.row?.badBeatNet ?? 0, progressiveNet: p.row?.progressiveNet ?? 0, pairsCombo: p.row?.pairsCombo ?? null,
           badBeatCombo: p.row?.badBeatCombo ?? null, progressiveHand: p.row?.progressiveHand ?? null,
           pairsMultiplier: p.row?.pairsMultiplier ?? null, badBeatMultiplier: p.row?.badBeatMultiplier ?? null,
+          pairPlusNet: p.row?.pairPlusNet ?? 0, sixCardNet: p.row?.sixCardNet ?? 0, anteBonusNet: p.row?.anteBonusNet ?? 0, sixCardHand: p.row?.sixCardHand ?? null,
         })),
         decisions: this.decisions.filter((d) => d.handId === h.id).map((d) => ({ playerId: d.playerId, phase: d.phase, correct: d.correct })),
       }));

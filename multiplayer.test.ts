@@ -299,7 +299,7 @@ describe('connections, mid-hand joins and multiple tables', () => {
     expect((await b2.join(code)).seat).toBe(1);
     const r = await b2.waitState((x) => !!x.handId);
     expect(r.seats[1]!.cards).toEqual(myCards);
-    expect(r.seats[1]!.bet).toEqual({ ante: $(10), blind: $(10), trips: $(5), play: $(40), pairs: 0, badBeat: 0, progressive: 0 });
+    expect(r.seats[1]!.bet).toEqual({ ante: $(10), blind: $(10), trips: $(5), play: $(40), pairs: 0, badBeat: 0, progressive: 0, pairPlus: 0, sixCard: 0 });
     expect(r.seats[1]!.connected).toBe(true);
     expect(r.seats[1]!.balance).toBe($(1000) - $(65));
 
