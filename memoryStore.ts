@@ -4,9 +4,10 @@
 import type { DecisionRecord, TableConfig } from '../shared/protocol.js';
 import { handNameRank, type HandName } from '../shared/evaluator.js';
 import { PROGRESSIVE } from '../shared/progressive.js';
+import type { NightHand } from '../shared/recap.js';
 import {
   InsufficientFunds, type HandStart, type SettlementBuilder, type PlayerRow, type PlayerSettlementRow, type PlayerStats,
-  type RecentHandRow, type ReplayData, type StackRow, type Store, type TableRow,
+  type DebtEvent, type NightRow, type RecentHandRow, type ReplayData, type StackRow, type Store, type TableRow,
 } from './store.js';
 
 interface HP {
@@ -19,6 +20,7 @@ interface H {
   id: string; tableCode: string; handNumber: number; status: 'active' | 'settled' | 'voided'; deckCommitment: string;
   dealer: string[]; community: string[]; participants: number; dealerHand: string | null; dealerQualifies: boolean | null;
   startedAt: Date; settledAt: Date | null; players: HP[]; pairsVariant: string; badBeatVariant: string;
+  nightId: string; rulesVersion: string;
 }
 interface L { key: string; playerId: string; code: string; handId?: string; kind: string; amount: number; after: number }
 
@@ -27,6 +29,7 @@ export class MemoryStore implements Store {
   tables = new Map<string, TableRow>();
   stacks = new Map<string, StackRow>();
   hands = new Map<string, H>();
+  nights = new Map<string, { id: string; tableCode: string; startedAt: number; endedAt: number | null }>();
   decisions: (DecisionRecord & { handId: string; playerId: string; at: Date })[] = [];
   ledger: L[] = [];
   keys = new Set<string>();
@@ -74,18 +77,42 @@ export class MemoryStore implements Store {
   async createStack(p: string, c: string, amount: number) {
     const k = this.sk(p, c);
     if (!this.stacks.has(k)) {
-      this.stacks.set(k, { balance: amount, reloads: 0 });
+      this.stacks.set(k, { balance: amount, reloads: 0, debt: 0 });
       this.post({ key: `${c}:${p}:buyin`, playerId: p, code: c, kind: 'buyin', amount, after: amount });
     }
     return { ...this.stacks.get(k)! };
   }
-  async reloadStack(p: string, c: string, amount: number) {
+  debtLog: DebtEvent[] = [];
+  private debtCode = new Map<number, string>();
+  private logDebt(p: string, c: string, e: Omit<DebtEvent, 'id' | 'playerId' | 'at'>) {
+    const id = this.debtLog.length + 1;
+    this.debtLog.push({ id, playerId: p, at: Date.now(), ...e });
+    this.debtCode.set(id, c);
+  }
+  async reloadStack(p: string, c: string, amount: number, pawn?: { name: string; item: string }) {
     const s = this.stacks.get(this.sk(p, c));
     if (!s) throw new Error('No stack');
     s.reloads++;
+    const added = Math.max(0, amount - s.balance);
+    s.debt += added;
+    if (pawn && added) this.logDebt(p, c, { name: pawn.name, kind: 'marker', amount: added, debtAfter: s.debt, item: pawn.item });
     this.post({ key: `${c}:${p}:reload:${s.reloads}`, playerId: p, code: c, kind: 'reload', amount: amount - s.balance, after: amount });
     s.balance = amount;
     return { ...s };
+  }
+
+  async payDebt(p: string, c: string, amount: number, pawn: { name: string; item: (debtAfter: number) => string }) {
+    const s = this.stacks.get(this.sk(p, c));
+    if (!s) throw new Error('No stack');
+    const paid = Math.max(0, Math.min(amount, s.debt, s.balance));
+    if (!paid) return { ...s, paid: 0 };
+    s.balance -= paid; s.debt -= paid;
+    this.post({ key: `${c}:${p}:payoff:${this.debtLog.length + 1}`, playerId: p, code: c, kind: 'reload', amount: -paid, after: s.balance });
+    this.logDebt(p, c, { name: pawn.name, kind: 'payoff', amount: paid, debtAfter: s.debt, item: pawn.item(s.debt) });
+    return { ...s, paid };
+  }
+  async debtEvents(code: string, limit: number) {
+    return this.debtLog.filter((e) => this.debtCode.get(e.id) === code).reverse().slice(0, limit);
   }
 
   private debit(p: string, c: string, handId: string, amount: number, key: string): number | null {
@@ -106,6 +133,7 @@ export class MemoryStore implements Store {
     this.hands.set(h.id, {
       id: h.id, tableCode: h.tableCode, handNumber: h.handNumber, status: 'active', deckCommitment: h.deckCommitment,
       dealer: h.dealerCards, community: h.community, participants: h.players.length, dealerHand: null, dealerQualifies: null,
+      nightId: h.nightId, rulesVersion: h.rulesVersion,
       startedAt: new Date(), settledAt: null, pairsVariant: h.pairsVariant, badBeatVariant: h.badBeatVariant,
       players: h.players.map((p) => ({ ...p, play: 0, folded: false, row: null, outcome: null, handName: null, handRank: null, net: null, tripsNet: null, settlement: null, settled: false })),
     });
@@ -219,7 +247,7 @@ export class MemoryStore implements Store {
       baseNet: rows.reduce((s, r) => s + (r.hp.row?.baseNet ?? 0), 0),
       baseWagered: rows.reduce((s, r) => s + r.hp.ante + r.hp.blind + r.hp.play, 0),
       handsWithFriends: rows.filter((r) => r.h.participants > 1).length,
-      reloads: stacks.reduce((s, [, v]) => s + v.reloads, 0), tables: stacks.length,
+      reloads: stacks.reduce((s, [, v]) => s + v.reloads, 0), tables: stacks.length, debt: stacks.reduce((s, [, v]) => s + v.debt, 0),
       series: rows.slice(-500).map((r) => ({ at: r.h.settledAt!.toISOString(), cumulative: (cum += r.hp.net!) })),
     };
   }
@@ -246,11 +274,58 @@ export class MemoryStore implements Store {
       handId: h.id, tableCode: h.tableCode, handNumber: h.handNumber, status: h.status,
       startedAt: h.startedAt.toISOString(), settledAt: h.settledAt?.toISOString() ?? null,
       dealer: h.dealer, community: h.community, dealerHand: h.dealerHand, dealerQualifies: h.dealerQualifies, deckCommitment: h.deckCommitment,
-      pairsVariant: h.pairsVariant, badBeatVariant: h.badBeatVariant,
+      pairsVariant: h.pairsVariant, badBeatVariant: h.badBeatVariant, rulesVersion: h.rulesVersion ?? null,
       players: h.players.map((p) => ({ playerId: p.playerId, name: p.name, seat: p.seat, hole: p.hole, folded: p.folded, ante: p.ante,
         blind: p.blind, trips: p.trips, pairs: p.pairs, badBeat: p.badBeat, progressive: p.progressive, play: p.play, net: p.net, outcome: p.outcome, handName: p.handName, settlement: p.settlement })),
       decisions: this.decisions.filter((d) => d.handId === handId).map((d) => ({ ...d, at: d.at.toISOString() })),
     };
+  }
+
+  private nightOut(n: { id: string; tableCode: string; startedAt: number; endedAt: number | null }): NightRow {
+    return { ...n, hands: [...this.hands.values()].filter((h) => h.nightId === n.id && h.status === 'settled').length };
+  }
+  async openNight(code: string, idleMs: number, fresh: boolean): Promise<NightRow> {
+    const cur = [...this.nights.values()].find((n) => n.tableCode === code && n.endedAt === null);
+    if (cur && !fresh) {
+      const times = [...this.hands.values()].filter((h) => h.nightId === cur.id).map((h) => (h.settledAt ?? h.startedAt).getTime());
+      const lastAt = times.length ? Math.max(...times) : cur.startedAt;
+      if (Date.now() - lastAt < idleMs) return this.nightOut(cur);
+    }
+    if (cur) cur.endedAt = Date.now();
+    const n = { id: `night-${code}-${Date.now().toString(36)}-${this.nights.size}`, tableCode: code, startedAt: Date.now(), endedAt: null };
+    this.nights.set(n.id, n);
+    return this.nightOut(n);
+  }
+  async endNight(code: string) {
+    const cur = [...this.nights.values()].find((n) => n.tableCode === code && n.endedAt === null);
+    if (!cur) return null;
+    cur.endedAt = Date.now();
+    return this.nightOut(cur);
+  }
+  async getNight(id: string) { const n = this.nights.get(id); return n ? this.nightOut(n) : null; }
+  async listNights(code: string, limit: number) {
+    return [...this.nights.values()].filter((n) => n.tableCode === code).sort((a, b) => b.startedAt - a.startedAt).slice(0, limit).map((n) => this.nightOut(n));
+  }
+  async nightHands(nightId: string): Promise<NightHand[]> {
+    return [...this.hands.values()].filter((h) => h.nightId === nightId && h.status === 'settled').sort((a, b) => a.handNumber - b.handNumber)
+      .map((h) => ({
+        handId: h.id, handNumber: h.handNumber, startedAt: h.startedAt.getTime(), settledAt: h.settledAt!.getTime(), community: h.community,
+        dealerHand: h.dealerHand ?? '',
+        players: [...h.players].sort((a, b) => a.seat - b.seat).map((p) => ({
+          playerId: p.playerId, name: p.name, seat: p.seat, hole: p.hole, folded: p.folded, net: p.net ?? 0, outcome: p.outcome ?? '',
+          handName: p.handName ?? '', handRank: p.handRank ?? 0, tripsNet: p.tripsNet ?? 0, pairsNet: p.row?.pairsNet ?? 0,
+          badBeatNet: p.row?.badBeatNet ?? 0, progressiveNet: p.row?.progressiveNet ?? 0, pairsCombo: p.row?.pairsCombo ?? null,
+          badBeatCombo: p.row?.badBeatCombo ?? null, progressiveHand: p.row?.progressiveHand ?? null,
+          pairsMultiplier: p.row?.pairsMultiplier ?? null, badBeatMultiplier: p.row?.badBeatMultiplier ?? null,
+        })),
+        decisions: this.decisions.filter((d) => d.handId === h.id).map((d) => ({ playerId: d.playerId, phase: d.phase, correct: d.correct })),
+      }));
+  }
+
+  async ledgerSummary(p: string, c: string) {
+    const out: Record<string, number> = {};
+    for (const l of this.ledger) if (l.playerId === p && l.code === c) out[l.kind] = (out[l.kind] ?? 0) + l.amount;
+    return out;
   }
 
   async ledgerSum(p: string, c: string) {

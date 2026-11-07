@@ -1,12 +1,13 @@
 import { api } from '../api.js';
 import { h, money, svg, toast } from '../dom.js';
+import { pawnFor } from '../../shared/debt.js';
 
 interface Stats {
   hands: number; net: number; wins: number; losses: number; pushes: number; folds: number; biggestWin: number; biggestLoss: number;
   bestHand: string | null; totalWagered: number; decisions: number; correctDecisions: number; evLost: number;
   byPhase: { phase: string; action: string; count: number; correct: number }[];
   commonMistakes: { phase: string; action: string; recommended: string; count: number; evCost: number }[];
-  trips: { bets: number; wins: number; net: number }; handsWithFriends: number; reloads: number; tables: number;
+  trips: { bets: number; wins: number; net: number }; handsWithFriends: number; reloads: number; tables: number; debt?: number;
   side: Record<'trips' | 'pairs' | 'badBeat' | 'progressive', Side>; baseNet: number; baseWagered: number;
   series: { at: string; cumulative: number }[];
 }
@@ -46,15 +47,34 @@ export async function mountStats(root: HTMLElement, nav: (p: string) => void) {
       fig('Main-game return', s.baseWagered ? `${((s.baseNet / s.baseWagered) * 100).toFixed(2)}%` : '—'),
       fig('With friends', `${s.handsWithFriends} hands`)),
     h('section', { class: 'card-sec' }, h('h2', {}, 'Lifetime bankroll'), graph(s.series),
-      h('p', { class: 'muted' }, `Across ${s.tables} table${s.tables === 1 ? '' : 's'} · ${s.reloads} reload${s.reloads === 1 ? '' : 's'}. With perfect strategy the house edge is about 2.2% of the Ante per hand, roughly 0.5% of total action.`)),
+      h('p', { class: 'muted' }, `Across ${s.tables} table${s.tables === 1 ? '' : 's'} · ${s.reloads} reload${s.reloads === 1 ? '' : 's'}${s.debt ? ` · ${money(s.debt)} in markers (to cover it, pawn ${pawnFor(s.debt).item})` : ''}. With perfect strategy the house edge is about 2.2% of the Ante per hand, roughly 0.5% of total action.`)),
     h('section', { class: 'card-sec' }, h('h2', {}, 'Strategy'),
       h('p', {}, `${pct(s.correctDecisions, s.decisions)} of your ${s.decisions} decisions matched optimal strategy. Mistakes have cost about `,
         h('b', {}, `${s.evLost.toFixed(2)} antes`), ' of expected value in total.'),
       h('div', { class: 'phase-grid' }, ...phases),
+      habit(s.commonMistakes),
       h('h3', {}, 'Most common mistakes'),
       s.commonMistakes.length ? h('ol', { class: 'mistakes' }, ...s.commonMistakes.map((m) => h('li', {},
         `${PHASE[m.phase]}: ${LABEL[m.action]} instead of ${LABEL[m.recommended]}`, h('span', { class: 'muted' }, ` — ${m.count}× · ${m.evCost.toFixed(2)} antes`)))) : h('p', { class: 'muted' }, 'None yet.')),
     sideSection(s)));
+}
+
+/** A repeated mistake (3+ times) gets a plain-language tip from basic strategy. */
+const TIPS: Record<string, string> = {
+  'preflop:check:play4': 'Raise 4× pre-flop with any pair of 3s or better, any ace, K2 suited+/K5+, Q6 suited+/Q8+, J8 suited+/J10+.',
+  'preflop:play4:check': 'You’re raising too wide pre-flop. Outside the 4× list (pairs 3s+, any ace, K2s+/K5o+, Q6s+/Q8o+, J8s+/JTo+), check.',
+  'preflop:play3:play4': 'When you raise pre-flop, raise the full 4×: it’s never better to raise 3×.',
+  'flop:check:play2': 'Bet 2× on the flop with two pair or better, a hidden pair (except pocket 2s), or four to a flush with a hidden 10 or better.',
+  'flop:play2:check': 'Check the flop unless you have two pair+, a hidden pair (not 2s), or four to a flush with a hidden 10+.',
+  'river:fold:play1': 'Rule of thumb: call 1× on the river with a hidden pair or better, or when fewer than 21 dealer cards beat you.',
+  'river:play1:fold': 'Rule of thumb: fold on the river when nothing is hidden in your hand and 21 or more dealer cards beat you.',
+};
+function habit(ms: { phase: string; action: string; recommended: string; count: number; evCost: number }[]) {
+  const m = ms.find((x) => x.count >= 3);
+  if (!m) return null;
+  const tip = TIPS[`${m.phase}:${m.action}:${m.recommended}`] ?? `On the ${PHASE[m.phase].toLowerCase()}, the better play was ${LABEL[m.recommended]}.`;
+  return h('div', { class: 'habit' }, h('b', {}, `You keep doing this: ${PHASE[m.phase]} ${LABEL[m.action]} instead of ${LABEL[m.recommended]} (${m.count}×).`),
+    h('p', {}, tip, m.phase === 'river' ? ' The trainer’s river advice is exact; it counts every possible dealer hand.' : ''));
 }
 
 function graph(series: { cumulative: number }[]) {

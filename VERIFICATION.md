@@ -3,13 +3,38 @@
 What was actually run, where, and what it proved — and what was not tested.
 
 **Environment:** Linux, Node.js 22.23, PostgreSQL 16 (local), Google Chrome for Testing 153, run on 2 November 2026.
-**Result:** 109 of 109 automated tests passed.
+**Result:** 123 of 123 automated tests passed (6 November 2026).
 
 ```
 npx tsc --noEmit                 → no type errors (client, server, shared, tests)
-npm test  (Vitest)               → 8 files, 104 tests passed   (62 unit + 42 multiplayer integration)
-npm run test:e2e (Playwright)    → 5 tests passed in real Chrome against the production build
+npm test  (Vitest)               → 11 files, 116 tests passed   (65 unit + 51 multiplayer integration)
+npm run test:e2e (Playwright)    → 7 tests passed in real Chrome against the production build
 ```
+
+Update 6 November 2026: refinement pass — Progressive/Envy audit under concurrency, rules version, Sit Out / Sit Back In, same bet every hand, decision countdowns and action tags, Tonight running tab and night recap, chips check, results presentation, six-browser test, restore code — section 1f.
+
+## 1f. Refinement pass (6 November 2026)
+
+**Progressive and Envy audit (integration, PostgreSQL).**
+* Six players at one table, five with the $5 bet, all deciding at once. Rigged flop Q♠ J♠ 10♠: Ann royal, Bo straight flush, Cy trips, Di straight, Ed two pair (then folds), Flo no progressive (folds). Asserted for every seat: the exact credit (royal = whole meter in whole dollars + $1,500 Envy; straight flush = 10% of the reseeded meter + $5,000 Envy; trips $45 + $6,500; straight $150 + $6,500; Ed folded and still gets $6,500 Envy; Flo gets nothing); the meter afterwards; two `progressive_hits` rows with the right meter-before values; every player's ledger sum equals their stack; a player at another table is untouched. Envy is never taken from the meter.
+* Four tables each settling a royal at the same instant, each settlement fired twice: exactly four applied, retries rejected, claims serialized on the meter row (the first takes the whole meter, each later one the reseeded meter), conservation holds (`paid + meter after = meter before + 4 × reseed`), every ledger reconciles.
+* Already covered and still passing: fold eligibility, hole + flop only, seat order for several winners, rounding remainder carried into the reseed, crash recovery removing a voided hand's contribution.
+
+**Rules version.** `RULES_VERSION = 2026.11` is stored on every hand (`hands.rules_version`), shown in the pay tables and in replays.
+
+**Sit Out / Sit Back In, same bet every hand (integration).** Sitting out skips the next deal without losing the seat or chips; sitting back in mid-hand shows *Next hand* and deals you in after. Same bet: refused with nothing to repeat; once confirmed, the bet is re-placed and the player readied automatically at the next betting round (asserted with Ante, Trips+ and Progressive); changing the bet by hand turns it off. The server re-checks limits and affordability every hand and turns it off with a chat note if the bet can't be covered (by code review; no test drains a stack for this).
+
+**Tonight and the recap (integration + unit).** Two rigged hands: the running tab has the right hands count, order, net per player (equal to each stack's change from the ledger), folds, best hand, biggest win and loss, best hands with hole cards, Trips+ hit and decision counts. A stranger gets 404. Only the host can End the night, not mid-hand, not twice; everyone receives `night:ended`; the ended night keeps its recap; the next hand opens a new night and the dealer says so. Unit tests cover streaks, folded hands excluded from best hands, bonus ordering, the debt award and the 5-decision minimum for "Sharpest player".
+
+**Six-browser test (Playwright).** Two iPhone-sized and four desktop browsers at one table: everyone bets and deals in at once; on both phones all six name plates are on screen and none overlap, with no sideways scrolling; one player refreshes mid-hand and gets the same cards and turn back; another player's tab is closed, the table shows her *Away*, she returns in a new tab and acts; simultaneous decisions on every street; after settlement every screen shows the same board, the same 12 face-up hole cards and the same stacks; the Tonight tab lists six players and the chips check says *Matches your stack*. No page errors.
+
+**Restore code (Playwright).** Copy the code from Settings on a desktop browser; on an iPhone-sized browser a wrong code is refused, the right one signs in as the same player.
+
+**By eye (393×659 iPhone viewport, desktop 1366×860).** Seconds left on every deciding player's avatar; Checked / Deciding / Folded tags; amounts float over the name plate rather than the cards; the winning five light up first and the compact breakdown fades in after; Tonight tab and recap modal on phone and desktop; Same bet every hand row.
+
+**Pay off and pawn shop (integration, PostgreSQL).** Zero refused; $10 paid leaves $20 owed and $5 in chips with the dealer's chat line; asking for $500 pays only the $5 you have; with no chips it's refused; mid-hand it's refused; ledger still equals the stack and the chips check reports *balanced*; the pawn-shop list has the two markers and two payoffs in order with the pawned item; reloading afterwards adds a new marker. Checked by eye on an iPhone viewport: IOU and Pay off under the bet circles, the payoff sheet, the Pawn shop list.
+
+**Not verified in this pass:** a real iPhone or Safari (emulation only); the share image on an actual phone's share sheet (the canvas drawing runs without errors in Chrome; download is the fallback); the 4-hour automatic night rollover (logic shared with the tested manual path, but no test waits 4 hours or mocks the clock); the deploy notes' roll-back claim.
 
 Update 3 November 2026 (later): host-chosen felt and card backs, host Set away / Move to spectators, debt counter, phone layout — section 1e.
 
@@ -155,7 +180,7 @@ Screenshots from these runs (desktop and iPhone, settled hand) are in `docs/scre
 * **Load.** No load or soak testing. Expect a single instance to handle many concurrent tables, but this hasn't been measured.
 * **Audio and animation.** Exercised in the browser runs without errors, but quality is judged by eye and ear, not by tests.
 * **Side-bet animations** (the Ultimate Pairs ribbon, the Bad Beat banner with both hands highlighted, the larger shimmer for 100:1+ payouts) were checked by eye on a rigged hand in Chrome, not by automated assertions. A real 10,000:1 straight-flush bad beat was tested in settlement code, not played through the UI.
-* **Side-bet privacy choice:** other players see a folded seat's bonus-bet amounts and whether each won, but never the combination. Tell me if you'd rather hide folded seats' bonus results entirely.
+* **Face-up policy:** after a hand settles everyone's cards, folded hands included, are shown to the table, with bonus combinations announced in chat. During a hand nobody sees another player's cards.
 * **Pre-flop and flop EV costs** are estimates (Monte Carlo / sampled runouts) and labelled "est." in the UI. River EV is exact.
 * **Deck commitment.** Each hand stores a SHA-256 of the shuffled deck for audit, but the full deck order isn't stored, so it can't be independently re-verified later; the dealt cards themselves are stored.
-* **Not implemented:** registered accounts and a friends list (guest identities only, as the brief allowed); a cross-table hand-history browser (replays are reached from a table's "Table & history" panel, last 15 hands); horizontal scaling across multiple server instances.
+* **Not implemented:** registered accounts and a friends list (guest identities only, as the brief allowed); a cross-table hand-history browser (replays are reached from a table's History panel, last 15 hands, and from the Tonight tab); horizontal scaling across multiple server instances.

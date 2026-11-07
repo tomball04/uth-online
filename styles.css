@@ -130,7 +130,12 @@ input[type=checkbox], input[type=radio] { accent-color: var(--brass); width: 18p
 .card .idx b { font: 400 calc(var(--w) * .33) var(--display); letter-spacing: -.06em; }
 .card .idx i { font-style: normal; font-size: calc(var(--w) * .26); }
 .card .idx-b { left: auto; top: auto; right: 7%; bottom: 4%; transform: rotate(180deg); }
-.card .pip { position: absolute; inset: 0; display: grid; place-items: center; font-size: calc(var(--w) * .62); padding-top: 8%; }
+.card .pip { position: absolute; inset: 0; display: grid; place-items: center; font-size: calc(var(--w) * .46); padding-top: 10%; }
+/* Small cards (at the seats) read like casino jumbo-index cards: big corner rank and suit, no centre pip. */
+.seat .card .pip, .seat .card .idx-b { display: none; }
+.seat .card .idx { left: 9%; top: 5%; }
+.seat .card .idx b { font-size: calc(var(--w) * .46); }
+.seat .card .idx i { font-size: calc(var(--w) * .36); }
 .card.back {
   background:
     repeating-linear-gradient(45deg, rgba(238, 215, 155, .28) 0 1px, transparent 1px 7px),
@@ -233,6 +238,13 @@ table.tables { width: 100%; border-collapse: collapse; }
 .tname { font: 400 20px var(--display); color: var(--brass-hi); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .code { background: rgba(201, 164, 92, .1); border: 1px solid rgba(201, 164, 92, .35); color: var(--brass-hi); border-radius: 6px; padding: 3px 8px; font-weight: 600; letter-spacing: .12em; }
 .tbar-actions { display: flex; gap: 2px; flex: none; }
+.more-btn { display: none; font-size: 20px; line-height: 1; }
+.menu-list { display: flex; flex-direction: column; gap: 6px; }
+.menu-item { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; width: 100%; text-align: left; padding: 12px 14px; border-radius: 10px;
+  background: rgba(201, 164, 92, .07); border: 1px solid rgba(201, 164, 92, .22); color: var(--text); cursor: pointer; }
+.menu-item b { font-weight: 600; color: var(--brass-hi); }
+.menu-item small { color: var(--muted); font-size: 13px; }
+.menu-item:active { background: rgba(201, 164, 92, .16); }
 .conn { background: var(--oxblood); color: #fff; border-radius: 99px; padding: 3px 10px; font-size: 14px; }
 /* Linked progressive meter: an LED-style sign, the way a progressive bank is signed in a pit. */
 .jackpot {
@@ -326,6 +338,17 @@ table.tables { width: 100%; border-collapse: collapse; }
   -webkit-mask: radial-gradient(circle, transparent 62%, #000 64%); mask: radial-gradient(circle, transparent 62%, #000 64%);
 }
 .seat .avatar { --t: inherit; }
+/* Seconds left on every deciding player's avatar. */
+.seat.acting .avatar[data-secs]::before {
+  content: attr(data-secs); position: absolute; inset: 0; display: grid; place-items: center; z-index: 2; border-radius: 50%;
+  background: rgba(10, 6, 3, .78); color: var(--brass-hi); font: 700 15px/1 'Barlow Semi Condensed', sans-serif; font-variant-numeric: tabular-nums;
+}
+.seat.acting.low .avatar::after { background: conic-gradient(#e0644f calc(var(--t) * 360deg), rgba(255, 255, 255, .08) 0); }
+.seat.acting.low .avatar[data-secs]::before { color: #ff9a8a; }
+/* Action tags: checked / played / folded read at a glance. */
+.seat[data-act=check] .pstatus { color: #cfe6d8; }
+.seat[data-act^=play] .pstatus { color: var(--brass-hi); font-weight: 700; }
+.seat[data-act=fold] .pstatus, .seat[data-st=folded] .pstatus { color: var(--neg); }
 .pinfo { min-width: 0; line-height: 1.1; }
 .pname { font-weight: 600; font-size: clamp(12px, 1.55cqi, 16px); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 10cqi; }
 .pbal { color: var(--brass-hi); font-size: clamp(11px, 1.4cqi, 15px); }
@@ -352,12 +375,14 @@ table.tables { width: 100%; border-collapse: collapse; }
 .seat .plate { cursor: default; }
 .seat:not(.mine):not(.empty-seat) .plate { cursor: pointer; }
 .float {
-  position: absolute; top: -8%; left: 50%; transform: translate(-50%, 0); font-weight: 700; font-size: clamp(14px, 2.2cqi, 24px);
-  opacity: 0; pointer-events: none; text-shadow: 0 2px 4px rgba(0, 0, 0, .8); white-space: nowrap;
+  /* Sits on the name plate, never over the cards, so winning hands stay visible. */
+  position: absolute; bottom: 0; left: 50%; transform: translate(-50%, 0); font-weight: 700; font-size: clamp(13px, 1.9cqi, 20px);
+  opacity: 0; pointer-events: none; white-space: nowrap; z-index: 3; padding: 2px 10px; border-radius: 99px;
+  background: rgba(12, 7, 4, .92); border: 1px solid var(--brass-lo); box-shadow: 0 2px 8px rgba(0, 0, 0, .5);
 }
 .float.show { animation: rise 3.6s ease-out forwards; }
-.float.big { font-size: clamp(18px, 3.2cqi, 34px); color: var(--brass-hi); }
-@keyframes rise { 0% { opacity: 0; transform: translate(-50%, 10px); } 12% { opacity: 1; transform: translate(-50%, 0); } 80% { opacity: 1; } 100% { opacity: 0; transform: translate(-50%, -16px); } }
+.float.big { font-size: clamp(15px, 2.3cqi, 24px); color: var(--brass-hi); border-color: var(--brass-hi); box-shadow: 0 0 14px rgba(238, 215, 155, .45); }
+@keyframes rise { 0% { opacity: 0; transform: translate(-50%, 6px) scale(.9); } 10% { opacity: 1; transform: translate(-50%, 0) scale(1); } 82% { opacity: 1; } 100% { opacity: 0; transform: translate(-50%, 0); } }
 .reaction {
   position: absolute; bottom: 100%; left: 50%; transform: translateX(-50%); white-space: nowrap; background: var(--ivory); color: var(--ink);
   font-weight: 600; font-size: clamp(12px, 1.5cqi, 15px); padding: 4px 10px; border-radius: 12px; animation: pop 2.6s ease forwards; z-index: 5;
@@ -409,6 +434,10 @@ table.tables { width: 100%; border-collapse: collapse; }
 .lines { display: flex; flex-wrap: wrap; gap: 4px 18px; }
 .lines li { display: flex; gap: 6px; }
 .lines li span:first-child { color: var(--muted); }
+.lines li { padding: 1px 8px; border-radius: 6px; background: rgba(255, 255, 255, .04); }
+.res-details { margin: 2px 0; font-size: 13px; color: #d8c7ef; }
+.my-result .lines, .my-result .res-details, .my-result .subtotals, .my-result .grades { transition: opacity .35s ease; }
+.my-result.staged .lines, .my-result.staged .res-details, .my-result.staged .subtotals, .my-result.staged .grades { opacity: 0; }
 .grades { max-height: 11em; overflow-y: auto; }
 .grades li { margin: 3px 0; }
 .grades .ok { color: var(--pos); }
@@ -477,6 +506,8 @@ select { background: #0f0a07; border: 1px solid #5a4126; border-radius: 8px; pad
 .swatch input:checked + .swatch-dot { box-shadow: 0 0 0 3px var(--brass-hi), 0 2px 6px rgba(0,0,0,.5); }
 .swatch input:checked ~ .swatch-name { color: var(--brass-hi); }
 .swatch input:focus-visible + .swatch-dot { outline: 2px solid var(--brass-hi); outline-offset: 3px; }
+.swatch-group.readonly .swatch { cursor: default; }
+.swatch-group.readonly .swatch:not(:has(input:checked)) { opacity: .45; }
 .theme-preview { --cw: 44px; padding: 14px; border-radius: 10px; background: radial-gradient(ellipse at 50% 40%, var(--felt-light), var(--felt) 55%, var(--felt-deep)); box-shadow: inset 0 0 0 2px var(--brass-lo); }
 
 /* side panel */
@@ -501,6 +532,11 @@ select { background: #0f0a07; border: 1px solid #5a4126; border-radius: 8px; pad
 .spark { width: 100%; height: 54px; color: var(--brass-hi); margin-top: 8px; }
 .plist { list-style: none; padding: 0; margin: 0; }
 .plist li { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid rgba(255, 255, 255, .05); }
+.host-plist li { flex-wrap: wrap; }
+.pbal[data-debt]:not([data-debt=''])::after { content: attr(data-debt); display: block; color: #ff8f80; font-size: .82em; line-height: 1.1; }
+.debt-line b { color: #ff8f80; }
+.host-plist li > span:first-child { display: flex; flex-direction: column; min-width: 0; }
+.host-btns { display: flex; flex-wrap: wrap; gap: 6px; }
 .recent { list-style: none; padding: 0; margin: 0; font-size: 14px; }
 .recent li { padding: 8px 0; border-bottom: 1px solid rgba(255, 255, 255, .05); }
 .rp { display: flex; flex-direction: column; color: var(--muted); }
@@ -560,49 +596,88 @@ label.radio small { color: var(--muted); font-size: 14px; }
 
 @media (max-width: 760px) {
   body { font-size: 16px; }
-  .tbar { gap: 4px; padding-left: 6px; padding-right: 6px; }
-  .tbar-actions .ghost { padding: 6px 7px; font-size: 15px; }
-  .tname { font-size: 17px; }
+  .tbar { gap: 6px; padding: max(4px, env(safe-area-inset-top)) 6px 4px; min-height: 44px; }
+  .tbar .ghost { white-space: nowrap; }
+  .tbar-actions .ghost { padding: 6px 8px; font-size: 15px; }
+  .back-btn { font-size: 20px; padding: 4px 8px; }
+  .more-btn { display: inline-block; }
+  .tname { font-size: 16px; }
+  .tbar-title { gap: 6px; }
   .tbar-title .code { display: none; }
   .hide-m { display: none; }
   .show-m { display: inline; }
   .fp-wide { display: none; }
   .fp-tall { display: block; }
-  .table-area { padding: 8px 6px; }
-  .rail { width: min(100cqw, 100cqh * 1.02); aspect-ratio: 1.02; border-radius: 9% 9% 48% 48% / 9% 9% 60% 60%; padding: 2.4%; }
+  .table-area { padding: 6px 4px 4px; }
+  /* Phones: the table fills the space it has instead of keeping a fixed shape. */
+  .rail { width: 100cqw; height: 100cqh; aspect-ratio: auto; border-radius: 9% 9% 48% 48% / 9% 9% 60% 60%; padding: 2.4%; }
   .felt { border-radius: 7% 7% 48% 48% / 7% 7% 58% 58%; --cw: clamp(20px, 7cqi, 40px); }
-  .community { top: 33%; --cw: clamp(30px, 10.5cqi, 56px); }
-  .dealer-zone { top: 8%; }
-  .seat { width: 22cqi; --cw: clamp(16px, 6cqi, 30px); gap: 2px; }
-  .pstatus { font-size: 11px; }
+  .community { top: 28%; --cw: clamp(30px, 11.6cqi, 58px); gap: 4px; }
+  .dealer-zone { top: 7%; --cw: clamp(22px, 8cqi, 40px); }
+  .card .pip { font-size: calc(var(--w) * .38); padding-top: 18%; }
+  .phase-line { font-size: 13px; }
+  .seat { width: 25cqi; --cw: clamp(18px, 7.6cqi, 36px); gap: 2px; }
+  .seat .cards-row { gap: 2px; }
+  /* Status becomes a small tag on the name plate instead of a line of text under it. */
+  .pstatus {
+    top: 0; left: auto; right: -2px; transform: translateY(-60%); font-size: 10px; line-height: 1; padding: 2px 6px; border-radius: 99px;
+    background: #120a06; border: 1px solid var(--brass-lo); color: var(--muted); z-index: 1;
+  }
+  /* Only short, useful tags; the timer ring on the avatar already shows who is deciding. */
+  .seat:not([data-tag='1']) .pstatus { display: none; }
+  .pstatus { transform: translateY(-75%); }
+  .seat[data-st=ready] .pstatus { color: var(--pos); border-color: rgba(120, 200, 140, .5); }
+  .seat.acting .pstatus { color: var(--brass-hi); border-color: var(--brass); }
+  .seat.won .pstatus { color: var(--pos); } .seat.lost .pstatus { color: var(--neg); }
+  .avatar { width: 24px; height: 24px; font-size: 13px; }
+  .pname { font-size: 12px; max-width: 18cqi; }
+  .pbal { font-size: 12px; }
+  .float { font-size: 15px; }
+  .felt-print { opacity: .6; }
   .seat.empty-seat .pinfo { display: none; }
   .seat.empty-seat .plate { min-width: 0; padding: 2px; }
   .seat.empty-seat .cards-row { display: none; }
   .dealer-zone .bubble { display: none; }
   .seat .mini-spots { display: none; }
   .seat .hand-name { display: none; }
-  .plate { padding: 2px 6px 2px 2px; gap: 4px; }
-  .pname { max-width: 15cqi; }
+  .plate { padding: 2px 8px 2px 2px; gap: 5px; min-width: 0; }
+  .pname { max-width: 17cqi; }
   .felt-print .fp-small { display: none; }
   .felt-print .fp-big { font-size: 46px; }
   .shoe { width: 8cqi; height: 10cqi; right: 8%; }
   .tray-col { width: 3.6cqi; height: 4.6cqi; }
-  .dock { grid-template-columns: auto minmax(0, 1fr); gap: 8px 12px; padding: 8px 10px calc(8px + var(--safe-b)); min-height: 0; }
+  .dock { grid-template-columns: auto minmax(0, 1fr); gap: 6px 10px; padding: 6px 10px calc(8px + var(--safe-b)); min-height: 0; max-height: 62dvh; overflow-y: auto; overscroll-behavior: contain; }
+  .dock-mid { gap: 5px; }
   .res-title { font-size: 19px; }
   .res-title small { display: block; }
   .lines { font-size: 14px; gap: 2px 12px; }
-  .dock-hand { --cw: 50px; min-width: 0; }
+  .dock-hand { --cw: 46px; min-width: 0; gap: 2px; }
+  /* Between hands there are no cards to show: give the bet controls the full width. */
+  .dock.no-hand .dock-hand { display: none; }
+  .dock.no-hand .dock-mid { grid-column: 1 / -1; }
+  .my-hn { font-size: 14px; }
   .dock-right { grid-column: 1 / -1; align-items: stretch; }
   .controls { justify-content: stretch; }
   .controls .btn { flex: 1; }
   .btn.act { min-width: 0; }
   .rack { justify-content: space-between; }
-  .chip { width: 44px; height: 44px; }
-  .spots { gap: 6px; }
-  .bet-layout { gap: 6px; }
+  .chip { width: 42px; height: 42px; }
+  .dock-right { gap: 8px; }
+  .bet-layout { gap: 6px; flex-wrap: wrap; align-items: center; }
+  /* Ante, Blind, Play and a round Bonus button share one evenly spaced row. */
+  .spots { flex: 1; gap: 6px; justify-content: space-around; }
+  .bonus-panel { display: contents; }
+  .bonus-panel .bonus-toggle {
+    width: 52px; height: 52px; min-height: 0; padding: 0; border-radius: 50%; flex: none; margin-right: 4px;
+    flex-direction: column; justify-content: center; gap: 1px; font-size: 11px; line-height: 1.05;
+  }
+  .bonus-panel .bonus-toggle::after { content: none; }
+  .bonus-panel .bonus-toggle b { font-size: 12px; }
+  .bonus-panel.open .bonus-toggle { border-style: solid; background: rgba(91, 42, 134, .45); }
+  .bonus-panel .bonus-body { width: 100%; justify-content: space-around; }
   .bonus-panel { border-left: 0; padding-left: 0; width: 100%; }
   .bonus-toggle {
-    display: flex; justify-content: space-between; align-items: center; width: 100%; min-height: 36px; padding: 4px 12px;
+    display: flex; justify-content: space-between; align-items: center; width: 100%; min-height: 32px; padding: 2px 12px;
     background: rgba(91, 42, 134, .2); border: 1px dashed rgba(238, 215, 155, .45); border-radius: 8px; color: var(--brass-hi); font-size: 14px;
   }
   .bonus-toggle::after { content: '▾'; margin-left: 8px; }
@@ -620,8 +695,8 @@ label.radio small { color: var(--muted); font-size: 14px; }
   .bonus-flash { font-size: 13px; padding: 4px 10px; }
   .bonus-flash.rare { font-size: 15px; }
   .gem { font-size: 10px; }
-  .spot { width: 56px; height: 56px; }
-  .spot-label { font-size: 11px; }
+  .spot { width: 60px; height: 60px; }
+  .spot-label { font-size: 12px; }
   .spot-amt { font-size: 13px; }
   .dock-msg { font-size: 14px; }
   .form-grid { grid-template-columns: 1fr; }
@@ -639,3 +714,56 @@ label.radio small { color: var(--muted); font-size: 14px; }
   .dock-hand { --cw: 40px; }
   .spot { width: 48px; height: 48px; }
 }
+
+/* ---------- Tonight: running tab and recap ---------- */
+.night { display: flex; flex-direction: column; gap: 14px; }
+.night h4 { margin: 0 0 6px; font-size: 13px; letter-spacing: .12em; text-transform: uppercase; color: var(--brass-hi); font-weight: 600; }
+.night-sub { margin: 0; color: var(--muted); font-size: 14px; }
+.board { width: 100%; border-collapse: collapse; font-size: 15px; }
+.board th { text-align: left; font-weight: 500; color: var(--muted); font-size: 12px; padding: 4px 6px; border-bottom: 1px solid rgba(201, 164, 92, .25); }
+.board td { padding: 6px; border-bottom: 1px solid rgba(255, 255, 255, .05); }
+.board tr.me td { background: rgba(201, 164, 92, .08); }
+.board td:first-child { width: 2em; color: var(--muted); }
+.board .num, .bonus-list .num { text-align: right; font-variant-numeric: tabular-nums; }
+.iou { color: #ff8f80; font-size: 12px; }
+.moments { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 8px; }
+.moment { border: 1px solid rgba(201, 164, 92, .25); border-radius: 10px; padding: 8px 10px; background: rgba(0, 0, 0, .18); display: flex; flex-direction: column; gap: 4px; }
+.moment small { color: var(--muted); text-transform: uppercase; letter-spacing: .1em; font-size: 11px; }
+.moment.pos { border-left: 3px solid var(--pos); } .moment.neg { border-left: 3px solid var(--neg); }
+.moment-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.moment .link { align-self: flex-start; }
+.mini-cards { display: inline-flex; gap: 3px; --cw: 30px; flex: none; }
+.mini-cards .card .pip, .mini-cards .card .idx-b { display: none; }
+.mini-cards .card .idx { left: 9%; top: 5%; }
+.mini-cards .card .idx b { font-size: calc(var(--w) * .5); }
+.mini-cards .card .idx i { font-size: calc(var(--w) * .4); }
+.best-list, .bonus-list, .fun-list, .past-nights { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.best-list li { display: grid; grid-template-columns: 1fr auto auto; gap: 8px; align-items: center; }
+.bonus-list li { display: flex; justify-content: space-between; gap: 8px; }
+.fun-list li { display: flex; flex-direction: column; }
+.fun-list b { color: var(--brass-hi); font-size: 13px; font-weight: 600; }
+.chips-check .kv { margin: 0; }
+.chips-check .total { border-top: 1px solid rgba(201, 164, 92, .35); padding-top: 4px; font-weight: 700; }
+.night-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.recap-head { font: 600 22px/1.2 'Marcellus', Georgia, serif; color: var(--brass-hi); margin: 0 0 10px; }
+.pane-night { overflow-y: auto; padding: 12px 14px; }
+.auto-row { font-size: 14px; }
+.auto-on { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; padding: 4px 10px; border-radius: 99px;
+  border: 1px solid rgba(201, 164, 92, .45); background: rgba(201, 164, 92, .08); }
+.auto-on b { color: var(--brass-hi); font-weight: 600; }
+.auto-on small { color: var(--muted); }
+.auto-off { font-size: 14px; }
+.auto-confirm { font-weight: 700; color: var(--brass-hi); font-size: 18px; }
+.habit { border: 1px solid rgba(224, 100, 79, .45); border-left: 4px solid #e0644f; border-radius: 10px; padding: 10px 14px; margin: 10px 0; background: rgba(224, 100, 79, .08); }
+.habit p { margin: 4px 0 0; }
+.restore-link { margin-top: 10px; font-size: 14px; }
+.restore-code { flex: 1; min-width: 0; font-family: ui-monospace, monospace; }
+.payoff-link { margin-left: 8px; font-size: 13px; }
+.pawn-shop ul { list-style: none; margin: 0 0 8px; padding: 0; display: flex; flex-direction: column; gap: 6px; font-size: 14px; }
+.pawn-shop li { display: grid; grid-template-columns: auto 1fr auto; gap: 8px; align-items: baseline; padding: 4px 0; border-bottom: 1px dashed rgba(201, 164, 92, .18); }
+.pawn-time { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.pawn-owes { font-size: 12px; white-space: nowrap; }
+.auto-row { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center; }
+.debt-pill { display: inline-flex; gap: 6px; align-items: baseline; font-size: 14px; color: var(--muted); }
+.debt-pill b { color: #ff8f80; }
+.debt-pill .link { font-size: 13px; }

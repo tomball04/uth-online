@@ -41,3 +41,14 @@ export async function restore(): Promise<Me | null> {
     return session.me && session.token ? session.me : null;
   }
 }
+
+/** Adopt a restore code (another device's token) after checking it with the server. */
+export async function restoreWithCode(code: string): Promise<Me> {
+  const token = code.trim();
+  if (!/^[A-Za-z0-9._~+/=-]{16,}$/.test(token)) throw new Error('That doesn’t look like a restore code.');
+  const r = await fetch('/api/me', { headers: { authorization: `Bearer ${token}` } });
+  if (!r.ok) throw new Error('That restore code wasn’t recognised.');
+  const { player } = await r.json() as { player: Me };
+  session.save(token, player);
+  return player;
+}

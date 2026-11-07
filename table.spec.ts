@@ -216,3 +216,139 @@ test('side bets: bonus panel on a phone, Trips+ requirement, locking, and settle
   expect(host.errors).toEqual([]);
   expect(phone.errors).toEqual([]);
 });
+
+test('phone host: table menu, felt and card colours for everyone, set a player away', async ({ browser }) => {
+  const host = await newPlayer(browser, 'Pita', 'iphone');
+  const guest = await newPlayer(browser, 'Gus');
+  await signIn(host.page, 'Pita');
+  await host.page.getByRole('button', { name: 'Create a private table' }).click();
+  await host.page.getByRole('button', { name: 'Create table' }).click();
+  await host.page.waitForURL(/\/table\/[A-Z0-9]{8}$/);
+  await signIn(guest.page, 'Gus', new URL(host.page.url()).pathname);
+  await expect(host.page.locator('.seat:not(.empty-seat) .pname')).toHaveCount(2);
+
+  // One tidy top bar on the phone; everything else lives in the menu.
+  await expect(host.page.locator('.tbar').getByRole('button', { name: 'Invite' })).toBeHidden();
+  await host.page.getByRole('button', { name: 'Table menu' }).click();
+  await host.page.getByRole('button', { name: /Host controls/ }).click();
+  await host.page.locator('.swatch[title="Burgundy"]').first().click();          // felt
+  await host.page.locator('.swatch-group').nth(1).locator('.swatch[title="Gold"]').click();
+  await expect(guest.page.locator('html')).toHaveAttribute('data-felt', 'burgundy');
+  await expect(guest.page.locator('html')).toHaveAttribute('data-back', 'gold');
+  // The guest sees the look but can't change it.
+  await guest.page.getByRole('button', { name: 'Settings' }).click();
+  await expect(guest.page.getByText('The host chooses the felt and card backs')).toBeVisible();
+  await expect(guest.page.locator('.swatch-group.readonly input').first()).toBeDisabled();
+  await guest.page.keyboard.press('Escape');
+
+  // Set Gus away from the host's player list.
+  await host.page.getByRole('button', { name: 'Set away' }).click();
+  await expect(guest.page.getByRole('button', { name: 'Sit back in' })).toBeVisible();
+  await guest.page.getByRole('button', { name: 'Sit back in' }).click();
+  await expect(guest.page.getByRole('button', { name: 'Deal me in' })).toBeVisible();
+  expect([...host.errors, ...guest.errors]).toEqual([]);
+});
+
+test('six players: simultaneous decisions, a refresh and a dropped connection mid-hand, phone layout', async ({ browser }) => {
+  test.setTimeout(180_000);
+  const names = ['Ana', 'Ben', 'Cal', 'Dee', 'Eve', 'Fay'];
+  const devicesFor: ('desktop' | 'iphone')[] = ['desktop', 'iphone', 'desktop', 'iphone', 'desktop', 'desktop'];
+  const ps = await Promise.all(names.map((n, i) => newPlayer(browser, n, devicesFor[i])));
+  await signIn(ps[0].page, 'Ana');
+  await ps[0].page.getByRole('button', { name: 'Create a private table' }).click();
+  await ps[0].page.getByRole('button', { name: 'Create table' }).click();
+  await ps[0].page.waitForURL(/\/table\/[A-Z0-9]{8}$/);
+  const path = new URL(ps[0].page.url()).pathname;
+  for (let i = 1; i < 6; i++) await signIn(ps[i].page, names[i], path);
+  for (const p of ps) await expect(p.page.locator('.seat:not(.empty-seat) .pname')).toHaveCount(6, { timeout: 15000 });
+
+  // Everyone bets and deals in at once; Ben adds the $5 progressive.
+  await Promise.all(ps.map(async ({ page }, i) => {
+    await page.locator('.rack .chip.c5').click();
+    await page.locator('.spot-ante').click();
+    await page.locator('.spot-ante').click();
+    if (i === 1) { await page.locator('.bonus-toggle').click(); await page.locator('.spot-progressive').click(); }
+    await page.getByRole('button', { name: 'Deal me in' }).click();
+  }));
+  for (const { page } of ps) await expect(page.getByRole('button', { name: /^Check/ })).toBeVisible({ timeout: 20000 });
+
+  // Phones: all six name plates readable — none overlap each other and none run off the screen.
+  for (const { page } of ps.filter((_, i) => devicesFor[i] === 'iphone')) {
+    const boxes = await page.locator('.seat:not(.empty-seat) .plate').evaluateAll((els) => els.map((e) => { const r = e.getBoundingClientRect(); return { x: r.x, y: r.y, w: r.width, h: r.height }; }));
+    expect(boxes).toHaveLength(6);
+    const vw = page.viewportSize()!.width;
+    for (const b of boxes) { expect(b.x).toBeGreaterThanOrEqual(-1); expect(b.x + b.w).toBeLessThanOrEqual(vw + 1); }
+    for (let a = 0; a < boxes.length; a++) for (let b = a + 1; b < boxes.length; b++) {
+      const A = boxes[a], B = boxes[b];
+      const overlap = A.x < B.x + B.w - 2 && B.x < A.x + A.w - 2 && A.y < B.y + B.h - 2 && B.y < A.y + A.h - 2;
+      expect(overlap, `plates ${a} and ${b} overlap`).toBe(false);
+    }
+    expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0);
+  }
+
+  // Eve refreshes mid-hand: same seat, same two cards, still her turn.
+  const before = await ps[4].page.locator('.dock-hand .card').evaluateAll((els) => els.map((e) => (e as HTMLElement).dataset.card));
+  await ps[4].page.reload();
+  await expect(ps[4].page.getByRole('button', { name: /^Check/ })).toBeVisible({ timeout: 20000 });
+  expect(await ps[4].page.locator('.dock-hand .card').evaluateAll((els) => els.map((e) => (e as HTMLElement).dataset.card))).toEqual(before);
+  // Fay's connection drops (her tab dies); the others see her as away. She comes back in a new tab and carries on.
+  const fayUrl = ps[5].page.url();
+  const fayCtx = ps[5].page.context();
+  await ps[5].page.close();
+  await expect(ps[0].page.locator('.seat:not(.empty-seat)', { hasText: 'Fay' }).locator('.pstatus')).toHaveText('Away', { timeout: 15000 });
+  const fay = await fayCtx.newPage();
+  fay.on('pageerror', (e) => ps[5].errors.push(e.message));
+  await fay.goto(fayUrl);
+  ps[5].page = fay;
+  await expect(fay.getByRole('button', { name: /^Check/ })).toBeVisible({ timeout: 20000 });
+  await expect(ps[0].page.locator('.seat:not(.empty-seat)', { hasText: 'Fay' }).locator('.pstatus')).not.toHaveText('Away', { timeout: 15000 });
+
+  // Simultaneous decisions.
+  await Promise.all(ps.map(({ page }, i) => page.getByRole('button', { name: i < 3 ? /^Play 4×/ : /^Check/ }).click()));
+  for (const { page } of ps.slice(3)) await expect(page.getByRole('button', { name: /^Play 2×/ })).toBeVisible({ timeout: 20000 });
+  await Promise.all(ps.slice(3).map(({ page }) => page.getByRole('button', { name: /^Check/ }).click()));
+  for (const { page } of ps.slice(3)) await expect(page.getByRole('button', { name: /^Fold/ })).toBeVisible({ timeout: 20000 });
+  await Promise.all(ps.slice(3).map(({ page }, j) => page.getByRole('button', { name: j === 0 ? /^Play 1×/ : /^Fold/ }).click()));
+
+  for (const { page } of ps) await expect(page.locator('.my-result')).toBeVisible({ timeout: 25000 });
+  await ps[0].page.waitForTimeout(1500);
+  // Everyone saw the same board and dealer, every hand is face up, and every screen agrees on every stack.
+  const board = await communityCards(ps[0].page);
+  expect(board.filter(Boolean)).toHaveLength(5);
+  const seatCards = (p: Page) => p.locator('.seat:not(.empty-seat) .cards-row .card').evaluateAll((els) => els.map((e) => (e as HTMLElement).dataset.card).filter(Boolean).sort());
+  const stacks = (p: Page) => p.locator('.seat:not(.empty-seat)').evaluateAll((els) => els.map((e) =>
+    `${e.querySelector('.pname')?.textContent}=${e.querySelector('.pbal')?.firstChild?.textContent ?? e.querySelector('.pbal')?.textContent}`).sort());
+  const ref = await stacks(ps[0].page);
+  expect(await seatCards(ps[0].page)).toHaveLength(12);
+  for (const { page } of ps) {
+    expect(await communityCards(page)).toEqual(board);
+    expect(await stacks(page)).toEqual(ref);
+    expect(await seatCards(page)).toEqual(await seatCards(ps[0].page));
+  }
+  // The running tab agrees with the table.
+  await ps[0].page.locator('.tabs .tab', { hasText: 'Tonight' }).click();
+  await expect(ps[0].page.locator('.pane-night .board tbody tr')).toHaveCount(6);
+  await expect(ps[0].page.locator('.pane-night .chips-check')).toContainText('Matches your stack');
+  for (const p of ps) expect(p.errors, p.name).toEqual([]);
+});
+
+test('restore code moves a guest to another device', async ({ browser }) => {
+  const a = await newPlayer(browser, 'Rosa');
+  await signIn(a.page, 'Rosa');
+  await a.page.getByRole('button', { name: 'Create a private table' }).waitFor();
+  await a.page.getByRole('button', { name: 'Settings' }).first().click();
+  await a.page.getByRole('button', { name: 'Show' }).click();
+  const code = await a.page.locator('.restore-code').inputValue();
+  expect(code.length).toBeGreaterThan(20);
+  const b = await newPlayer(browser, 'Rosa (phone)', 'iphone');
+  await b.page.goto('/');
+  await b.page.getByRole('button', { name: 'Have a restore code?' }).click();
+  await b.page.getByLabel('Restore code').fill('not-a-real-code-at-all-123');
+  await b.page.getByRole('button', { name: 'Restore', exact: true }).click();
+  await expect(b.page.getByText('wasn’t recognised')).toBeVisible();
+  await b.page.getByLabel('Restore code').fill(code);
+  await b.page.getByRole('button', { name: 'Restore', exact: true }).click();
+  await expect(b.page.getByRole('button', { name: 'Create a private table' })).toBeVisible();
+  expect(await b.page.evaluate(() => JSON.parse(localStorage.getItem('uth.me') ?? '{}').name)).toBe('Rosa');
+  expect([...a.errors, ...b.errors]).toEqual([]);
+});

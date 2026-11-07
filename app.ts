@@ -10,6 +10,7 @@ import { REACTIONS } from '../shared/protocol.js';
 import { buildConfig } from './config.js';
 import { DEFAULT_TIMING, EngineError, TableEngine, cleanName, type Timing } from './engine.js';
 import { newId, newToken, roomCode, secureShuffle, sha256 } from './rng.js';
+import { buildRecap } from '../shared/recap.js';
 import type { PlayerRow, Store } from './store.js';
 
 type IO = Server<ClientToServer, ServerToClient, object, SocketData>;
@@ -113,6 +114,7 @@ export class TableManager {
         for (const c of this.tables.keys()) if (c !== code) this.broadcast(c);
       },
       jackpotAmount: () => this.jackpot,
+      nightEnded: (nightId: string) => { for (const s of this.sockets.get(code) ?? []) s.emit('night:ended', { nightId }); },
       jackpotHit: (p: { tableName: string; playerName: string; hand: string; amount: number }) => {
         // Every table hears about a linked jackpot hit, like the sign over a casino pit.
         for (const [c, set] of this.sockets) for (const s of set) s.emit('jackpot:hit', { ...p, same: c === code });
@@ -260,10 +262,52 @@ export async function createApp(opts: AppOptions) {
     res.json({ table: { ...t.listing(), solo: t.config.solo } });
   }));
   app.get('/api/stats/me', requireAuth, wrap(async (_req, res) => { res.json({ stats: await store.playerStats(res.locals.player.id) }); }));
+  // ---- table nights: running tab and recaps
+  const nightAccess = async (code: string, me: string) => {
+    const t = await store.loadTable(code);
+    if (!t) return null;
+    if (t.hostId === me || (await store.getStack(me, code)) || t.config.allowSpectators || t.config.isPublic) return t;
+    return null;
+  };
+  app.get('/api/tables/:code/nights', requireAuth, wrap(async (req, res) => {
+    const code = String(req.params.code).toUpperCase();
+    if (!(await nightAccess(code, res.locals.player.id))) { res.status(404).json({ error: 'Table not found.' }); return; }
+    res.json({ nights: await store.listNights(code, 30) });
+  }));
+  app.get('/api/tables/:code/pawns', requireAuth, wrap(async (req, res) => {
+    const code = String(req.params.code).toUpperCase();
+    if (!(await nightAccess(code, res.locals.player.id))) { res.status(404).json({ error: 'Table not found.' }); return; }
+    res.json({ events: await store.debtEvents(code, 50) });
+  }));
+  app.get('/api/tables/:code/night', requireAuth, wrap(async (req, res) => {
+    const code = String(req.params.code).toUpperCase();
+    const t = await nightAccess(code, res.locals.player.id);
+    if (!t) { res.status(404).json({ error: 'Table not found.' }); return; }
+    const id = typeof req.query.id === 'string' ? req.query.id : null;
+    const night = id ? await store.getNight(id) : (await store.listNights(code, 1))[0] ?? null;
+    if (!night || night.tableCode !== code) { res.json({ recap: null }); return; }
+    const hands = await store.nightHands(night.id);
+    const debts = new Map<string, number>();
+    for (const pid of new Set(hands.flatMap((h) => h.players.map((p) => p.playerId)))) debts.set(pid, (await store.getStack(pid, code))?.debt ?? 0);
+    res.json({ recap: buildRecap({ nightId: night.id, tableName: t.config.name, startedAt: night.startedAt, endedAt: night.endedAt }, hands, debts) });
+  }));
+
+  // Your chips at one table, straight from the ledger: start + reloads − wagers + payouts + refunds = stack.
+  app.get('/api/tables/:code/chips', requireAuth, wrap(async (req, res) => {
+    const code = String(req.params.code).toUpperCase(), me = res.locals.player.id as string;
+    const stack = await store.getStack(me, code);
+    if (!stack) { res.status(404).json({ error: 'You have no chips at this table.' }); return; }
+    const k = await store.ledgerSummary(me, code);
+    const total = Object.values(k).reduce((a, b) => a + b, 0);
+    res.json({ chips: { start: k.buyin ?? 0, reloads: k.reload ?? 0, wagered: -(k.wager ?? 0), paid: k.payout ?? 0, refunded: k.refund ?? 0,
+      ledgerTotal: total, balance: stack.balance, debt: stack.debt, balanced: total === stack.balance } });
+  }));
+
   app.get('/api/hands/:id', requireAuth, wrap(async (req, res) => {
     const r = await store.handReplay(String(req.params.id));
     const me = res.locals.player.id as string;
-    if (!r || !r.players.some((p) => p.playerId === me)) { res.status(404).json({ error: 'Hand not found.' }); return; }
+    // Players in the hand, and anyone who has played at that table (cards are all face up once a hand settles).
+    if (!r || (!r.players.some((p) => p.playerId === me) && !(await store.getStack(me, r.tableCode)))) { res.status(404).json({ error: 'Hand not found.' }); return; }
     if (r.status === 'active') { res.status(409).json({ error: 'Hand still in progress.' }); return; }
     // Settled hands are fully face up (folded hands included), matching the table's showdown policy.
     r.decisions = r.decisions.filter((d) => d.playerId === me);
@@ -353,9 +397,14 @@ export async function createApp(opts: AppOptions) {
       await e.decide(socket.data.player.id, x.actionId, String(x.handId), x.phase, x.decision);
     });
     on('player:reload', async (e) => e.reload(socket.data.player.id));
+    on('player:payDebt', async (e, p) => e.payDebt(socket.data.player.id, Number(obj(p).amount)));
     on('player:prefs', async (e, p) => e.setPrefs(socket.data.player.id, obj(p)));
     on('host:kick', async (e, p) => e.kick(socket.data.player.id, String(obj(p).playerId)));
     on('host:close', async (e) => e.close(socket.data.player.id));
+    on('host:theme', async (e, p) => e.setTheme(socket.data.player.id, obj(p)));
+    on('host:away', async (e, p) => e.setAway(socket.data.player.id, String(obj(p).playerId), obj(p).away !== false));
+    on('host:endNight', async (e) => e.endNight(socket.data.player.id));
+    on('host:standUp', async (e, p) => e.standUp(socket.data.player.id, String(obj(p).playerId)));
     on('host:settings', async (e, p) => e.updateSettings(socket.data.player.id, obj(p)));
 
     socket.on('chat:send', (p, ack) => {

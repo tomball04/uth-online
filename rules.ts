@@ -23,6 +23,14 @@ import { PROGRESSIVE, type ProgressiveAward } from './progressive.js';
 export const CHIP_DENOMINATIONS = [100, 500, 2500, 10000, 50000] as const; // $1 $5 $25 $100 $500
 
 /** Blind pays only when the player WINS with a straight or better. [numerator, denominator] */
+/**
+ * Rules version. Bumped whenever any pay table, rounding rule or eligibility rule changes; every hand
+ * records the version it was played under. 2026.11: Blind 3:2 rounded down to the dollar; Trips+ (WoO standard);
+ * Ultimate Pairs and Bad Beat per the selected table variant; $5 Five Card Progressive (hole + flop,
+ * live after a fold, Envy to other $5 bettors at the same table).
+ */
+export const RULES_VERSION = '2026.11';
+
 export const BLIND_PAYTABLE: Partial<Record<HandName, [number, number]>> = {
   'Royal Flush': [500, 1],
   'Straight Flush': [50, 1],

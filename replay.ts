@@ -10,7 +10,7 @@ import { outsEl } from './outs.js';
 interface Replay {
   hand: {
     handId: string; handNumber: number; status: string; dealer: string[]; community: string[]; dealerHand: string | null;
-    dealerQualifies: boolean | null; deckCommitment: string; pairsVariant: string | null; badBeatVariant: string | null;
+    dealerQualifies: boolean | null; deckCommitment: string; pairsVariant: string | null; badBeatVariant: string | null; rulesVersion?: string | null;
     players: { playerId: string; name: string; seat: number; hole: string[] | null; folded: boolean; ante: number; blind: number; trips: number; pairs: number; badBeat: number; progressive?: number; play: number; net: number | null; outcome: string | null; handName: string | null;
       settlement: { [k: string]: { stake: number; result: string; net: number; credit?: number; note?: string; multiplier?: number; combo?: string } } | null }[];
     decisions: { phase: string; action: string; recommended: string; correct: boolean; reason: string; timedOut: boolean; evCost?: number; evExact?: boolean; outs?: Outs }[];
@@ -63,7 +63,7 @@ export async function openReplay(handId: string) {
   go(0);
   modal(`Hand #${r.handNumber}${r.status === 'voided' ? ' (voided — stakes refunded)' : ''}`,
     h('div', { class: 'replay' }, stage, h('div', { class: 'replay-nav' }, prevBtn, stepLabel, nextBtn),
-      h('p', { class: 'muted tiny' }, `Pay tables: ${r.pairsVariant ? PAIRS_VARIANTS[r.pairsVariant as keyof typeof PAIRS_VARIANTS]?.name ?? r.pairsVariant : 'Ultimate Pairs (default)'}, ${r.badBeatVariant ? BAD_BEAT_VARIANTS[r.badBeatVariant as keyof typeof BAD_BEAT_VARIANTS]?.name ?? r.badBeatVariant : 'Bad Beat (default)'}. Deck commitment ${r.deckCommitment.slice(0, 16)}…`)), { wide: true });
+      h('p', { class: 'muted tiny' }, `Pay tables: ${r.pairsVariant ? PAIRS_VARIANTS[r.pairsVariant as keyof typeof PAIRS_VARIANTS]?.name ?? r.pairsVariant : 'Ultimate Pairs (default)'}, ${r.badBeatVariant ? BAD_BEAT_VARIANTS[r.badBeatVariant as keyof typeof BAD_BEAT_VARIANTS]?.name ?? r.badBeatVariant : 'Bad Beat (default)'}. ${r.rulesVersion ? ` Rules ${r.rulesVersion}.` : ''} Deck commitment ${r.deckCommitment.slice(0, 16)}…`)), { wide: true });
 }
 
 const SIDE = { trips: 'Trips+', pairs: 'Ultimate Pairs', badBeat: 'Bad Beat', progressive: 'Progressive' } as const;

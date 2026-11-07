@@ -10,7 +10,7 @@ import type {
 } from '../shared/protocol.js';
 import {
   LEGAL_DECISIONS, NO_BETS, PLAY_MULTIPLIER, TIMEOUT_DEFAULT, decisionLabel, formatMoney, requiredToStart, sideTotal,
-  dealerQualifies, settle, validateInitialBet, type Decision, type DecisionPhase, type InitialBets, type Settlement,
+  RULES_VERSION, dealerQualifies, settle, validateInitialBet, type Decision, type DecisionPhase, type InitialBets, type Settlement,
 } from '../shared/rules.js';
 import { advise, mistakeCost, outsFor } from '../shared/strategy.js';
 import { PROGRESSIVE, progressiveHand, resolveProgressive, type ProgressiveEntry, type ProgressiveResolution } from '../shared/progressive.js';
@@ -27,9 +27,14 @@ export function withSideBetDefaults(c: TableConfig): TableConfig {
     pairsVariant: isPairsVariant(c.pairsVariant) ? c.pairsVariant : DEFAULT_PAIRS_VARIANT,
     badBeatVariant: isBadBeatVariant(c.badBeatVariant) ? c.badBeatVariant : DEFAULT_BAD_BEAT_VARIANT,
     progressive: c.progressive !== false,
+    felt: isFelt(c.felt) ? c.felt : DEFAULT_FELT,
+    cardBack: isBack(c.cardBack) ? c.cardBack : DEFAULT_BACK,
   };
 }
 import { newId, sha256 } from './rng.js';
+import { debtLine, pawnFor } from '../shared/debt.js';
+import { NIGHT_IDLE_MS } from '../shared/recap.js';
+import { BACKS, DEFAULT_BACK, DEFAULT_FELT, FELTS, isBack, isFelt } from '../shared/themes.js';
 import type { PlayerRow, Store } from './store.js';
 
 export interface Timing {
@@ -50,13 +55,17 @@ export interface EngineHooks {
   jackpot(amount: number): void;
   jackpotHit(p: { tableName: string; playerName: string; hand: string; amount: number }): void;
   jackpotAmount(): number;
+  nightEnded(nightId: string): void;
 }
 
 interface Seat {
-  seat: number; playerId: string; name: string; avatar: string; balance: number; reloads: number;
+  seat: number; playerId: string; name: string; avatar: string; balance: number; reloads: number; debt: number;
   connected: boolean; disconnectedAt: number | null;
   pending: InitialBets; ready: boolean; lastBet: InitialBets | null;
   sitOut: boolean; timeoutPolicy: 'default' | 'strategy'; leaving: boolean;
+  /** Same bet every hand: placed and readied automatically at the start of each betting round. */
+  autoRebet: InitialBets | null;
+  standingUp: boolean; awayByHost: boolean;
   seen: string[];
 }
 
@@ -87,6 +96,9 @@ export class TableEngine {
   closed = false;
   banned = new Set<string>();
   recent: HandSummary[] = [];
+  /** The open table night (running tab). Set at the first deal; the host can end it between hands. */
+  nightId: string | null = null;
+  private freshNight = false;
   private timer: NodeJS.Timeout | null = null;
   private sweepTimer: NodeJS.Timeout;
   private queue: Promise<unknown> = Promise.resolve();
@@ -168,9 +180,9 @@ export class TableEngine {
     if (this.seats[idx] || this.seatOf(player.id)) throw new EngineError('That seat is taken.');
     this.spectators.delete(player.id);
     this.seats[idx] = {
-      seat: idx, playerId: player.id, name: player.name, avatar: player.avatar, balance: stack.balance, reloads: stack.reloads,
+      seat: idx, playerId: player.id, name: player.name, avatar: player.avatar, balance: stack.balance, reloads: stack.reloads, debt: stack.debt ?? 0,
       connected: true, disconnectedAt: null, pending: { ...NO_BETS }, ready: false, lastBet: null,
-      sitOut: false, timeoutPolicy: 'default', leaving: false, seen: [],
+      sitOut: false, timeoutPolicy: 'default', leaving: false, autoRebet: null, standingUp: false, awayByHost: false, seen: [],
     };
     if (!this.seatOf(this.hostId)) this.hostId = player.id;
     this.say(`${player.name} takes seat ${idx + 1}.`, 'system');
@@ -208,6 +220,12 @@ export class TableEngine {
     else if (this.phase === 'betting') this.checkStart();
   }
 
+  /** Seat → rail. The stack stays in the database, so sitting down again restores it. */
+  private standUpNow(s: Seat) {
+    this.spectators.set(s.playerId, { name: s.name });
+    this.removeSeat(s, `${s.name} was moved to the spectators by the host.`);
+  }
+
   setConnected(pid: string, connected: boolean) {
     const s = this.seatOf(pid);
     if (!s) return;
@@ -232,6 +250,7 @@ export class TableEngine {
     if (err) throw new EngineError(err);
     s.pending = { ante: bets.ante, trips: bets.trips, pairs: bets.pairs, badBeat: bets.badBeat, progressive: bets.progressive };
     s.ready = false;
+    s.autoRebet = null;   // changing the bet by hand turns same-bet off
     this.checkStart();
   }
 
@@ -241,6 +260,7 @@ export class TableEngine {
     if (this.phase !== 'betting') throw new EngineError('Bets are locked during a hand.');
     s.pending = { ...NO_BETS };
     s.ready = false;
+    s.autoRebet = null;
     this.checkStart();
   }
 
@@ -251,9 +271,11 @@ export class TableEngine {
     if (ready) {
       const err = validateInitialBet(s.pending, s.balance, this.limits());
       if (err) throw new EngineError(s.pending.ante ? err : 'Place an Ante first.');
-      s.sitOut = false;
+      if (s.sitOut) this.say(`${s.name} is back.`, 'system');
+      s.sitOut = false; s.awayByHost = false;
     }
     s.ready = ready;
+    if (!ready) s.autoRebet = null;
     await this.checkStart();
   }
 
@@ -305,7 +327,12 @@ export class TableEngine {
 
     const id = newId();
     const number = this.handCounter + 1;
+    const night = await this.store.openNight(this.code, NIGHT_IDLE_MS, this.freshNight);
+    if (night.id !== this.nightId) this.say(this.freshNight || !this.nightId ? 'A new night begins. Good luck, everyone.' : 'Welcome back — a new night begins.');
+    this.freshNight = false;
+    this.nightId = night.id;
     const { balances, jackpot } = await this.store.startHand({
+      nightId: night.id, rulesVersion: RULES_VERSION,
       id, tableCode: this.code, handNumber: number,
       deckCommitment: sha256(deck.map(intToCard).join('') + ':' + id),
       dealerCards: dealer.map(intToCard), community: community.map(intToCard),
@@ -557,10 +584,20 @@ export class TableEngine {
       s.ready = false;
       if (s.leaving || (!s.connected && s.disconnectedAt && this.now() - s.disconnectedAt > this.timing.graceMs))
         this.removeSeat(s, `${s.name} leaves the table.`);
+      else if (s.standingUp) this.standUpNow(s);
     }
     if (this.closing) { await this.doClose('The host closed the table.'); return; }
     this.phase = this.seatedCount() ? 'betting' : 'waiting';
     this.deadline = null;
+    // Same bet every hand: re-place it and deal the player in, re-checking limits and affordability each time.
+    let auto = false;
+    for (const s of this.seats) {
+      if (!s?.autoRebet || s.sitOut || !s.connected || this.phase !== 'betting') continue;
+      const err = validateInitialBet(s.autoRebet, s.balance, this.limits());
+      if (err) { s.autoRebet = null; this.say(`${s.name}: same-bet is off — ${err}`, 'system'); continue; }
+      s.pending = { ...s.autoRebet }; s.ready = true; auto = true;
+    }
+    if (auto) await this.checkStart();
   }
 
   // ------------------------------------------------------------------ misc player actions
@@ -568,17 +605,60 @@ export class TableEngine {
     const s = this.requireSeat(pid);
     if (this.inActiveHand(pid)) throw new EngineError('You can reload between hands.');
     if (requiredToStart(this.config.minAnte) <= s.balance) throw new EngineError('You can reload once your stack can no longer cover a minimum hand.');
-    const st = await this.store.reloadStack(pid, this.code, this.config.startingBankroll);
+    const debtAfter = s.debt + Math.max(0, this.config.startingBankroll - s.balance);
+    const st = await this.store.reloadStack(pid, this.code, this.config.startingBankroll, { name: s.name, item: pawnFor(debtAfter).item });
+    const borrowed = st.debt - s.debt;
     s.balance = st.balance;
     s.reloads = st.reloads;
+    s.debt = st.debt;
     s.pending = { ...NO_BETS };
-    this.say(`${s.name} reloads to ${formatMoney(st.balance)} in virtual chips.`, 'system');
+    // Just for fun: the dealer keeps a running tab and suggests something to pawn.
+    const out = { balance: st.balance, debt: st.debt };
+    this.say(borrowed > 0 ? debtLine(s.name, borrowed, st.debt, st.reloads) : `${s.name} reloads to ${formatMoney(st.balance)} in virtual chips.`);
+    return out;
   }
 
-  async setPrefs(pid: string, p: { timeoutPolicy?: 'default' | 'strategy'; sitOut?: boolean }) {
+  /** Pay back markers from your stack, between hands. Just for fun: it only moves chips you own to the house. */
+  async payDebt(pid: string, amount: number) {
+    const s = this.requireSeat(pid);
+    if (this.inActiveHand(pid)) throw new EngineError('You can pay off your markers between hands.');
+    if (!s.debt) throw new EngineError('You don’t owe the house anything.');
+    if (!Number.isInteger(amount) || amount <= 0) throw new EngineError('Choose an amount to pay.');
+    const before = s.debt;
+    const r = await this.store.payDebt(pid, this.code, amount, { name: s.name, item: () => pawnFor(before).item });
+    if (!r.paid) throw new EngineError('You have no chips to pay with.');
+    s.balance = r.balance; s.debt = r.debt;
+    // A bet that no longer fits is taken back.
+    if (s.pending.ante && validateInitialBet(s.pending, s.balance, this.limits())) { s.pending = { ...NO_BETS }; s.ready = false; s.autoRebet = null; }
+    this.say(r.debt
+      ? `${s.name} pays ${formatMoney(r.paid)} on their markers. Still owes ${formatMoney(r.debt)} — ${pawnFor(r.debt).item.replace(/^your /, 'their ')} stays at the pawn shop.`
+      : `${s.name} pays off all ${formatMoney(r.paid)} in markers and gets ${pawnFor(before).item.replace(/^your /, 'their ')} back from the pawn shop. Debt free!`);
+    await this.checkStart();
+    return { balance: r.balance, debt: r.debt, paid: r.paid };
+  }
+
+  async setPrefs(pid: string, p: { timeoutPolicy?: 'default' | 'strategy'; sitOut?: boolean; autoRebet?: boolean }) {
     const s = this.requireSeat(pid);
     if (p.timeoutPolicy === 'default' || p.timeoutPolicy === 'strategy') s.timeoutPolicy = p.timeoutPolicy;
-    if (typeof p.sitOut === 'boolean') { s.sitOut = p.sitOut; if (p.sitOut) s.ready = false; await this.checkStart(); }
+    if (p.autoRebet === false) s.autoRebet = null;
+    if (p.autoRebet === true) {
+      // The bet to repeat: what's on the layout now, otherwise the last bet you played.
+      const bet = s.pending.ante ? { ...s.pending } : s.lastBet ? { ...s.lastBet } : null;
+      if (!bet) throw new EngineError('Place a bet first, then turn on Same bet every hand.');
+      const err = validateInitialBet(bet, s.balance, this.limits());
+      if (err) throw new EngineError(err);
+      s.autoRebet = bet;
+      if (this.phase === 'betting' && !s.sitOut && !s.ready) { s.pending = { ...bet }; s.ready = true; await this.checkStart(); }
+    }
+    if (typeof p.sitOut === 'boolean') {
+      if (s.sitOut === p.sitOut && !s.awayByHost) return;
+      const inHand = !!this.hand && !this.hand.settled && this.hand.players.has(pid);
+      s.sitOut = p.sitOut; s.awayByHost = false;
+      // Mid-hand, sitting out takes effect from the next hand; the current hand plays out normally.
+      if (p.sitOut) { s.ready = false; s.pending = { ...NO_BETS }; }
+      this.say(p.sitOut ? `${s.name} is sitting out${inHand ? ' after this hand' : ''}.` : `${s.name} sits back in.`, 'system');
+      await this.checkStart();
+    }
   }
 
   // ------------------------------------------------------------------ host controls (no access to cards/outcomes)
@@ -595,6 +675,58 @@ export class TableEngine {
       if (this.inActiveHand(target)) { s.leaving = true; await this.autoActForAbsent(); await this.maybeAdvance(); }
       else this.removeSeat(s, `${s.name} was removed by the host.`);
     }
+  }
+
+  /** Host sets a player away (sitting out) or back. The current hand is unaffected; it applies from the next deal. */
+  async setAway(hostId: string, target: string, away: boolean) {
+    this.requireHost(hostId);
+    const s = this.seatOf(target);
+    if (!s) throw new EngineError('That player is not seated.');
+    if (s.sitOut === away) return;
+    s.sitOut = away; s.awayByHost = away;
+    if (away) { s.ready = false; s.pending = { ...NO_BETS }; }
+    const live = this.inActiveHand(target) ? ' after this hand' : '';
+    this.say(away ? `The host set ${s.name} away${live}. They can tap Sit back in whenever they’re ready.` : `The host brought ${s.name} back in.`, 'system');
+    await this.checkStart();
+  }
+
+  /** Host ends the night: the running tab becomes a recap and the next hand starts a new night. */
+  async endNight(hostId: string) {
+    this.requireHost(hostId);
+    if (this.hand && !this.hand.settled) throw new EngineError('Finish this hand first.');
+    const n = await this.store.endNight(this.code);
+    if (!n) throw new EngineError('No hands have been played tonight yet.');
+    this.nightId = null;
+    this.say(`That’s the night! ${n.hands} hand${n.hands === 1 ? '' : 's'} played. The recap is up — the next hand starts a new night.`);
+    this.hooks.nightEnded(n.id);
+  }
+
+  /** Host moves a player to the spectators. Mid-hand, they finish the hand first. */
+  async standUp(hostId: string, target: string) {
+    this.requireHost(hostId);
+    if (target === hostId) throw new EngineError('Use Leave to stand up yourself.');
+    const s = this.seatOf(target);
+    if (!s) throw new EngineError('That player is not seated.');
+    if (this.inActiveHand(target)) {
+      s.standingUp = true; s.sitOut = true;
+      this.say(`${s.name} will move to the spectators after this hand.`, 'system');
+      return;
+    }
+    this.standUpNow(s);
+  }
+
+  /** Felt and card backs: cosmetic, so the host may change them at any time, even mid-hand. */
+  async setTheme(hostId: string, p: { felt?: unknown; cardBack?: unknown }) {
+    this.requireHost(hostId);
+    const c = { ...this.config };
+    if (p.felt !== undefined) { if (!isFelt(p.felt)) throw new EngineError('Unknown felt.'); c.felt = p.felt; }
+    if (p.cardBack !== undefined) { if (!isBack(p.cardBack)) throw new EngineError('Unknown card back.'); c.cardBack = p.cardBack; }
+    if (c.felt === this.config.felt && c.cardBack === this.config.cardBack) return;
+    const msg = c.felt !== this.config.felt ? `The host changed the felt to ${FELTS.find((f) => f.id === c.felt)!.name}.`
+      : `The host changed the card backs to ${BACKS.find((b) => b.id === c.cardBack)!.name}.`;
+    this.config = c;
+    await this.store.updateTable(this.code, { config: c });
+    this.say(msg, 'system');
   }
 
   async close(hostId: string) {
@@ -697,9 +829,11 @@ export class TableEngine {
         lastBet: me?.lastBet ?? null,
         canReload: !!me && !this.inActiveHand(viewerId) && me.balance < requiredToStart(this.config.minAnte),
         timeoutPolicy: me?.timeoutPolicy ?? 'default',
+        autoRebet: me?.autoRebet ?? null,
       },
       recent: this.recent,
       jackpot: { amount: this.hooks.jackpotAmount(), wager: PROGRESSIVE.wager },
+      nightId: this.nightId, rulesVersion: RULES_VERSION,
     };
   }
 
@@ -734,7 +868,8 @@ export class TableEngine {
       cards: h ? (canSee ? h.hole.map(intToCard) : [null, null]) : [],
       handName: h && canSee ? handName(evaluate([...h.hole, ...visible])) : undefined,
       result,
-      leaving: s.leaving,
+      debt: s.debt || undefined,
+      leaving: s.leaving, standingUp: s.standingUp || undefined, awayByHost: s.awayByHost || undefined, sitOut: s.sitOut || undefined,
     };
   }
 

@@ -3,9 +3,10 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { DecisionRecord, TableConfig } from '../shared/protocol.js';
 import { PROGRESSIVE } from '../shared/progressive.js';
+import type { NightHand } from '../shared/recap.js';
 import {
   InsufficientFunds, JACKPOT_ID, type HandStart, type SettlementBuilder, type PlayerRow, type PlayerSettlementRow, type PlayerStats,
-  type RecentHandRow, type ReplayData, type StackRow, type Store, type TableRow,
+  type DebtEvent, type NightRow, type RecentHandRow, type ReplayData, type StackRow, type Store, type TableRow,
 } from './store.js';
 
 // BIGINT -> number (all our values are well inside Number.MAX_SAFE_INTEGER)
@@ -81,32 +82,59 @@ export class PgStore implements Store {
   }
 
   async getStack(playerId: string, code: string): Promise<StackRow | null> {
-    const r = await this.pool.query('SELECT balance,reloads FROM stacks WHERE player_id=$1 AND table_code=$2', [playerId, code]);
-    return r.rows[0] ?? null;
+    const r = await this.pool.query('SELECT balance,reloads,debt FROM stacks WHERE player_id=$1 AND table_code=$2', [playerId, code]);
+    return r.rows[0] ? stackRow(r.rows[0]) : null;
   }
   async createStack(playerId: string, code: string, amount: number): Promise<StackRow> {
     return this.tx(async (c) => {
       const ins = await c.query(
-        `INSERT INTO stacks(player_id,table_code,balance) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING RETURNING balance,reloads`,
+        `INSERT INTO stacks(player_id,table_code,balance) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING RETURNING balance,reloads,debt`,
         [playerId, code, amount]);
       if (ins.rowCount) {
         await c.query(`INSERT INTO ledger(tx_key,player_id,table_code,kind,amount,balance_after) VALUES ($1,$2,$3,'buyin',$4,$4)`,
           [`${code}:${playerId}:buyin`, playerId, code, amount]);
-        return ins.rows[0];
+        return stackRow(ins.rows[0]);
       }
-      return (await c.query('SELECT balance,reloads FROM stacks WHERE player_id=$1 AND table_code=$2', [playerId, code])).rows[0];
+      return stackRow((await c.query('SELECT balance,reloads,debt FROM stacks WHERE player_id=$1 AND table_code=$2', [playerId, code])).rows[0]);
     });
   }
-  async reloadStack(playerId: string, code: string, amount: number): Promise<StackRow> {
+  async reloadStack(playerId: string, code: string, amount: number, pawn?: { name: string; item: string }): Promise<StackRow> {
     return this.tx(async (c) => {
-      const cur = (await c.query('SELECT balance,reloads FROM stacks WHERE player_id=$1 AND table_code=$2 FOR UPDATE', [playerId, code])).rows[0];
+      const cur = (await c.query('SELECT balance,reloads,debt FROM stacks WHERE player_id=$1 AND table_code=$2 FOR UPDATE', [playerId, code])).rows[0];
       if (!cur) throw new Error('No stack');
       const n = cur.reloads + 1;
-      await c.query('UPDATE stacks SET balance=$3, reloads=$4, updated_at=now() WHERE player_id=$1 AND table_code=$2', [playerId, code, amount, n]);
+      const debt = Number(cur.debt) + Math.max(0, amount - Number(cur.balance));
+      await c.query('UPDATE stacks SET balance=$3, reloads=$4, debt=$5, updated_at=now() WHERE player_id=$1 AND table_code=$2', [playerId, code, amount, n, debt]);
       await c.query(`INSERT INTO ledger(tx_key,player_id,table_code,kind,amount,balance_after) VALUES ($1,$2,$3,'reload',$4,$5)`,
         [`${code}:${playerId}:reload:${n}`, playerId, code, amount - cur.balance, amount]);
-      return { balance: amount, reloads: n };
+      if (pawn && debt > Number(cur.debt))
+        await c.query(`INSERT INTO debt_events(player_id,table_code,name,kind,amount,debt_after,item) VALUES ($1,$2,$3,'marker',$4,$5,$6)`,
+          [playerId, code, pawn.name, debt - Number(cur.debt), debt, pawn.item]);
+      return { balance: amount, reloads: n, debt };
     });
+  }
+
+  async payDebt(playerId: string, code: string, amount: number, pawn: { name: string; item: (debtAfter: number) => string }) {
+    return this.tx(async (c) => {
+      const cur = (await c.query('SELECT balance,reloads,debt FROM stacks WHERE player_id=$1 AND table_code=$2 FOR UPDATE', [playerId, code])).rows[0];
+      if (!cur) throw new Error('No stack');
+      const paid = Math.max(0, Math.min(amount, Number(cur.debt), Number(cur.balance)));
+      if (!paid) return { ...stackRow(cur), paid: 0 };
+      const balance = Number(cur.balance) - paid, debt = Number(cur.debt) - paid;
+      await c.query('UPDATE stacks SET balance=$3, debt=$4, updated_at=now() WHERE player_id=$1 AND table_code=$2', [playerId, code, balance, debt]);
+      const n = (await c.query(`SELECT COUNT(*)::int n FROM debt_events WHERE player_id=$1 AND table_code=$2`, [playerId, code])).rows[0].n;
+      await c.query(`INSERT INTO ledger(tx_key,player_id,table_code,kind,amount,balance_after) VALUES ($1,$2,$3,'reload',$4,$5)`,
+        [`${code}:${playerId}:payoff:${n + 1}`, playerId, code, -paid, balance]);
+      await c.query(`INSERT INTO debt_events(player_id,table_code,name,kind,amount,debt_after,item) VALUES ($1,$2,$3,'payoff',$4,$5,$6)`,
+        [playerId, code, pawn.name, paid, debt, pawn.item(debt)]);
+      return { balance, reloads: Number(cur.reloads), debt, paid };
+    });
+  }
+
+  async debtEvents(code: string, limit: number) {
+    return (await this.pool.query('SELECT * FROM debt_events WHERE table_code=$1 ORDER BY id DESC LIMIT $2', [code, limit])).rows.map((r: any) => ({
+      id: Number(r.id), playerId: r.player_id, name: r.name, kind: r.kind, amount: Number(r.amount), debtAfter: Number(r.debt_after), item: r.item,
+      at: new Date(r.created_at).getTime() }));
   }
 
   private async debit(c: Q, playerId: string, code: string, handId: string, amount: number, key: string): Promise<number | null> {
@@ -126,10 +154,10 @@ export class PgStore implements Store {
   async startHand(h: HandStart) {
     return this.tx(async (c) => {
       await c.query(
-        `INSERT INTO hands(id,table_code,hand_number,status,deck_commitment,dealer_cards,community,participant_count,pairs_variant,bad_beat_variant)
-         VALUES ($1,$2,$3,'active',$4,$5,$6,$7,$8,$9)`,
+        `INSERT INTO hands(id,table_code,hand_number,status,deck_commitment,dealer_cards,community,participant_count,pairs_variant,bad_beat_variant,night_id,rules_version)
+         VALUES ($1,$2,$3,'active',$4,$5,$6,$7,$8,$9,$10,$11)`,
         [h.id, h.tableCode, h.handNumber, h.deckCommitment, JSON.stringify(h.dealerCards), JSON.stringify(h.community), h.players.length,
-         h.pairsVariant, h.badBeatVariant]);
+         h.pairsVariant, h.badBeatVariant, h.nightId || null, h.rulesVersion]);
       await c.query('UPDATE game_tables SET hand_counter=$2 WHERE code=$1', [h.tableCode, h.handNumber]);
       const balances = new Map<string, number>();
       for (const p of h.players) {
@@ -271,7 +299,7 @@ export class PgStore implements Store {
          GROUP BY phase, action, recommended ORDER BY count DESC LIMIT 5`),
       q(`SELECT COUNT(*)::int bets, COUNT(*) FILTER (WHERE trips_net>0)::int wins, COALESCE(SUM(trips_net),0) net FROM hand_players WHERE player_id=$1 AND settled AND trips>0`),
       q(`SELECT COUNT(*)::int n FROM hand_players hp JOIN hands h ON h.id=hp.hand_id WHERE hp.player_id=$1 AND hp.settled AND h.participant_count>1`),
-      q(`SELECT COALESCE(SUM(reloads),0)::int reloads, COUNT(*)::int tables FROM stacks WHERE player_id=$1`),
+      q(`SELECT COALESCE(SUM(reloads),0)::int reloads, COALESCE(SUM(debt),0) debt, COUNT(*)::int tables FROM stacks WHERE player_id=$1`),
       q(`SELECT h.settled_at at, SUM(hp.net) OVER (ORDER BY h.settled_at, h.id) cum
          FROM hand_players hp JOIN hands h ON h.id=hp.hand_id WHERE hp.player_id=$1 AND hp.settled ORDER BY h.settled_at DESC, h.id DESC LIMIT 500`),
     ]);
@@ -286,7 +314,7 @@ export class PgStore implements Store {
       trips: { bets: trips.rows[0].bets, wins: trips.rows[0].wins, net: Number(trips.rows[0].net) },
       side: { trips: sTrips, pairs: sPairs, badBeat: sBad, progressive: sProg },
       baseNet: Number(base.rows[0].net), baseWagered: Number(base.rows[0].wagered),
-      handsWithFriends: friends.rows[0].n, reloads: stacks.rows[0].reloads, tables: stacks.rows[0].tables,
+      handsWithFriends: friends.rows[0].n, reloads: stacks.rows[0].reloads, tables: stacks.rows[0].tables, debt: Number(stacks.rows[0].debt),
       series: series.rows.reverse().map((r) => ({ at: new Date(r.at).toISOString(), cumulative: Number(r.cum) })),
     };
   }
@@ -323,7 +351,7 @@ export class PgStore implements Store {
       startedAt: new Date(h.started_at).toISOString(), settledAt: h.settled_at ? new Date(h.settled_at).toISOString() : null,
       dealer: h.dealer_cards, community: h.community, dealerHand: h.dealer_hand, dealerQualifies: h.dealer_qualifies,
       deckCommitment: h.deck_commitment,
-      pairsVariant: h.pairs_variant, badBeatVariant: h.bad_beat_variant,
+      pairsVariant: h.pairs_variant, badBeatVariant: h.bad_beat_variant, rulesVersion: h.rules_version ?? null,
       players: ps.map((p) => ({
         playerId: p.player_id, name: p.name, seat: p.seat, hole: p.hole, folded: p.folded,
         ante: p.ante, blind: p.blind, trips: p.trips, pairs: p.pairs, badBeat: p.bad_beat, progressive: p.progressive, play: p.play, net: p.net, outcome: p.outcome,
@@ -337,8 +365,70 @@ export class PgStore implements Store {
     };
   }
 
+  private nightRow = (r: any): NightRow => ({ id: r.id, tableCode: r.table_code, startedAt: new Date(r.started_at).getTime(),
+    endedAt: r.ended_at ? new Date(r.ended_at).getTime() : null, hands: Number(r.hands ?? 0) });
+  private nightSelect = `SELECT n.*, (SELECT COUNT(*) FROM hands h WHERE h.night_id=n.id AND h.status='settled') hands FROM table_nights n`;
+
+  async openNight(code: string, idleMs: number, fresh: boolean): Promise<NightRow> {
+    return this.tx(async (c) => {
+      await c.query('SELECT code FROM game_tables WHERE code=$1 FOR UPDATE', [code]);   // one opener per table at a time
+      const cur = (await c.query(`${this.nightSelect} WHERE n.table_code=$1 AND n.ended_at IS NULL`, [code])).rows[0];
+      if (cur && !fresh) {
+        const last = (await c.query(`SELECT MAX(COALESCE(settled_at, started_at)) t FROM hands WHERE night_id=$1`, [cur.id])).rows[0].t;
+        const lastAt = last ? new Date(last).getTime() : new Date(cur.started_at).getTime();
+        if (Date.now() - lastAt < idleMs) return this.nightRow(cur);
+      }
+      if (cur) await c.query('UPDATE table_nights SET ended_at=now() WHERE id=$1', [cur.id]);
+      const id = `night-${code}-${Date.now().toString(36)}`;
+      const r = (await c.query('INSERT INTO table_nights(id,table_code) VALUES ($1,$2) RETURNING *', [id, code])).rows[0];
+      return this.nightRow({ ...r, hands: 0 });
+    });
+  }
+
+  async endNight(code: string) {
+    const r = (await this.pool.query('UPDATE table_nights SET ended_at=now() WHERE table_code=$1 AND ended_at IS NULL RETURNING id', [code])).rows[0];
+    return r ? this.getNight(r.id) : null;
+  }
+
+  async getNight(id: string) {
+    const r = (await this.pool.query(`${this.nightSelect} WHERE n.id=$1`, [id])).rows[0];
+    return r ? this.nightRow(r) : null;
+  }
+
+  async listNights(code: string, limit: number) {
+    return (await this.pool.query(`${this.nightSelect} WHERE n.table_code=$1 ORDER BY n.started_at DESC LIMIT $2`, [code, limit])).rows.map(this.nightRow);
+  }
+
+  async nightHands(nightId: string): Promise<NightHand[]> {
+    const hands = (await this.pool.query(
+      `SELECT id, hand_number, started_at, settled_at, community, dealer_hand FROM hands WHERE night_id=$1 AND status='settled' ORDER BY hand_number`, [nightId])).rows;
+    if (!hands.length) return [];
+    const ids = hands.map((h: any) => h.id);
+    const players = (await this.pool.query(`SELECT * FROM hand_players WHERE hand_id = ANY($1) ORDER BY seat`, [ids])).rows;
+    const decisions = (await this.pool.query(`SELECT hand_id, player_id, phase, correct FROM decisions WHERE hand_id = ANY($1)`, [ids])).rows;
+    return hands.map((h: any) => ({
+      handId: h.id, handNumber: h.hand_number, startedAt: new Date(h.started_at).getTime(), settledAt: new Date(h.settled_at).getTime(),
+      community: h.community, dealerHand: h.dealer_hand ?? '',
+      players: players.filter((p: any) => p.hand_id === h.id).map((p: any) => ({
+        playerId: p.player_id, name: p.name, seat: p.seat, hole: p.hole, folded: p.folded, net: Number(p.net ?? 0), outcome: p.outcome ?? '',
+        handName: p.hand_name ?? '', handRank: p.hand_rank ?? 0, tripsNet: Number(p.trips_net ?? 0), pairsNet: Number(p.pairs_net ?? 0),
+        badBeatNet: Number(p.bad_beat_net ?? 0), progressiveNet: Number(p.progressive_net ?? 0), pairsCombo: p.pairs_combo, badBeatCombo: p.bad_beat_combo,
+        progressiveHand: p.progressive_hand, pairsMultiplier: p.pairs_multiplier, badBeatMultiplier: p.bad_beat_multiplier,
+      })),
+      decisions: decisions.filter((d: any) => d.hand_id === h.id).map((d: any) => ({ playerId: d.player_id, phase: d.phase, correct: d.correct })),
+    }));
+  }
+
+  async ledgerSummary(playerId: string, code: string) {
+    const rows = (await this.pool.query('SELECT kind, SUM(amount)::bigint s FROM ledger WHERE player_id=$1 AND table_code=$2 GROUP BY kind', [playerId, code])).rows;
+    return Object.fromEntries(rows.map((r: any) => [r.kind, Number(r.s)]));
+  }
+
   async ledgerSum(playerId: string, code: string) {
     const r = await this.pool.query('SELECT COALESCE(SUM(amount),0) s FROM ledger WHERE player_id=$1 AND table_code=$2', [playerId, code]);
     return Number(r.rows[0].s);
   }
 }
+
+const stackRow = (r: { balance: unknown; reloads: unknown; debt: unknown }): StackRow =>
+  ({ balance: Number(r.balance), reloads: Number(r.reloads), debt: Number(r.debt ?? 0) });

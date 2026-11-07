@@ -1,4 +1,4 @@
-import { BLIND_PAYTABLE, TRIPS_PAYTABLE } from '../../shared/rules.js';
+import { BLIND_PAYTABLE, RULES_VERSION, TRIPS_PAYTABLE } from '../../shared/rules.js';
 import type { TableConfig } from '../../shared/protocol.js';
 import { BAD_BEAT_VARIANTS, PAIRS_VARIANTS, type BadBeatVariant, type PairsVariant } from '../../shared/sidebets.js';
 import { PROGRESSIVE } from '../../shared/progressive.js';
@@ -77,7 +77,8 @@ export function openPayTables(c: TableConfig, jackpot?: number) {
       h('div', {}, h('h4', {}, 'Trips+'), payRows(Object.entries(TRIPS_PAYTABLE).map(([k, x]) => [k, `${x} to 1`])))),
     h('div', { class: 'pay-grid' }, pairsTable(PAIRS_VARIANTS[c.pairsVariant]), badBeatTable(BAD_BEAT_VARIANTS[c.badBeatVariant])),
     c.progressive ? h('div', { class: 'pay-grid' }, progressiveTable(jackpot)) : h('p', { class: 'muted' }, 'The progressive is switched off at this table.'),
-    h('p', { class: 'muted' }, `Blind flush (3 to 2) is rounded down to the dollar. Bonus limits: Trips+ up to $${c.maxTrips / 100}, Ultimate Pairs up to $${c.maxPairs / 100}, Bad Beat up to $${c.maxBadBeat / 100}. Pay tables only change between hands, and every change is announced in chat.`)),
+    h('p', { class: 'muted' }, `Blind flush (3 to 2) is rounded down to the dollar. Bonus limits: Trips+ up to $${c.maxTrips / 100}, Ultimate Pairs up to $${c.maxPairs / 100}, Bad Beat up to $${c.maxBadBeat / 100}. Pay tables only change between hands, and every change is announced in chat.`),
+    h('p', { class: 'muted tiny' }, `Rules version ${RULES_VERSION}. Every hand records the rules version and pay tables it was played under.`)),
     { wide: true });
 }
 

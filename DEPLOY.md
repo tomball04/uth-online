@@ -71,6 +71,9 @@ Or locally with the bundled database: `docker compose --profile app up --build` 
 
 ## Operations
 
-* **Backups:** the database holds identities, stacks, hand history and the ledger. Use your provider's scheduled backups.
+* **Backups:** the database holds identities, stacks, hand history, nights and the ledger. Neon keeps a point-in-time restore window (its length depends on your plan); for a longer history run `pg_dump "$DATABASE_URL" > uth-$(date +%F).sql` now and then and keep the file. Restoring is `psql "$DATABASE_URL" < file.sql` into an empty database.
+* **Monitoring:** `GET /api/health` returns `{ ok, tables }`; point Render's health check (or any uptime pinger) at it. Errors and restarts show in Render's **Logs** tab. A free Render service sleeps after ~15 minutes idle; the first visit wakes it in under a minute and nothing is lost.
+* **Deploy safety:** migrations in `migrations/` run automatically on start, in order, once each. They only add tables and columns (new columns have defaults or allow empty values), so an older build can still run against the newer database if you need to roll back. This is by design; it is not covered by an automated test.
+* **Moving devices:** a player's identity is a private restore code (Settings → Use another device). There are no passwords to reset; if someone loses their code and their browser data, they start a new guest.
 * **Restarts / deploys:** safe at any time. Hands in progress are voided on the next boot and all their stakes refunded exactly once (see `voidActiveHands` in `src/server/pgStore.ts`). Players' browsers reconnect automatically and rejoin their table.
 * **Audit:** every chip movement is a row in `ledger`; `SUM(amount)` per player and table equals the stack balance.

@@ -4,16 +4,18 @@ import { REACTIONS } from '../../shared/protocol.js';
 import { BLIND_PAYTABLE, NO_BETS, TRIPS_PAYTABLE, requiredToStart, sideTotal, type Decision, type DecisionPhase, type InitialBets } from '../../shared/rules.js';
 import { BAD_BEAT_VARIANTS, PAIRS_VARIANTS, previewPairs } from '../../shared/sidebets.js';
 import { PROGRESSIVE, progressiveHand } from '../../shared/progressive.js';
+import { pawnFor } from '../../shared/debt.js';
 import type { WagerKey } from '../../shared/protocol.js';
 import { advise } from '../../shared/strategy.js';
 import { session } from '../api.js';
 import { cardEl, setCard } from '../cardView.js';
 import { append, h, initials, modal, money, svg, toast } from '../dom.js';
 import { actionId, call, getSocket, onStatus, setCurrentTable } from '../net.js';
-import { motionScale, prefs } from '../settings.js';
+import { motionScale, prefs, setTableTheme } from '../settings.js';
 import { sfx, unlockAudio } from '../sound.js';
-import { openSettings } from './settingsModal.js';
+import { openSettings, tableLook } from './settingsModal.js';
 import { openReplay } from './replay.js';
+import { fetchChips, fetchPawns, fetchRecap, openPastNights, openRecap, renderNight } from './night.js';
 import { openHelp, openPayTables, readSideBetFields, sideBetFields } from './help.js';
 import { outsEl, outsText } from './outs.js';
 import { outsFor } from '../../shared/strategy.js';
@@ -33,12 +35,12 @@ const LAYOUTS: Record<number, [number, number][]> = {
 
 // Tall (phone) table: seats wrap around the lower curve, clear of the board.
 const LAYOUTS_TALL: Record<number, [number, number][]> = {
-  1: [[50, 86]],
-  2: [[33, 86], [67, 86]],
-  3: [[18, 74], [50, 89], [82, 74]],
-  4: [[13, 64], [35, 88], [65, 88], [87, 64]],
-  5: [[12, 62], [24, 81], [50, 91], [76, 81], [88, 62]],
-  6: [[11, 58], [15, 77], [36, 92], [64, 92], [85, 77], [89, 58]],
+  1: [[50, 85]],
+  2: [[32, 84], [68, 84]],
+  3: [[17, 72], [50, 88], [83, 72]],
+  4: [[14, 63], [34, 87], [66, 87], [86, 63]],
+  5: [[12, 58], [17, 79], [50, 92], [83, 79], [88, 58]],
+  6: [[12, 57], [12, 77], [33, 92], [67, 92], [88, 77], [88, 57]],
 };
 
 const ALL_WAGERS: WagerKey[] = ['ante', 'blind', 'play', 'trips', 'pairs', 'badBeat', 'progressive'];
@@ -46,6 +48,7 @@ const BETTABLE: WagerKey[] = ['ante', 'trips', 'pairs', 'badBeat', 'progressive'
 const SIDE_KEYS = ['trips', 'pairs', 'badBeat', 'progressive'] as const;
 const WAGER_NAME: Record<WagerKey, string> = { ante: 'Ante', blind: 'Blind', play: 'Play', trips: 'Trips+', pairs: 'Ultimate Pairs', badBeat: 'Bad Beat', progressive: '$5 Progressive' };
 
+const narrowScreen = () => matchMedia('(max-width: 760px)').matches;
 const DECISION_LABEL: Record<Decision, string> = { play4: 'Play 4×', play3: 'Play 3×', play2: 'Play 2×', play1: 'Play 1×', check: 'Check', fold: 'Fold' };
 const MULT: Partial<Record<Decision, number>> = { play4: 4, play3: 3, play2: 2, play1: 1 };
 
@@ -69,7 +72,7 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
   const analysis = new Map<string, DecisionRecord[]>();
   const sessionStats = { hands: 0, net: 0, baseNet: 0, decisions: 0, correct: 0, evLostCents: 0, series: [] as number[],
     side: { trips: { bets: 0, wins: 0, net: 0 }, pairs: { bets: 0, wins: 0, net: 0 }, badBeat: { bets: 0, wins: 0, net: 0 }, progressive: { bets: 0, wins: 0, net: 0 } } };
-  let panel: 'chat' | 'table' = 'chat';
+  let panel: 'chat' | 'table' | 'night' = 'chat';
   let panelOpenMobile = false;
   let unread = 0;
   let disposed = false;
@@ -81,19 +84,43 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
   const jackpotSign = h('button', { class: 'jackpot', title: 'Five Card Progressive — linked jackpot. Tap for the pay table.', hidden: true,
     onclick: () => view && openPayTables(view.config, view.jackpot?.amount) }, h('span', { class: 'jp-label' }, 'Progressive'), jackpotAmt);
   let shownJackpot = 0;
-  const hostBtn = h('button', { class: 'ghost', onclick: () => openHostMenu(), hidden: true }, 'Host');
+  const hostBtn = h('button', { class: 'ghost hide-m', onclick: () => openHostMenu(), hidden: true }, 'Host');
+  // Phones: one tidy row — back, name, jackpot, chat, and a menu for everything else.
+  const moreBtn = h('button', { class: 'ghost more-btn', 'aria-label': 'Table menu', title: 'Table menu', onclick: () => openMoreMenu() }, '☰');
   const chatBtn = h('button', { class: 'ghost panel-toggle', onclick: () => togglePanel('chat') }, 'Chat');
   const top = h('header', { class: 'tbar' },
-    h('button', { class: 'ghost', onclick: () => leave() }, '← Lobby'),
+    h('button', { class: 'ghost back-btn', 'aria-label': 'Back to the lobby', onclick: () => leave() }, '←', h('span', { class: 'hide-m' }, ' Lobby')),
     h('div', { class: 'tbar-title' }, tableName, h('button', { class: 'code', title: 'Copy invitation link', onclick: () => invite() }, code)),
     statusPill, jackpotSign,
     h('div', { class: 'tbar-actions' },
-      h('button', { class: 'ghost', onclick: () => invite() }, 'Invite'),
+      h('button', { class: 'ghost hide-m', onclick: () => invite() }, 'Invite'),
       chatBtn,
-      h('button', { class: 'ghost panel-toggle', onclick: () => togglePanel('table') }, 'History'),
+      h('button', { class: 'ghost panel-toggle hide-m', onclick: () => togglePanel('night') }, 'Tonight'),
+      h('button', { class: 'ghost panel-toggle hide-m', onclick: () => togglePanel('table') }, 'History'),
       hostBtn,
       h('button', { class: 'ghost hide-m', onclick: () => openHelp() }, 'Rules'),
-      h('button', { class: 'ghost', 'aria-label': 'Settings', title: 'Settings', onclick: () => openSettings({ inTable: true, view: () => view }) }, h('span', { class: 'hide-m' }, 'Settings'), h('span', { class: 'show-m' }, '⚙'))));
+      h('button', { class: 'ghost hide-m', 'aria-label': 'Settings', title: 'Settings', onclick: () => openSettings({ inTable: true, view: () => view }) }, 'Settings'),
+      moreBtn));
+
+  function openMoreMenu() {
+    const item = (label: string, sub: string, fn: () => void) => h('button', { class: 'menu-item', onclick: () => { m.close(); fn(); } },
+      h('b', {}, label), h('small', {}, sub));
+    const body = h('div', { class: 'menu-list' },
+      item('Invite friends', `Share the link · code ${code}`, () => invite()),
+      item('Tonight', 'Leaderboard, biggest wins and losses, best hands', () => togglePanel('night')),
+      item('Table & history', 'Players, recent hands, your session', () => togglePanel('table')),
+      view?.you.isHost && !view.config.solo ? item('Host controls', 'Players, limits, felt and card colors', () => openHostMenu()) : null,
+      (() => {
+        const me = view && view.you.seat !== null ? view.seats[view.you.seat] : null;
+        if (!me || view!.config.solo) return null;
+        return me.sitOut ? item('Sit back in', 'Get dealt in from the next hand', () => setSitOut(false))
+          : item('Sit out', 'Keep your seat and chips, skip hands', () => setSitOut(true));
+      })(),
+      item('Settings', 'Sound, animations, strategy trainer', () => openSettings({ inTable: true, view: () => view })),
+      item('How to play', 'Rules and pay tables', () => openHelp()),
+      item('Leave table', 'Back to the lobby', () => leave()));
+    const m = modal(view?.config.name ?? 'Table', body);
+  }
 
   // Gold lettering printed on the felt, as on a real layout. Separate artwork for the wide and tall tables.
   const feltPrint = svg(`<svg class="felt-print fp-wide" viewBox="0 0 1000 562" aria-hidden="true">
@@ -145,6 +172,7 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
       h('div', { class: 'bonus-spots' }, spotEls.trips, spotEls.pairs, spotEls.badBeat, spotEls.progressive),
       h('button', { class: 'link paytable-link', onclick: () => view && openPayTables(view.config, view.jackpot?.amount) }, 'Pay tables')));
   const totals = h('div', { class: 'totals' });
+  const autoRow = h('div', { class: 'auto-row', hidden: true });
   const bonusFlash = h('div', { class: 'bonus-flash', hidden: true, role: 'status' });
   const rack = h('div', { class: 'rack', role: 'radiogroup', 'aria-label': 'Chip value' },
     ...CHIPS.map((c) => h('button', { class: `chip ${CHIP_CLASS[c]}`, role: 'radio', 'aria-label': `$${CHIP_LABEL[c]} chip`, 'data-v': c, onclick: () => selectChip(c) }, h('span', {}, CHIP_LABEL[c]))));
@@ -158,7 +186,7 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
       h('div', { class: 'bet-layout' },
         h('div', { class: 'spots' }, spotEls.ante, spotEls.blind, spotEls.play),
         bonusPanel),
-      totals, bonusFlash, hint, result),
+      totals, autoRow, bonusFlash, hint, result),
     h('div', { class: 'dock-right' }, rack, controls));
 
   // Side panel
@@ -169,11 +197,13 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     reactRow,
     h('form', { class: 'chat-form', onsubmit: (e: Event) => { e.preventDefault(); sendChat(); } }, chatInput, h('button', { class: 'btn small' }, 'Send')));
   const historyPane = h('div', { class: 'pane pane-table', hidden: true });
+  const nightPane = h('div', { class: 'pane pane-night', hidden: true });
+  const tabNight = h('button', { class: 'tab', onclick: () => setPanel('night') }, 'Tonight');
   const tabChat = h('button', { class: 'tab on', onclick: () => setPanel('chat') }, 'Chat');
-  const tabTable = h('button', { class: 'tab', onclick: () => setPanel('table') }, 'Table & history');
+  const tabTable = h('button', { class: 'tab', onclick: () => setPanel('table') }, 'History');
   const side = h('aside', { class: 'side' },
-    h('div', { class: 'tabs' }, tabChat, tabTable, h('button', { class: 'icon-btn side-close', 'aria-label': 'Close panel', onclick: () => togglePanel() }, '✕')),
-    chatPane, historyPane);
+    h('div', { class: 'tabs' }, tabChat, tabNight, tabTable, h('button', { class: 'icon-btn side-close', 'aria-label': 'Close panel', onclick: () => togglePanel() }, '✕')),
+    chatPane, nightPane, historyPane);
 
   const screen = h('div', { class: 'table-screen' }, top, h('div', { class: 'stage' }, h('div', { class: 'table-area' }, tableEl), side), dock);
   root.replaceChildren(screen);
@@ -218,7 +248,11 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
 
   // ---------------------------------------------------------------- socket wiring
   const handlers = {
-    state: (v: TableView) => { clockOffset = v.serverNow - Date.now(); prev = view; view = v; render(); },
+    state: (v: TableView) => {
+      clockOffset = v.serverNow - Date.now(); prev = view; view = v; render();
+      // Keep the running tab current: refresh once per settled hand while it's on screen.
+      if (v.phase === 'settled' && prev?.phase !== 'settled' && isPanelVisible('night')) setTimeout(refreshNight, 300);
+    },
     chat: (m: ChatMessage) => addChat(m),
     history: (ms: ChatMessage[]) => { chat = []; chatList.replaceChildren(); ms.forEach((m) => addChat(m, true)); },
     reaction: (p: { playerId: string; seat: number | null; reaction: Reaction }) => showReaction(p),
@@ -239,6 +273,7 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     toast(`${p.hand === 'Royal Flush' ? 'Jackpot! ' : ''}${p.playerName} hit a ${p.hand} on the progressive at ${p.tableName} — ${money(p.amount)}.`, 'info');
   };
   sock.on('jackpot:hit', onJackpotHit);
+  sock.on('night:ended', onNightEnded);
   const offStatus = onStatus((s) => { statusPill.hidden = s === 'connected'; statusPill.textContent = s === 'offline' ? 'Offline — refresh to retry' : 'Reconnecting…'; });
   setCurrentTable(code);
 
@@ -274,6 +309,7 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     mq.removeEventListener('change', onMq);
     sock.off('table:state', handlers.state);
     sock.off('jackpot:hit', onJackpotHit);
+    sock.off('night:ended', onNightEnded);
     sock.off('chat:message', handlers.chat);
     sock.off('chat:history', handlers.history);
     sock.off('chat:reaction', handlers.reaction);
@@ -282,6 +318,7 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     sock.off('kicked', handlers.kicked);
     offStatus();
     setCurrentTable(null);
+    setTableTheme(null);
   }
 
   // ---------------------------------------------------------------- render
@@ -299,6 +336,7 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     hostBtn.hidden = !v.you.isHost || v.config.solo;
     screen.classList.toggle('solo', v.config.solo);
     screen.dataset.phase = v.phase;
+    setTableTheme({ felt: v.config.felt, cardBack: v.config.cardBack });
     renderJackpot(v);
 
     // --- seats
@@ -373,6 +411,7 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
       Object.values(el.spots).forEach((x) => { x.textContent = ''; x.classList.remove('on'); });
       el.handName.textContent = '';
       el.root.classList.remove('acting', 'won', 'lost', 'pushed', 'folded', 'away', 'host', 'ready');
+      delete el.root.dataset.st;
       el.root.setAttribute('aria-label', `Seat ${realSeat + 1}, open`);
       return;
     }
@@ -380,6 +419,8 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     el.avatar.title = s.name;
     el.name.textContent = s.name;
     el.bal.textContent = money(s.balance);
+    el.bal.dataset.debt = s.debt ? `IOU ${money(s.debt)}` : '';
+    el.bal.title = s.debt ? `${s.name} owes the house ${money(s.debt)} in markers — just for fun.` : '';
     el.root.classList.toggle('host', s.isHost);
     el.root.classList.toggle('away', !s.connected);
     el.root.classList.toggle('acting', s.needsToAct);
@@ -390,6 +431,11 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     el.root.classList.toggle('lost', !!r && r.net < 0);
     el.root.classList.toggle('pushed', !!r && r.net === 0);
     el.status.textContent = !s.connected ? 'Away' : statusText(s);
+    el.root.dataset.st = !s.connected ? 'away' : s.leaving || s.standingUp ? 'leaving' : s.status;
+    // Phones show short tags only when they tell you something: Ready, Checked, Played 3×, Folded, Away…
+    const tag = el.status.textContent ?? '';
+    el.root.dataset.tag = /^(In hand|Choosing bet|Betting|Next hand|Won |Lost |Push)/.test(tag) || !tag ? '' : '1';
+    el.root.dataset.act = s.lastAction ?? '';
     el.root.setAttribute('aria-label', `Seat ${realSeat + 1}, ${s.name}, ${money(s.balance)}, ${el.status.textContent}`);
 
     // cards
@@ -421,10 +467,11 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
 
   function statusText(s: SeatView) {
     if (s.leaving) return 'Leaving';
+    if (s.standingUp) return 'To the rail';
     switch (s.status) {
       case 'betting': return s.bet.ante ? 'Betting' : 'Choosing bet';
       case 'ready': return 'Ready';
-      case 'sitting-out': return 'Sitting out';
+      case 'sitting-out': return s.awayByHost ? 'Away' : 'Sitting out';
       case 'waiting-next': return 'Next hand';
       case 'folded': return 'Folded';
       case 'in-hand':
@@ -475,6 +522,12 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
       [...community, ...dealerCards].forEach((c) => { if (set.has(c.dataset.card ?? '') && !c.classList.contains('hl')) c.classList.add('hl-dealer'); });
     };
     // A Bad Beat highlights both the winning and the losing combination.
+    // Other players' winning hands light up on their own seats (their best cards from their two hole cards).
+    for (const sv of v.seats) {
+      if (!sv?.result || sv.seat === mine?.seat || !(sv.result.net > 0)) continue;
+      const set = new Set(sv.result.best5 ?? []);
+      seatEls.find((x) => x.root.dataset.realSeat === String(sv.seat))?.cards.forEach((c) => { if (set.has(c.dataset.card ?? '')) c.classList.add('hl'); });
+    }
     if (r.lines.some((l) => l.wager === 'badBeat' && l.result === 'win')) { markMine(); markDealer(); return; }
     if (r.outcome === 'win' || r.outcome === 'push') markMine();
     else if (r.outcome === 'lose') markDealer();
@@ -487,6 +540,7 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     const s = myView();
     dock.classList.toggle('spectating', !s);
     const inHand = !!s && s.cards.length > 0;
+    dock.classList.toggle('no-hand', !inHand);
     myCards.forEach((el, i) => { if (inHand) updateCard(el, s!.cards[i], false, 0); else clearCard(el); });
     myHandName.textContent = inHand ? (s!.result?.handName ?? s!.handName ?? '') : '';
 
@@ -505,7 +559,7 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
       (el as HTMLButtonElement).disabled = !editable(k);
     }
     const sideSum = amounts.trips + amounts.pairs + amounts.badBeat + amounts.progressive;
-    bonusToggle.replaceChildren(h('span', {}, 'Bonus bets'), h('b', {}, sideSum ? money(sideSum) : 'none'));
+    bonusToggle.replaceChildren(h('span', {}, narrowScreen() ? 'Bonus' : 'Bonus bets'), h('b', {}, sideSum ? money(sideSum) : narrowScreen() ? '+' : 'none'));
     rack.hidden = !betting;
 
     // Committed vs reserved: everything on the table, plus what must stay free for a 1× Play.
@@ -517,9 +571,11 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
       append(totals, [
         h('span', {}, 'On the table ', h('b', {}, money(committed))),
         reserve ? h('span', {}, 'Reserved for 1× Play ', h('b', {}, money(reserve))) : null,
-        h('span', {}, betting ? 'Free after bets ' : 'Stack ', h('b', {}, money(betting ? s.balance - committed - reserve : s.balance)))]);
+        h('span', {}, betting ? 'Free after bets ' : 'Stack ', h('b', {}, money(betting ? s.balance - committed - reserve : s.balance))),
+        null]);
     } else totals.hidden = true;
     renderPairsFlash(v, s);
+    renderAuto(v, s);
 
     // Message line
     let msg = '';
@@ -528,11 +584,15 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
       msg = free ? 'You are watching. Tap an open seat to join the table.' : 'You are watching this table.';
     } else if (v.phase === 'betting') {
       const need = requiredToStart(Math.max(draft.ante, v.config.minAnte), sideTotal(draft));
-      msg = s.status === 'ready' ? 'Ready — waiting for the others.' :
+      msg = s.status === 'sitting-out' ? (s.awayByHost ? 'The host set you away. Tap Sit back in to play the next hand.' : 'You’re sitting out. Your seat and chips are saved — tap Sit back in when you’re ready.') :
+        s.status === 'ready' ? 'Ready — waiting for the others.' :
         s.balance < requiredToStart(v.config.minAnte) ? 'Your stack can’t cover a minimum hand.' :
         draft.ante ? 'Add bonus bets if you like, then deal in. Bonus bets lock when the cards come out.' :
         `Choose a chip, then tap Ante. Limits ${money(v.config.minAnte)}–${money(v.config.maxAnte)}. You need ${money(need)} free.`;
-    } else if (s.status === 'waiting-next') msg = 'You’re in from the next hand.';
+    } else if (s.standingUp) msg = 'The host is moving you to the spectators after this hand. Your chips stay with you.';
+    else if (s.status === 'sitting-out') msg = 'You’re sitting out — you’ll be dealt in when you sit back in.';
+    else if (s.sitOut && inHand && v.phase !== 'settled') msg = 'You’ll sit out after this hand.';
+    else if (s.status === 'waiting-next') msg = 'You’re in from the next hand.';
     else if (v.phase === 'settled') msg = '';
     else if (s.needsToAct) msg = v.phase === 'river' ? 'Play 1× or fold.' : v.phase === 'flop' ? 'Play 2× or check.' : 'Play 4×, 3× or check.';
     else if (inHand) msg = s.bet.play ? `Your ${money(s.bet.play)} Play bet is in. Waiting for the others.` : s.status === 'folded' ? 'You folded.' : 'Waiting for the others.';
@@ -543,12 +603,22 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     if (!s) {
       const free = v.seats.findIndex((x) => !x);
       if (free >= 0) controls.append(h('button', { class: 'btn gold', onclick: () => sit(free) }, 'Take a seat'));
+    } else if (v.phase === 'betting' && s.status === 'sitting-out') {
+      controls.append(h('button', { class: 'btn gold', onclick: async () => {
+        const r = await call('player:prefs', { sitOut: false }); if (!r.ok) toast(r.error, 'error');
+      } }, 'Sit back in'));
     } else if (v.phase === 'betting') {
+      if (!v.config.solo && s.status !== 'ready') controls.append(h('button', { class: 'btn subtle', onclick: () => setSitOut(true) }, 'Sit out'));
       if (v.you.canReload) controls.append(h('button', { class: 'btn', onclick: reload }, `Reload ${money(v.config.startingBankroll)}`));
       if (v.you.lastBet && s.status !== 'ready') controls.append(h('button', { class: 'btn', onclick: rebet }, 'Rebet'));
       if (draft.ante || sideTotal(draft)) controls.append(h('button', { class: 'btn', disabled: s.status === 'ready', onclick: clearBets }, 'Clear'));
       if (s.status === 'ready') controls.append(h('button', { class: 'btn', onclick: () => setReady(false) }, 'Not ready'));
       else controls.append(h('button', { class: 'btn gold', disabled: !draft.ante, onclick: readyUp }, v.config.solo ? 'Deal' : 'Deal me in'));
+    } else if (inHand && !v.config.solo && v.phase !== 'settled' && !s.needsToAct) {
+      // Schedule (or cancel) sitting out after the current hand.
+      controls.append(s.sitOut
+        ? h('button', { class: 'btn subtle', onclick: () => setSitOut(false) }, 'Stay in next hand')
+        : h('button', { class: 'btn subtle', onclick: () => setSitOut(true) }, 'Sit out next hand'));
     } else if (s.needsToAct) {
       const rec = trainerAdvice(v, s);
       for (const d of v.you.legal) {
@@ -596,7 +666,13 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     (timerBar.firstChild as HTMLElement).style.transform = `scaleX(${frac})`;
     timerBar.dataset.secs = d ? `${secs}s` : '';
     timerBar.classList.toggle('low', !!d && secs <= 5);
-    seatEls.forEach((s) => s.root.style.setProperty('--t', String(s.root.classList.contains('acting') ? frac : 0)));
+    seatEls.forEach((s) => {
+      const acting = s.root.classList.contains('acting') && !!d;
+      s.root.style.setProperty('--t', String(acting ? frac : 0));
+      // Seconds left, shown on every deciding player's avatar (server clock).
+      if (acting) s.avatar.dataset.secs = String(secs); else delete s.avatar.dataset.secs;
+      s.root.classList.toggle('low', acting && secs <= 5);
+    });
     const mine = myView();
     if (mine?.needsToAct && secs <= 5 && secs > 0 && secs !== lastTick) { lastTick = secs; sfx.tick(); }
   }
@@ -611,7 +687,7 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
   function onSpot(k: WagerKey) {
     if (!view || view.phase !== 'betting' || !BETTABLE.includes(k)) return;
     const s = myView();
-    if (!s || s.status === 'ready') return;
+    if (!s || s.status === 'ready' || s.status === 'sitting-out') return;
     const c = view.config;
     const key = k as keyof InitialBets;
     if (k === 'progressive' && !c.progressive) return toast('The progressive is not offered at this table.', 'error');
@@ -659,6 +735,46 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     if (!r.ok) toast(r.error, 'error');
     if (view) renderDock(view);
   }
+  async function setSitOut(on: boolean) {
+    const r = await call('player:prefs', { sitOut: on });
+    if (!r.ok) toast(r.error, 'error');
+  }
+
+  /** Short description of a bet: "$25 Ante · $5 Trips+ · $5 Progressive". */
+  function betLabel(b: InitialBets) {
+    return [`${money(b.ante)} Ante`, ...SIDE_KEYS.filter((k) => b[k]).map((k) => `${money(b[k])} ${WAGER_NAME[k]}`)].join(' · ');
+  }
+  function renderAuto(v: TableView, s: SeatView | null) {
+    const auto = v.you.autoRebet;
+    const showAuto = !!s && (!!auto || (v.phase === 'betting' && (!!draft.ante || !!v.you.lastBet)));
+    // Markers owed, with Pay off between hands.
+    const debt = s?.debt ? h('span', { class: 'debt-pill' }, 'IOU ', h('b', {}, money(s.debt)),
+      !inHandNow(v) && s.balance > 0 ? h('button', { class: 'link', onclick: () => openPayoff() }, 'Pay off') : null) : null;
+    autoRow.hidden = !showAuto && !debt;
+    if (autoRow.hidden) return;
+    autoRow.replaceChildren(!showAuto ? '' : auto
+      ? h('span', { class: 'auto-on' }, h('b', {}, '↻ Same bet every hand'), h('small', {}, betLabel(auto)),
+        h('button', { class: 'link', onclick: () => setAuto(false) }, 'Stop'))
+      : h('button', { class: 'link auto-off', onclick: () => confirmAuto() }, '↻ Same bet every hand…'), debt ?? '');
+  }
+  async function confirmAuto() {
+    if (!view) return;
+    if (draftDirty && !(await syncBet())) return;
+    const bet = draft.ante ? draft : view.you.lastBet;
+    if (!bet?.ante) return toast('Place a bet first.', 'error');
+    const body = h('div', { class: 'stack' },
+      h('p', {}, 'Each new hand, this bet goes down and you’re dealt in automatically:'),
+      h('p', { class: 'auto-confirm' }, betLabel(bet)),
+      h('p', { class: 'muted tiny' }, 'It stops if you change your bet, tap Not ready, sit out, or can’t cover it. The server checks limits and your chips every hand.'),
+      h('div', { class: 'row' },
+        h('button', { class: 'btn gold', onclick: async () => { m.close(); await setAuto(true); } }, 'Turn on'),
+        h('button', { class: 'btn', onclick: () => m.close() }, 'Cancel')));
+    const m = modal('Same bet every hand', body);
+  }
+  async function setAuto(on: boolean) {
+    const r = await call('player:prefs', { autoRebet: on });
+    if (!r.ok) toast(r.error, 'error'); else toast(on ? 'Same bet every hand is on.' : 'Same bet every hand is off.', 'info');
+  }
   async function rebet() {
     const lb = view?.you.lastBet;
     if (!lb) return;
@@ -693,7 +809,9 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
   }
   async function reload() {
     const r = await call('player:reload');
-    if (!r.ok) toast(r.error, 'error'); else toast('Stack reloaded with virtual chips.', 'success');
+    if (!r.ok) return toast(r.error, 'error');
+    const debt = (r as { debt?: number }).debt ?? 0;
+    toast(debt ? `Marker signed. You owe the house ${money(debt)} — pawn ${pawnFor(debt).item} to cover it.` : 'Stack reloaded with virtual chips.', 'info');
   }
   async function leave() {
     if (view && myView()?.cards.length && view.phase !== 'settled' && view.phase !== 'betting') {
@@ -728,7 +846,7 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
       sfx.notify();
     }
   }
-  function isPanelVisible(p: 'chat' | 'table') { return panel === p && (panelOpenMobile || matchMedia('(min-width: 1100px)').matches); }
+  function isPanelVisible(p: 'chat' | 'table' | 'night') { return panel === p && (panelOpenMobile || matchMedia('(min-width: 1100px)').matches); }
   function mute(pid: string, name: string) {
     if (pid === me.id) return;
     if (!confirm(`Mute ${name}? Their messages will be hidden on this device.`)) return;
@@ -754,13 +872,14 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     el.root.append(b);
     setTimeout(() => b.remove(), 2600);
   }
-  function setPanel(p: 'chat' | 'table') {
+  function setPanel(p: 'chat' | 'table' | 'night') {
     panel = p;
-    tabChat.classList.toggle('on', p === 'chat'); tabTable.classList.toggle('on', p === 'table');
-    chatPane.hidden = p !== 'chat'; historyPane.hidden = p !== 'table';
+    tabChat.classList.toggle('on', p === 'chat'); tabTable.classList.toggle('on', p === 'table'); tabNight.classList.toggle('on', p === 'night');
+    chatPane.hidden = p !== 'chat'; historyPane.hidden = p !== 'table'; nightPane.hidden = p !== 'night';
+    if (p === 'night') refreshNight();
     if (p === 'chat') { unread = 0; chatBtn.textContent = 'Chat'; }
   }
-  function togglePanel(p?: 'chat' | 'table') {
+  function togglePanel(p?: 'chat' | 'table' | 'night') {
     if (p && (!panelOpenMobile || panel !== p)) { setPanel(p); panelOpenMobile = true; }
     else panelOpenMobile = false;
     side.classList.toggle('open', panelOpenMobile);
@@ -770,13 +889,78 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     const body = h('div', { class: 'stack' },
       h('p', {}, `${sv.name} · ${money(sv.balance)}`),
       h('button', { class: 'btn', onclick: () => { m.close(); mute(sv.playerId, sv.name); } }, 'Mute chat'),
-      view?.you.isHost ? h('button', { class: 'btn danger', onclick: () => { m.close(); kick(sv); } }, 'Remove from table') : null);
+      ...(view?.you.isHost ? hostSeatButtons(sv, () => m.close()) : []));
     const m = modal(sv.name, body);
+  }
+  /** Host seat controls: away/back, move to the spectators, remove. None of these touch cards or chips. */
+  function hostSeatButtons(sv: SeatView, done: () => void) {
+    const away = sv.status === 'sitting-out';
+    const act = async (ev: string, payload: object) => { done(); const r = await call(ev as 'host:away', payload as never); if (!r.ok) toast(r.error, 'error'); };
+    return [
+      h('button', { class: 'btn small', onclick: () => act('host:away', { playerId: sv.playerId, away: !away }) }, away ? 'Bring back' : 'Set away'),
+      sv.standingUp ? h('span', { class: 'muted tiny' }, 'Moving to spectators') :
+        h('button', { class: 'btn small', onclick: () => act('host:standUp', { playerId: sv.playerId }) }, 'Move to spectators'),
+      h('button', { class: 'btn small danger', onclick: () => { done(); kick(sv); } }, 'Remove'),
+    ];
   }
   async function kick(sv: SeatView) {
     if (!confirm(`Remove ${sv.name} from the table? They won't be able to rejoin.`)) return;
     const r = await call('host:kick', { playerId: sv.playerId });
     if (!r.ok) toast(r.error, 'error');
+  }
+
+  // ---------------------------------------------------------------- tonight: running tab and recap
+  let nightLoading = false, nightAgain = false;
+  async function refreshNight() {
+    if (nightLoading) { nightAgain = true; return; }
+    nightLoading = true;
+    try {
+      const [r, chips, pawns] = await Promise.all([fetchRecap(code), view?.you.seat !== null ? fetchChips(code) : Promise.resolve(null), fetchPawns(code)]);
+      nightPane.replaceChildren(renderNight(r, {
+        meId: me.id, isHost: !!view?.you.isHost && !view.config.solo, live: !!r && r.endedAt === null, chips,
+        onReplay: (id) => openReplay(id), onEnd: () => endNight(), onPast: () => openPastNights(code, me.id, openReplay),
+        pawns, onPay: () => openPayoff(),
+      }));
+    } catch (e) {
+      nightPane.replaceChildren(h('p', { class: 'muted' }, (e as Error).message));
+    } finally {
+      nightLoading = false;
+      if (nightAgain) { nightAgain = false; refreshNight(); }
+    }
+  }
+  const inHandNow = (v: TableView) => !!v.handId && v.phase !== 'settled' && v.phase !== 'betting' && (myView()?.cards.length ?? 0) > 0;
+  /** Pay markers back from your stack: all of it, or just what's above a starting stack. */
+  function openPayoff() {
+    const s = myView();
+    if (!view || !s?.debt) return;
+    const all = Math.min(s.debt, s.balance);
+    const winnings = Math.min(s.debt, Math.max(0, s.balance - view.config.startingBankroll));
+    const pay = async (amount: number) => {
+      m.close();
+      const r = await call<{ balance: number; debt: number; paid: number }>('player:payDebt', { amount });
+      if (!r.ok) return toast(r.error, 'error');
+      sfx.chip();
+      toast(r.debt ? `Paid ${money(r.paid)}. You still owe ${money(r.debt)}.` : `Debt free! Paid ${money(r.paid)}.`, 'success');
+      if (isPanelVisible('night')) refreshNight();
+    };
+    const body = h('div', { class: 'stack' },
+      h('p', {}, `You owe the house ${money(s.debt)} in markers. Pawned: ${pawnFor(s.debt).item}.`),
+      winnings > 0 && winnings < all ? h('button', { class: 'btn', onclick: () => pay(winnings) }, `Pay ${money(winnings)} — your winnings above a starting stack`) : null,
+      h('button', { class: 'btn gold', disabled: !all, onclick: () => pay(all) }, all >= s.debt ? `Pay it all off — ${money(all)}` : `Pay ${money(all)} — everything in front of you`),
+      h('p', { class: 'muted tiny' }, 'Just for fun: paying off moves chips from your stack back to the house. Bets on the layout that no longer fit are taken back.'));
+    const m = modal('Pay off markers', body);
+  }
+  async function endNight() {
+    if (!confirm('End the night for everyone? Everyone gets the recap, and the next hand starts a new night.')) return;
+    const r = await call('host:endNight');
+    if (!r.ok) toast(r.error, 'error');
+  }
+  async function onNightEnded(p: { nightId: string }) {
+    try {
+      const r = await fetchRecap(code, p.nightId);
+      if (r) openRecap(r, me.id, openReplay);
+    } catch { /* recap is still in Past nights */ }
+    if (isPanelVisible('night')) refreshNight();
   }
 
   // ---------------------------------------------------------------- history / session panel
@@ -934,18 +1118,24 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     const showGrades = prefs.get().trainer !== 'casino';
     const shown = decisions.filter((d) => showGrades || !d.correct);
     const hasSide = r.lines.some((l) => (SIDE_KEYS as readonly string[]).includes(l.wager));
-    const lineText = (l: (typeof r.lines)[0]) => l.result === 'push' ? 'Push'
-      : l.wager === 'progressive' && l.result === 'win' ? `${money(l.credit)} (${l.note ?? l.combo ?? ''}; the $5 is not returned)`
-      : l.result === 'win' ? `${money(l.net, true)}${l.multiplier && l.wager !== 'blind' ? ` (${l.multiplier.toLocaleString('en-US')}:1, stake ${money(l.stake)} returned)` : ''}`
-      : money(l.net, true);
+    // Compact: one chip per wager with its net; details for winning bonus bets go on one short line below.
+    const lineText = (l: (typeof r.lines)[0]) => l.result === 'push' ? 'Push' : money(l.net, true);
+    const details = r.lines.filter((l) => l.result === 'win' && (SIDE_KEYS as readonly string[]).includes(l.wager)).map((l) =>
+      l.wager === 'progressive' ? `Progressive: ${l.note ?? l.combo ?? ''} pays ${money(l.credit)} (the $5 is kept)`
+        : `${WAGER_NAME[l.wager]}: ${l.combo ?? ''}${l.multiplier ? ` ${l.multiplier.toLocaleString('en-US')}:1` : ''}, ${money(l.stake)} stake back`);
     result.hidden = false;
-    result.className = `my-result ${r.net > 0 ? 'pos' : r.net < 0 ? 'neg' : ''}`;
+    const fresh = result.dataset.hand !== v.handId;
+    result.dataset.hand = v.handId ?? '';
+    result.className = `my-result ${r.net > 0 ? 'pos' : r.net < 0 ? 'neg' : ''} ${fresh && motionScale() ? 'staged' : ''}`;
+    // First the cards: winning five light up and the title shows. Then the breakdown fades in.
+    if (fresh && motionScale()) setTimeout(() => result.classList.remove('staged'), 1400 * motionScale());
     result.replaceChildren();
     append(result, [
       h('div', { class: 'res-title' }, title, h('small', {}, ` ${r.handName} vs dealer ${v.dealer.handName ?? ''}`)),
       h('ul', { class: 'lines' }, ...r.lines.map((l) => h('li', { class: (SIDE_KEYS as readonly string[]).includes(l.wager) ? 'sideline' : '' },
         h('span', { title: l.note ?? '' }, WAGER_NAME[l.wager]),
         h('span', { class: l.net > 0 ? 'pos' : l.net < 0 ? 'neg' : '', title: l.note ?? '' }, lineText(l))))),
+      details.length ? h('p', { class: 'res-details' }, details.join(' · ')) : null,
       hasSide ? h('p', { class: 'subtotals' }, `Main game ${money(r.baseNet, true)} · Bonus bets ${money(r.sideNet, true)}`) : null,
       shown.length ? h('ul', { class: 'grades' }, ...shown.map((d) => h('li', { class: d.correct ? 'ok' : 'bad' },
         `${d.correct ? '✓' : '✗'} ${cap(d.phase)}: ${DECISION_LABEL[d.action]}${d.timedOut ? ' (timed out)' : ''}`,
@@ -1047,8 +1237,14 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     const body = h('div', { class: 'stack' },
       form,
       h('h3', {}, 'Players'),
-      others.length ? h('ul', { class: 'plist' }, ...others.map((s) => h('li', {}, h('span', {}, s.name),
-        h('button', { class: 'btn small danger', onclick: () => { m.close(); kick(s); } }, 'Remove')))) : h('p', { class: 'muted' }, 'Nobody else is seated.'),
+      others.length ? h('ul', { class: 'plist host-plist' }, ...others.map((s) => h('li', {},
+        h('span', {}, h('b', {}, s.name), h('small', { class: 'muted' }, ` ${!s.connected ? 'Disconnected' : statusText(s)} · ${money(s.balance)}`)),
+        h('span', { class: 'host-btns' }, ...hostSeatButtons(s, () => m.close()))))) : h('p', { class: 'muted' }, 'Nobody else is seated.'),
+      h('p', { class: 'muted tiny' }, 'Set away: they keep their seat but sit out until they tap Sit back in. Move to spectators: they stand up (after the current hand) and keep their chips if they sit again.'),
+      tableLook(view),
+      h('h3', {}, 'Tonight'),
+      h('p', { class: 'muted tiny' }, 'Ending the night shows everyone the recap (leaderboard, biggest win and loss, best hands). The next hand starts a new night. A night also ends on its own after 4 hours without a hand.'),
+      h('button', { class: 'btn', disabled: inHand, onclick: () => { m.close(); endNight(); } }, inHand ? 'End the night (after this hand)' : 'End the night'),
       h('p', { class: 'muted' }, 'Hosts manage the room only. Cards, shuffling, payouts and other players’ chips are controlled by the server.'),
       h('button', { class: 'btn danger', onclick: async () => {
         if (!confirm('Close this table for everyone? A hand in progress finishes first.')) return;
