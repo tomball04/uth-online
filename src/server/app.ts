@@ -12,6 +12,8 @@ import { DEFAULT_TIMING, EngineError, TableEngine, cleanName, type Timing } from
 import { newId, newToken, roomCode, secureShuffle, sha256 } from './rng.js';
 import { buildRecap } from '../shared/recap.js';
 import type { PlayerRow, Store } from './store.js';
+import { Cosmetics, CosmeticError, type CosmeticsConfig } from './cosmetics.js';
+import { COLLECTIONS, REACTION_SETS, randomAvatar, DEFAULT_AVATAR } from '../shared/cosmetics.js';
 
 type IO = Server<ClientToServer, ServerToClient, object, SocketData>;
 type Sock = Socket<ClientToServer, ServerToClient, object, SocketData>;
@@ -27,6 +29,8 @@ export interface AppOptions {
   log?: boolean;
   /** Multiplier for per-IP REST rate limits (tests use a large value). */
   rateLimitScale?: number;
+  /** §24 price and reward overrides. */
+  cosmetics?: CosmeticsConfig;
 }
 
 const AVATARS = ['♠', '♥', '♦', '♣', '★', '♛', '♞', '⚜'];
@@ -68,6 +72,8 @@ export class TableManager {
   private pendingBroadcast = new Set<string>();
   /** Linked progressive meter, shared by every table on this server. Seeded from the store at startup. */
   jackpot = 0;
+  /** Set by createApp: runs after every settled hand (cosmetic rewards only). */
+  onSettled: (code: string, handId: string, nightId: string | null, pids: string[]) => void = () => {};
 
   constructor(private io: IO, private store: Store, private shuffle: () => number[], private timing: Timing) {}
 
@@ -114,6 +120,7 @@ export class TableManager {
         for (const c of this.tables.keys()) if (c !== code) this.broadcast(c);
       },
       jackpotAmount: () => this.jackpot,
+      settled: (handId: string, nightId: string | null, pids: string[]) => this.onSettled(code, handId, nightId, pids),
       nightEnded: (nightId: string) => { for (const s of this.sockets.get(code) ?? []) s.emit('night:ended', { nightId }); },
       jackpotHit: (p: { tableName: string; playerName: string; hand: string; amount: number }) => {
         // Every table hears about a linked jackpot hit, like the sign over a casino pit.
@@ -213,6 +220,23 @@ export async function createApp(opts: AppOptions) {
     connectionStateRecovery: undefined,
   });
   const manager = new TableManager(io, store, opts.shuffle ?? secureShuffle, timing);
+  const cosmetics = new Cosmetics(store, opts.cosmetics);
+  const toPlayer = (pid: string, fn: (s: Sock) => void) => { for (const set of manager.sockets.values()) for (const s of set) if (s.data.player.id === pid) fn(s); };
+  const announceEarned = (pid: string, rewards: string[]) => {
+    if (!rewards.length) return;
+    store.getCosmetics(pid).then((st) => toPlayer(pid, (s) => s.emit('style:earned', { rewards, balance: st.balance }))).catch(() => {});
+  };
+  manager.onSettled = (_code, _handId, nightId, pids) => {
+    for (const pid of pids) cosmetics.afterHand(pid, nightId).then((got) => announceEarned(pid, got)).catch((e) => opts.log !== false && console.error('[cosmetics]', e));
+  };
+  /** Push a player's new look to every table they're at. */
+  const refreshLook = (pid: string, look: { appearance: unknown; equipped: unknown }) => {
+    for (const [code, e] of manager.tables) {
+      if (!e.seatOf(pid) && !e.spectators.has(pid)) continue;
+      e.looks.set(pid, look as never);
+      manager.broadcast(code);
+    }
+  };
   manager.jackpot = await store.getJackpot();
 
   const auth = async (token: unknown): Promise<PlayerRow | null> =>
@@ -237,6 +261,10 @@ export async function createApp(opts: AppOptions) {
     const token = newToken();
     const avatar = AVATARS[Math.floor(Math.random() * AVATARS.length)];
     const p = await store.createPlayer(newId(), name, avatar, sha256(token));
+    // Every new guest starts with a distinct free look and the welcome allowance of Style Credits.
+    const r = randomAvatar();
+    await store.saveAvatar(p.id, { ...DEFAULT_AVATAR, appearance: r.appearance, equipped: r.equipped, preset: 'casual', outfits: { casual: r.equipped } });
+    await cosmetics.welcome(p.id);
     res.json({ player: p, token });
   }));
 
@@ -247,6 +275,50 @@ export async function createApp(opts: AppOptions) {
     const avatar = AVATARS.includes(req.body?.avatar) ? req.body.avatar : undefined;
     await store.updatePlayer(res.locals.player.id, { name, avatar });
     res.json({ ok: true });
+  }));
+
+  // ---- §24 avatars, Style Credits and the Boutique (never chips)
+  const cwrap = (fn: (req: Request, res: Response) => Promise<unknown>) => (req: Request, res: Response) =>
+    fn(req, res).catch((e) => res.status(e instanceof CosmeticError ? 400 : 500).json({ error: e instanceof CosmeticError ? e.message : 'Request failed' }));
+  app.get('/api/catalog', (_req, res) => { res.json({ items: cosmetics.catalog(), rewards: cosmetics.rewards(), collections: COLLECTIONS }); });
+  app.get('/api/me/cosmetics', requireAuth, cwrap(async (_req, res) => {
+    const pid = res.locals.player.id as string;
+    await cosmetics.welcome(pid);
+    const st = await store.getCosmetics(pid);
+    res.json({ ...st, avatar: st.avatar ?? DEFAULT_AVATAR, history: await store.styleHistory(pid, 50) });
+  }));
+  app.put('/api/me/avatar', ipLimit(20, 0.5), requireAuth, cwrap(async (req, res) => {
+    const pid = res.locals.player.id as string;
+    const data = await cosmetics.save(pid, req.body);
+    refreshLook(pid, { appearance: data.appearance, equipped: data.equipped });
+    res.json({ avatar: data, balance: (await store.getCosmetics(pid)).balance });
+  }));
+  app.post('/api/me/outfit', ipLimit(20, 0.5), requireAuth, cwrap(async (req, res) => {
+    const pid = res.locals.player.id as string;
+    const data = await cosmetics.wear(pid, req.body?.preset);
+    refreshLook(pid, { appearance: data.appearance, equipped: data.equipped });
+    res.json({ avatar: data });
+  }));
+  app.post('/api/me/purchase', ipLimit(20, 0.5), requireAuth, cwrap(async (req, res) => {
+    const pid = res.locals.player.id as string;
+    const r = await cosmetics.buy(pid, req.body?.itemId, req.body?.key);
+    res.json(r);
+  }));
+  app.post('/api/me/event', ipLimit(10, 0.2), requireAuth, cwrap(async (req, res) => {
+    const pid = res.locals.player.id as string;
+    const ev = req.body?.event;
+    const applied = await cosmetics.event(pid, ev);
+    const st = await store.getCosmetics(pid);
+    res.json({ applied, balance: st.balance });
+  }));
+  app.get('/api/players/:id/profile', ipLimit(60, 2), requireAuth, cwrap(async (req, res) => {
+    const id = String(req.params.id);
+    if (!/^[A-Za-z0-9_-]{6,64}$/.test(id)) throw new CosmeticError('Invalid player.');
+    res.json({ profile: await cosmetics.profile(id) });
+  }));
+  app.get('/api/looks', ipLimit(60, 2), requireAuth, cwrap(async (req, res) => {
+    const ids = String(req.query.ids ?? '').split(',').filter((x) => /^[A-Za-z0-9_-]{6,64}$/.test(x)).slice(0, 24);
+    res.json({ looks: Object.fromEntries(await store.publicLooks(ids)) });
   }));
 
   app.get('/api/tables', (_req, res) => { res.json({ tables: manager.listings() }); });
@@ -365,7 +437,9 @@ export async function createApp(opts: AppOptions) {
         const e = await manager.get(code);
         if (!e) throw new EngineError('Table not found or closed.');
         const me = socket.data.player;
+        const av = await cosmetics.look(me.id);
         const seat = await e.run(async () => {
+          e.looks.set(me.id, { appearance: av.appearance, equipped: av.equipped });
           if (e.banned.has(me.id)) throw new EngineError('You were removed from this table.');
           const existing = e.seatOf(me.id);
           if (existing) { e.setConnected(me.id, true); return existing.seat; }
@@ -375,8 +449,8 @@ export async function createApp(opts: AppOptions) {
           return null;
         });
         manager.register(socket, code);
-        socket.emit('chat:history', manager.chat.get(code) ?? []);
         socket.emit('table:state', e.viewFor(me.id));
+        socket.emit('chat:history', manager.chat.get(code) ?? []);
         reply({ ok: true, seat });
       } catch (err) {
         reply({ ok: false, error: err instanceof EngineError ? err.message : 'Could not join table.' });
@@ -420,15 +494,17 @@ export async function createApp(opts: AppOptions) {
       if (!text) return reply({ ok: false, error: 'Empty message.' });
       const me = socket.data.player;
       manager.pushChat(code, { id: newId(), at: Date.now(), kind: 'player', playerId: me.id, name: me.name, text });
+      cosmetics.tableTalk(me.id).then((ok) => ok && announceEarned(me.id, ['table-talk'])).catch(() => {});
       reply({ ok: true });
     });
     socket.on('chat:react', (p, ack) => {
       const reply = typeof ack === 'function' ? ack : () => {};
       const code = socket.data.code;
-      const reaction = obj(p).reaction as Reaction;
-      if (!code || !REACTIONS.includes(reaction)) return reply({ ok: false, error: 'Invalid reaction.' });
+      const reaction = String(obj(p).reaction ?? '') as Reaction;
+      const e = code ? manager.tables.get(code) : undefined;
+      const pack = REACTION_SETS[e?.looks.get(socket.data.player.id)?.equipped.emotes ?? 'emotes-classic'] ?? [];
+      if (!code || !((REACTIONS as readonly string[]).includes(reaction) || pack.includes(reaction))) return reply({ ok: false, error: 'Invalid reaction.' });
       if (!reactBucket.take()) return reply({ ok: false, error: 'Slow down.' });
-      const e = manager.tables.get(code);
       const seat = e?.seatOf(socket.data.player.id)?.seat ?? null;
       for (const s of manager.sockets.get(code) ?? []) s.emit('chat:reaction', { playerId: socket.data.player.id, seat, reaction });
       reply({ ok: true });
@@ -438,7 +514,7 @@ export async function createApp(opts: AppOptions) {
   });
 
   return {
-    app, http, io, manager, store,
+    app, http, io, manager, store, cosmetics,
     async close() {
       for (const t of manager.tables.values()) t.dispose();
       io.close();

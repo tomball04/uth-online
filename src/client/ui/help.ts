@@ -1,3 +1,4 @@
+import { styleEvent } from '../cosmetics.js';
 import { BLIND_PAYTABLE, RULES_VERSION, TRIPS_PAYTABLE } from '../../shared/rules.js';
 import type { TableConfig } from '../../shared/protocol.js';
 import { BAD_BEAT_VARIANTS, PAIRS_VARIANTS, type BadBeatVariant, type PairsVariant } from '../../shared/sidebets.js';
@@ -6,6 +7,7 @@ import { ANTE_BONUS, PAIR_PLUS, SIX_CARD, TCP_RULES_VERSION, TCP_SOURCES } from 
 import { h, modal, money } from '../dom.js';
 
 export function openHelp() {
+  styleEvent('tutorial');
   const pay = (rows: [string, string][]) => h('table', { class: 'paytable' },
     ...rows.map(([a, b]) => h('tr', {}, h('td', {}, a), h('td', {}, b))));
   const body = h('div', { class: 'help' },

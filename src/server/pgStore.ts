@@ -5,9 +5,10 @@ import type { DecisionRecord, TableConfig } from '../shared/protocol.js';
 import { PROGRESSIVE } from '../shared/progressive.js';
 import type { NightHand } from '../shared/recap.js';
 import type { GameId } from '../shared/rules.js';
+import type { AvatarData, PublicLook } from '../shared/cosmetics.js';
 import {
   InsufficientFunds, JACKPOT_ID, type HandStart, type SettlementBuilder, type PlayerRow, type PlayerSettlementRow, type PlayerStats,
-  type DebtEvent, type NightRow, type RecentHandRow, type ReplayData, type StackRow, type Store, type TableRow,
+  type DebtEvent, type NightRow, type CosmeticState, type PurchaseResult, type RewardFacts, type StyleTx, type RecentHandRow, type ReplayData, type StackRow, type Store, type TableRow,
 } from './store.js';
 
 // BIGINT -> number (all our values are well inside Number.MAX_SAFE_INTEGER)
@@ -436,6 +437,87 @@ export class PgStore implements Store {
   async ledgerSum(playerId: string, code: string) {
     const r = await this.pool.query('SELECT COALESCE(SUM(amount),0) s FROM ledger WHERE player_id=$1 AND table_code=$2', [playerId, code]);
     return Number(r.rows[0].s);
+  }
+
+  // ---- §24 cosmetics (separate tables; never touches stacks or the chip ledger)
+  async getCosmetics(pid: string): Promise<CosmeticState> {
+    const [w, it, av, rw] = await Promise.all([
+      this.pool.query('SELECT balance FROM style_wallets WHERE player_id=$1', [pid]),
+      this.pool.query('SELECT item_id, method, acquired_at FROM player_items WHERE player_id=$1 ORDER BY acquired_at', [pid]),
+      this.pool.query('SELECT appearance, equipped, preset, outfits FROM avatar_profiles WHERE player_id=$1', [pid]),
+      this.pool.query('SELECT reward_id, created_at FROM style_tx WHERE player_id=$1 AND reward_id IS NOT NULL ORDER BY id', [pid]),
+    ]);
+    const a = av.rows[0];
+    return {
+      balance: w.rows[0]?.balance ?? 0,
+      owned: it.rows.map((r) => ({ itemId: r.item_id, method: r.method, at: new Date(r.acquired_at).getTime() })),
+      avatar: a ? { appearance: a.appearance, equipped: a.equipped, preset: a.preset, outfits: a.outfits } : null,
+      rewards: rw.rows.map((r) => ({ rewardId: r.reward_id, at: new Date(r.created_at).getTime() })),
+    };
+  }
+  async saveAvatar(pid: string, d: AvatarData) {
+    await this.pool.query(
+      `INSERT INTO avatar_profiles(player_id, appearance, equipped, preset, outfits) VALUES ($1,$2,$3,$4,$5)
+       ON CONFLICT (player_id) DO UPDATE SET appearance=$2, equipped=$3, preset=$4, outfits=$5, updated_at=now()`,
+      [pid, JSON.stringify(d.appearance), JSON.stringify(d.equipped), d.preset, JSON.stringify(d.outfits)]);
+  }
+  async publicLooks(ids: string[]) {
+    const m = new Map<string, PublicLook>();
+    if (!ids.length) return m;
+    const r = await this.pool.query('SELECT player_id, appearance, equipped FROM avatar_profiles WHERE player_id = ANY($1)', [ids]);
+    for (const x of r.rows) m.set(x.player_id, { appearance: x.appearance, equipped: x.equipped });
+    return m;
+  }
+  private async wallet(c: pg.PoolClient, pid: string): Promise<number> {
+    await c.query('INSERT INTO style_wallets(player_id) VALUES ($1) ON CONFLICT DO NOTHING', [pid]);
+    return (await c.query('SELECT balance FROM style_wallets WHERE player_id=$1 FOR UPDATE', [pid])).rows[0].balance;
+  }
+  async grant(pid: string, g: { key: string; rewardId: string | null; amount: number; items: string[]; method: 'reward' | 'collection'; note: string }) {
+    if (g.amount < 0) throw new Error('grant amount must be >= 0');
+    return this.tx(async (c) => {
+      const bal = await this.wallet(c, pid);
+      const dup = await c.query('SELECT 1 FROM style_tx WHERE tx_key=$1', [g.key]);
+      if (dup.rowCount) return { applied: false, balance: bal };
+      const after = bal + g.amount;
+      await c.query('UPDATE style_wallets SET balance=$2, updated_at=now() WHERE player_id=$1', [pid, after]);
+      await c.query(`INSERT INTO style_tx(tx_key, player_id, kind, amount, balance_after, item_id, reward_id, note) VALUES ($1,$2,'earn',$3,$4,$5,$6,$7)`,
+        [g.key, pid, g.amount, after, g.items[0] ?? null, g.rewardId, g.note]);
+      for (const it of g.items) {
+        await c.query('INSERT INTO player_items(player_id, item_id, method, tx_key) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING', [pid, it, g.method, g.key]);
+      }
+      return { applied: true, balance: after };
+    });
+  }
+  async purchase(pid: string, itemId: string, price: number, key: string, note: string): Promise<PurchaseResult> {
+    if (!Number.isInteger(price) || price < 0) throw new Error('bad price');
+    return this.tx(async (c) => {
+      const bal = await this.wallet(c, pid);   // row lock serializes concurrent purchases by one player
+      if ((await c.query('SELECT 1 FROM style_tx WHERE tx_key=$1', [key])).rowCount) return { status: 'duplicate' as const, balance: bal };
+      if ((await c.query('SELECT 1 FROM player_items WHERE player_id=$1 AND item_id=$2', [pid, itemId])).rowCount) return { status: 'owned' as const, balance: bal };
+      if (bal < price) return { status: 'insufficient' as const, balance: bal };
+      const after = bal - price;
+      await c.query('UPDATE style_wallets SET balance=$2, updated_at=now() WHERE player_id=$1', [pid, after]);
+      await c.query(`INSERT INTO style_tx(tx_key, player_id, kind, amount, balance_after, item_id, note) VALUES ($1,$2,'purchase',$3,$4,$5,$6)`,
+        [key, pid, -price, after, itemId, note]);
+      await c.query(`INSERT INTO player_items(player_id, item_id, method, tx_key) VALUES ($1,$2,'purchase',$3)`, [pid, itemId, key]);
+      return { status: 'ok' as const, balance: after };
+    });
+  }
+  async styleHistory(pid: string, limit: number): Promise<StyleTx[]> {
+    const r = await this.pool.query('SELECT id, kind, amount, balance_after, item_id, reward_id, note, created_at FROM style_tx WHERE player_id=$1 ORDER BY id DESC LIMIT $2', [pid, limit]);
+    return r.rows.map((x) => ({ id: x.id, kind: x.kind, amount: x.amount, balanceAfter: x.balance_after, itemId: x.item_id, rewardId: x.reward_id, note: x.note, at: new Date(x.created_at).getTime() }));
+  }
+  async rewardFacts(pid: string, nightId: string | null): Promise<RewardFacts> {
+    const h = await this.pool.query(
+      `SELECT count(*)::int AS hands, coalesce(array_agg(DISTINCT coalesce(h.game,'uth')), '{}') AS games,
+              count(*) FILTER (WHERE h.participant_count > 1)::int AS friend_hands,
+              count(DISTINCT h.night_id)::int AS nights,
+              count(*) FILTER (WHERE h.night_id = $2)::int AS night_hands
+         FROM hand_players hp JOIN hands h ON h.id = hp.hand_id
+        WHERE hp.player_id = $1 AND hp.settled AND h.status = 'settled'`, [pid, nightId]);
+    const d = await this.pool.query('SELECT count(*)::int AS n, count(*) FILTER (WHERE correct)::int AS c FROM decisions WHERE player_id=$1', [pid]);
+    const x = h.rows[0];
+    return { hands: x.hands, games: x.hands ? x.games : [], friendHands: x.friend_hands, nights: x.nights, nightHands: x.night_hands, decisions: d.rows[0].n, correct: d.rows[0].c };
   }
 }
 

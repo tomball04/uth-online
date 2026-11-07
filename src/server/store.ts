@@ -7,6 +7,7 @@
 import type { DecisionRecord, TableConfig } from '../shared/protocol.js';
 import type { NightHand } from '../shared/recap.js';
 import type { GameId } from '../shared/rules.js';
+import type { AvatarData, PublicLook } from '../shared/cosmetics.js';
 
 export interface PlayerRow { id: string; name: string; avatar: string }
 export interface StackRow { balance: number; reloads: number; debt: number }
@@ -69,6 +70,15 @@ export interface ReplayData {
   decisions: (DecisionRecord & { playerId: string; at: string })[];
 }
 
+export interface StyleTx { id: number; kind: 'earn' | 'purchase'; amount: number; balanceAfter: number; itemId: string | null; rewardId: string | null; note: string; at: number }
+export interface CosmeticState { balance: number; owned: { itemId: string; method: string; at: number }[]; avatar: AvatarData | null; rewards: { rewardId: string; at: number }[] }
+/** Facts the reward rules read. None of them involve wager size, wins, losses or jackpots. */
+export interface RewardFacts { hands: number; games: GameId[]; friendHands: number; nights: number; nightHands: number; decisions: number; correct: number }
+export type PurchaseResult =
+  | { status: 'ok' | 'duplicate'; balance: number }
+  | { status: 'owned'; balance: number }
+  | { status: 'insufficient'; balance: number };
+
 export interface RecentHandRow {
   handId: string; handNumber: number; at: number; dealerHand: string; dealerQualifies: boolean;
   players: { name: string; net: number; outcome: string; handName: string; sideHits?: string[] }[];
@@ -129,6 +139,22 @@ export interface Store {
   ledgerSummary(playerId: string, code: string): Promise<Record<string, number>>;
   /** Sum of ledger amounts for a stack — used to reconcile balances in tests and audits. */
   ledgerSum(playerId: string, code: string): Promise<number>;
+
+  // ---- §24 cosmetics. Fully separate from stacks and the chip ledger.
+  getCosmetics(playerId: string): Promise<CosmeticState>;
+  saveAvatar(playerId: string, data: AvatarData): Promise<void>;
+  /** Public looks for a set of players (seats, chat, recap, replay). Players without a saved look are omitted. */
+  publicLooks(playerIds: string[]): Promise<Map<string, PublicLook>>;
+  /**
+   * Credits a reward and/or grants items, once per `key`. Returns applied=false if the key was already used.
+   * Never touches casino chips.
+   */
+  grant(playerId: string, g: { key: string; rewardId: string | null; amount: number; items: string[]; method: 'reward' | 'collection'; note: string }):
+    Promise<{ applied: boolean; balance: number }>;
+  /** Buys an item for `price` credits, atomically and once per `key`. */
+  purchase(playerId: string, itemId: string, price: number, key: string, note: string): Promise<PurchaseResult>;
+  styleHistory(playerId: string, limit: number): Promise<StyleTx[]>;
+  rewardFacts(playerId: string, nightId: string | null): Promise<RewardFacts>;
 }
 
 export type SettlementBuilder = (jackpot: number) => {

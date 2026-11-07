@@ -4,7 +4,8 @@
 import type { CardStr } from './cards.js';
 import type { Decision, DecisionPhase, GameId, InitialBets, Settlement } from './rules.js';
 import type { BadBeatVariant, PairsVariant } from './sidebets.js';
-import type { CardBack, FeltColor } from './themes.js';
+import type { CardBack, EffectsLevel, FeltColor } from './themes.js';
+import type { PublicLook } from './cosmetics.js';
 
 export type WagerKey = 'ante' | 'blind' | 'play' | 'trips' | 'pairs' | 'badBeat' | 'progressive' | 'anteBonus' | 'pairPlus' | 'sixCard';
 import type { Advice, Outs } from './strategy.js';
@@ -30,6 +31,8 @@ export interface TableConfig {
   maxSixCard: number;          // cents, Three Card Poker
   felt: FeltColor;             // host's choice, shown to everyone
   cardBack: CardBack;
+  /** Host limit on cosmetic effects (§24). */
+  effects: EffectsLevel;
   startingBankroll: number;    // cents
   decisionSeconds: number;     // 0 = no timer (solo only)
   bettingSeconds: number;      // countdown once someone is ready
@@ -40,7 +43,9 @@ export interface SeatView {
   seat: number;
   playerId: string;
   name: string;
-  avatar: string;              // emoji or initials color seed
+  avatar: string;              // legacy emoji, used only when no portrait is saved
+  /** Public avatar look (§24). Cosmetic only. */
+  look?: PublicLook;
   balance: number;             // cents (table stack)
   connected: boolean;
   isHost: boolean;
@@ -127,7 +132,8 @@ export interface ChatMessage {
 }
 
 export const REACTIONS = ['Nice hand!', 'Good luck!', 'Ouch!', 'Well played!', 'Wow!'] as const;
-export type Reaction = (typeof REACTIONS)[number];
+/** A classic reaction, or a line from a reaction set the player has equipped (§24). */
+export type Reaction = string;
 
 export interface DecisionRecord {
   phase: DecisionPhase;
@@ -160,7 +166,7 @@ export interface ClientToServer {
   'host:kick': (p: { playerId: string }, ack: (r: Ack) => void) => void;
   'host:close': (ack: (r: Ack) => void) => void;
   /** Cosmetic only, allowed at any time. */
-  'host:theme': (p: { felt?: FeltColor; cardBack?: CardBack }, ack: (r: Ack) => void) => void;
+  'host:theme': (p: { felt?: FeltColor; cardBack?: CardBack; effects?: EffectsLevel }, ack: (r: Ack) => void) => void;
   /** Set a seated player away (sitting out) or back. */
   'host:away': (p: { playerId: string; away: boolean }, ack: (r: Ack) => void) => void;
   /** Move a seated player to the rail as a spectator; their stack is kept for when they sit again. */
@@ -181,6 +187,8 @@ export interface ServerToClient {
   'kicked': (p: { reason: string }) => void;
   'night:ended': (p: { nightId: string }) => void;
   'jackpot:hit': (p: { tableName: string; playerName: string; hand: string; amount: number; same: boolean }) => void;
+  /** Style Credits earned (§24). Never chips. */
+  'style:earned': (p: { rewards: string[]; balance: number }) => void;
 }
 
 export type Ack<T = object> = ({ ok: true } & T) | { ok: false; error: string };
@@ -195,6 +203,8 @@ export interface PublicTableListing {
   inHand: boolean;
   allowSpectators: boolean;
   game: GameId;
+  /** Who is seated, with public avatar looks (cosmetic). */
+  players?: { name: string; look?: PublicLook }[];
 }
 
 export type { Advice };

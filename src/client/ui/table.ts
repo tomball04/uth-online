@@ -9,13 +9,16 @@ import { GAME_NAME, tcpRequiredToStart, type GameId } from '../../shared/rules.j
 import { pawnFor } from '../../shared/debt.js';
 import type { WagerKey } from '../../shared/protocol.js';
 import { advise } from '../../shared/strategy.js';
-import { session } from '../api.js';
+import { api, session } from '../api.js';
 import { cardEl, setCard } from '../cardView.js';
 import { append, h, initials, modal, money, svg, toast } from '../dom.js';
 import { actionId, call, getSocket, onStatus, setCurrentTable } from '../net.js';
 import { motionScale, prefs, setTableTheme } from '../settings.js';
 import { sfx, unlockAudio } from '../sound.js';
 import { openSettings, tableLook } from './settingsModal.js';
+import { portrait, setPortrait, loadMine, credits } from '../cosmetics.js';
+import { REACTION_SETS, ITEM } from '../../shared/cosmetics.js';
+import type { PublicLook } from '../../shared/cosmetics.js';
 import { openReplay } from './replay.js';
 import { fetchChips, fetchPawns, fetchRecap, openPastNights, openRecap, renderNight } from './night.js';
 import { openHelp, openPayTables, readSideBetFields, sideBetFields } from './help.js';
@@ -60,7 +63,7 @@ const DECISION_LABEL: Record<Decision, string> = { play4: 'Play 4×', play3: 'Pl
 const MULT: Partial<Record<Decision, number>> = { play4: 4, play3: 3, play2: 2, play1: 1 };
 
 interface SeatEls {
-  root: HTMLElement; plate: HTMLElement; avatar: HTMLElement; name: HTMLElement; bal: HTMLElement; status: HTMLElement;
+  root: HTMLElement; plate: HTMLElement; avatar: HTMLElement; avImg: HTMLElement; name: HTMLElement; bal: HTMLElement; status: HTMLElement;
   cards: HTMLElement[]; spots: Record<WagerKey, HTMLElement>; handName: HTMLElement; float: HTMLElement; gem: HTMLElement;
 }
 
@@ -68,6 +71,9 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
   const me = session.me!;
   const sock = getSocket();
   let view: TableView | null = null;
+  /** Avatar looks seen at this table, for chat portraits (cosmetic only). */
+  const looks = new Map<string, PublicLook>();
+  let reactPack = '';
   let prev: TableView | null = null;
   let clockOffset = 0;
   let chip = 2500;
@@ -252,7 +258,8 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
       pairPlus: mk('pairPlus', 'Pair Plus'), sixCard: mk('sixCard', 'Six Card Bonus'), anteBonus: mk('anteBonus', 'Ante Bonus'),
     };
     const gem = h('div', { class: 'gem', hidden: true });
-    const avatar = h('div', { class: 'avatar' });
+    const avImg = h('span', { class: 'portrait' });
+    const avatar = h('div', { class: 'avatar' }, avImg);
     const name = h('div', { class: 'pname' });
     const bal = h('div', { class: 'pbal' });
     const status = h('div', { class: 'pstatus' });
@@ -271,7 +278,7 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
       if (!sv && view.you.role === 'spectator') sit(seat);
       else if (sv && sv.playerId !== me.id && (e.target as HTMLElement).closest('.plate')) seatMenu(sv);
     });
-    return { root, plate, avatar, name, bal, status, cards, spots, handName, float, gem };
+    return { root, plate, avatar, avImg, name, bal, status, cards, spots, handName, float, gem };
   }
 
   // ---------------------------------------------------------------- socket wiring
@@ -364,6 +371,16 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     hostBtn.hidden = !v.you.isHost || v.config.solo;
     screen.classList.toggle('solo', v.config.solo);
     screen.dataset.phase = v.phase;
+    screen.dataset.effects = v.config.effects;
+    // Your own chip skin on your rack, and your reaction set.
+    const myLook = v.you.seat !== null ? v.seats[v.you.seat]?.look : undefined;
+    const myEq = v.config.effects === 'off' ? {} : myLook?.equipped ?? {};
+    rack.dataset.chips = myEq.chips && myEq.chips !== 'chips-classic' ? ITEM.get(myEq.chips)?.look.kind ?? '' : '';
+    const pack = myLook?.equipped.emotes ?? 'emotes-classic';
+    if (pack !== reactPack) {
+      reactPack = pack;
+      reactRow.replaceChildren(...(REACTION_SETS[pack] ?? [...REACTIONS]).map((r) => h('button', { class: 'react', onclick: () => react(r) }, r)));
+    }
     // The table transforms with the game: printing, card counts, betting circles.
     const game: GameId = v.config.game;
     if (screen.dataset.game !== game) { screen.dataset.game = game; if (!first) adviceCache = null; }
@@ -432,13 +449,27 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     }
   }
 
+  /** Cosmetic victory flourish. Purely visual: it never delays or changes settlement, and respects
+   *  reduced motion, the local cosmetic-animation setting and the host's effects limit. */
+  function victory(el: SeatEls, s: SeatView) {
+    if (view!.config.effects !== 'all' || !prefs.get().cosmeticFx || motionScale() === 0) return;
+    const kind = ITEM.get(s.look?.equipped.victory ?? '')?.look.kind ?? 'standard';
+    if (kind === 'standard') return;
+    const n = kind === 'royal' ? 5 : kind === 'vegas' ? 14 : kind === 'spotlight' ? 1 : 7;
+    const fx = h('div', { class: `vfx vfx-${kind}`, 'aria-hidden': 'true' },
+      ...Array.from({ length: n }, (_, i) => h('i', { style: `--i:${i};--n:${n}` }, kind === 'royal' ? ['10', 'J', 'Q', 'K', 'A'][i] + '♠' : '')));
+    el.root.append(fx);
+    setTimeout(() => fx.remove(), 2600 * Math.max(motionScale(), 0.5));
+  }
+
   function renderSeat(el: SeatEls, s: SeatView | null, p: SeatView | null, realSeat: number, first: boolean) {
     el.root.classList.toggle('empty-seat', !s);
     el.root.classList.toggle('mine', !!s && s.playerId === me.id);
     if (!s) {
       el.name.textContent = view!.you.role === 'spectator' ? 'Sit here' : 'Open seat';
       el.bal.textContent = '';
-      el.avatar.textContent = '';
+      setPortrait(el.avImg, null, '');
+      delete el.root.dataset.cback; delete el.root.dataset.chips;
       el.status.textContent = '';
       el.cards.forEach((c) => clearCard(c));
       Object.values(el.spots).forEach((x) => { x.textContent = ''; x.classList.remove('on'); });
@@ -448,7 +479,14 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
       el.root.setAttribute('aria-label', `Seat ${realSeat + 1}, open`);
       return;
     }
-    el.avatar.textContent = s.avatar || initials(s.name);
+    setPortrait(el.avImg, s.look, s.name);
+    if (s.look) looks.set(s.playerId, s.look);
+    // Personal card backs and chip skins (unless the host turned cosmetics off). Backs are the same for every
+    // face-down card at the seat, so they can never hint at what the cards are.
+    const eq = view!.config.effects === 'off' ? {} : s.look?.equipped ?? {};
+    if (eq.cardBack && eq.cardBack !== 'back-table') el.root.dataset.cback = eq.cardBack; else delete el.root.dataset.cback;
+    if (eq.chips && eq.chips !== 'chips-classic') el.root.dataset.chips = ITEM.get(eq.chips)?.look.kind ?? ''; else delete el.root.dataset.chips;
+    if (s.result && s.result.net > 0 && !first && !p?.result) victory(el, s);
     el.avatar.title = s.name;
     el.name.textContent = s.name;
     el.bal.textContent = money(s.balance);
@@ -881,8 +919,10 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     chat.push(m);
     if (chat.length > 120) { chat.shift(); chatList.firstChild?.remove(); }
     const li = h('li', { class: `msg msg-${m.kind}` },
-      m.kind === 'player' ? h('button', { class: 'who', title: 'Mute this player', onclick: () => mute(m.playerId!, m.name!) }, m.name ?? '') : null,
-      h('span', {}, m.text));
+      m.kind === 'player' ? portrait(looks.get(m.playerId!) ?? null, m.name ?? '', { cls: 'chat-av', frame: false }) : null,
+      h('span', { class: 'msg-body' },
+        m.kind === 'player' ? h('button', { class: 'who', title: 'Mute this player', onclick: () => mute(m.playerId!, m.name!) }, m.name ?? '') : null,
+        h('span', {}, m.text)));
     chatList.append(li);
     chatList.scrollTop = chatList.scrollHeight;
     if (m.kind === 'dealer') { dealerBubble.textContent = m.text; dealerBubble.classList.add('show'); clearTimeout((dealerBubble as any)._t); (dealerBubble as any)._t = setTimeout(() => dealerBubble.classList.remove('show'), 3200); }
@@ -931,7 +971,14 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
   }
 
   function seatMenu(sv: SeatView) {
+    const prof = h('div', { class: 'mini-profile' }, portrait(sv.look ?? null, sv.name, { cls: 'profile-av' }), h('div', { class: 'muted tiny' }, 'Loading profile…'));
+    api<{ profile: { items: number; collections: string[]; achievements: string[] } }>(`/api/players/${sv.playerId}/profile`).then(({ profile }) => {
+      prof.lastElementChild!.replaceWith(h('div', { class: 'tiny' },
+        h('div', {}, `${profile.items} Boutique item${profile.items === 1 ? '' : 's'} · ${profile.achievements.length} achievement${profile.achievements.length === 1 ? '' : 's'}`),
+        profile.collections.length ? h('div', { class: 'muted' }, `Collections: ${profile.collections.map((c) => c.replace(/-/g, ' ')).join(', ')}`) : ''));
+    }).catch(() => prof.lastElementChild!.remove());
     const body = h('div', { class: 'stack' },
+      prof,
       h('p', {}, `${sv.name} · ${money(sv.balance)}`),
       h('button', { class: 'btn', onclick: () => { m.close(); mute(sv.playerId, sv.name); } }, 'Mute chat'),
       ...(view?.you.isHost ? hostSeatButtons(sv, () => m.close()) : []));

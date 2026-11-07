@@ -6,6 +6,8 @@ export interface Prefs {
   motion: 'full' | 'fast' | 'off';
   trainer: 'casino' | 'training' | 'challenge';
   fourColorDeck: boolean;
+  /** Show other players' animated frames and victory effects (§24). */
+  cosmeticFx: boolean;
 }
 
 import { DEFAULT_BACK, DEFAULT_FELT, type CardBack, type FeltColor } from '../shared/themes.js';
@@ -15,7 +17,7 @@ const KEY = 'uth.prefs';
 const defaults: Prefs = {
   fxVolume: 0.7, ambientVolume: 0.25,
   motion: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'off' : 'full',
-  trainer: 'casino', fourColorDeck: false,
+  trainer: 'casino', fourColorDeck: false, cosmeticFx: true,
 };
 
 let current: Prefs = { ...defaults, ...(() => { try { return JSON.parse(localStorage.getItem(KEY) ?? '{}'); } catch { return {}; } })() };
@@ -41,6 +43,7 @@ function applyTheme() {
   const d = document.documentElement.dataset;
   d.motion = current.motion;
   d.fourColor = String(current.fourColorDeck);
+  d.cosfx = current.cosmeticFx ? 'on' : 'off';
   d.felt = tableTheme?.felt ?? DEFAULT_FELT;
   d.back = tableTheme?.cardBack ?? DEFAULT_BACK;
 }

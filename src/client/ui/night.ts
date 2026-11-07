@@ -1,3 +1,4 @@
+import { lazyPortrait } from '../cosmetics.js';
 // "Tonight": the running tab for the current table night, the end-of-night recap, a shareable recap
 // image, and a chips check straight from the ledger. All numbers come from the server.
 
@@ -73,7 +74,7 @@ export function renderNight(r: NightRecap | null, o: {
       h('thead', {}, h('tr', {}, h('th', {}, '#'), h('th', {}, 'Player'), h('th', { class: 'num' }, 'Net'), h('th', { class: 'num' }, 'W-L-P'), h('th', {}, 'Best'))),
       h('tbody', {}, ...r.players.map((p, i) => h('tr', { class: p.playerId === o.meId ? 'me' : '' },
         h('td', {}, i === 0 && p.net > 0 ? '👑' : String(i + 1)),
-        h('td', {}, p.name, p.debt ? h('span', { class: 'iou', title: 'Markers taken at this table' }, ` IOU ${money(p.debt)}`) : null),
+        h('td', { class: 'lb-name' }, lazyPortrait(p.playerId, p.name, 'lb-av'), p.name, p.debt ? h('span', { class: 'iou', title: 'Markers taken at this table' }, ` IOU ${money(p.debt)}`) : null),
         h('td', { class: `num ${p.net < 0 ? 'neg' : p.net > 0 ? 'pos' : ''}` }, money(p.net, true)),
         h('td', { class: 'num' }, `${p.wins}-${p.losses}-${p.pushes}`),
         h('td', { class: 'tiny' }, p.bestHand ?? '—'))))),

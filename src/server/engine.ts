@@ -28,6 +28,7 @@ export function withSideBetDefaults(c: TableConfig): TableConfig {
     badBeatVariant: isBadBeatVariant(c.badBeatVariant) ? c.badBeatVariant : DEFAULT_BAD_BEAT_VARIANT,
     progressive: c.progressive !== false,
     felt: isFelt(c.felt) ? c.felt : DEFAULT_FELT,
+    effects: isEffects(c.effects) ? c.effects : 'all',
     cardBack: isBack(c.cardBack) ? c.cardBack : DEFAULT_BACK,
     game: c.game === 'tcp' ? 'tcp' : 'uth',
     maxPairPlus: typeof c.maxPairPlus === 'number' ? c.maxPairPlus : (c.solo ? 10_000 : 2_500),
@@ -39,7 +40,8 @@ import { debtLine, pawnFor } from '../shared/debt.js';
 import { NIGHT_IDLE_MS } from '../shared/recap.js';
 import { evaluate3, settleTcp, tcpDescribe, tcpAdvice, tcpExactEV, tcpHandName, tcpQualifies, TCP_RULES_VERSION, type TcpSettlement } from '../shared/tcp.js';
 import { validateTcpBet, tcpRequiredToStart, GAME_NAME, type GameId } from '../shared/rules.js';
-import { BACKS, DEFAULT_BACK, DEFAULT_FELT, FELTS, isBack, isFelt } from '../shared/themes.js';
+import { BACKS, DEFAULT_BACK, DEFAULT_FELT, EFFECTS, FELTS, isBack, isEffects, isFelt } from '../shared/themes.js';
+import type { PublicLook } from '../shared/cosmetics.js';
 import type { PlayerRow, Store } from './store.js';
 
 export interface Timing {
@@ -61,6 +63,8 @@ export interface EngineHooks {
   jackpotHit(p: { tableName: string; playerName: string; hand: string; amount: number }): void;
   jackpotAmount(): number;
   nightEnded(nightId: string): void;
+  /** A hand settled (drives cosmetic rewards; never affects chips). */
+  settled?(handId: string, nightId: string | null, playerIds: string[]): void;
 }
 
 interface Seat {
@@ -97,6 +101,8 @@ export class TableEngine {
   phase: Phase = 'waiting';
   seats: (Seat | null)[];
   spectators = new Map<string, { name: string }>();
+  /** Public avatar looks of players at this table (§24). Display only. */
+  looks = new Map<string, PublicLook>();
   hand: Hand | null = null;
   deadline: number | null = null;
   seq = 0;
@@ -558,6 +564,7 @@ export class TableEngine {
     }
     for (const [pid, bal] of res.balances) { const s = this.seatOf(pid); if (s) s.balance = bal; }
     hand.settled = true;
+    if (res.applied) this.hooks.settled?.(hand.id, this.nightId, [...hand.players.keys()]);
     this.phase = 'settled';
 
     const parts = [...hand.players.values()].map((h) => `${h.name} ${formatMoney(h.settlement!.net, { sign: true })}`);
@@ -614,6 +621,7 @@ export class TableEngine {
     if (!res.applied) console.warn(`[engine] hand ${hand.id} was already settled — skipping payout`);
     for (const [pid, bal] of res.balances) { const s = this.seatOf(pid); if (s) s.balance = bal; }
     hand.settled = true;
+    if (res.applied) this.hooks.settled?.(hand.id, this.nightId, [...hand.players.keys()]);
     this.phase = 'settled';
     const parts = players.map((h) => `${h.name} ${formatMoney(h.tcp!.net, { sign: true })}`);
     this.say(`Dealer has ${tcpDescribe(dealerScore)}${qualifies ? '' : ' — does not qualify (Ante pays, Play pushes)'}. ${parts.join(' · ')}`);
@@ -844,13 +852,14 @@ export class TableEngine {
   }
 
   /** Felt and card backs: cosmetic, so the host may change them at any time, even mid-hand. */
-  async setTheme(hostId: string, p: { felt?: unknown; cardBack?: unknown }) {
+  async setTheme(hostId: string, p: { felt?: unknown; cardBack?: unknown; effects?: unknown }) {
     this.requireHost(hostId);
     const c = { ...this.config };
     if (p.felt !== undefined) { if (!isFelt(p.felt)) throw new EngineError('Unknown felt.'); c.felt = p.felt; }
     if (p.cardBack !== undefined) { if (!isBack(p.cardBack)) throw new EngineError('Unknown card back.'); c.cardBack = p.cardBack; }
-    if (c.felt === this.config.felt && c.cardBack === this.config.cardBack) return;
-    const msg = c.felt !== this.config.felt ? `The host changed the felt to ${FELTS.find((f) => f.id === c.felt)!.name}.`
+    if (p.effects !== undefined) { if (!isEffects(p.effects)) throw new EngineError('Unknown effects level.'); c.effects = p.effects; }
+    if (c.felt === this.config.felt && c.cardBack === this.config.cardBack && c.effects === this.config.effects) return;
+    const msg = c.effects !== this.config.effects ? `The host set cosmetic effects to ${EFFECTS.find((x) => x.id === c.effects)!.name}.` : c.felt !== this.config.felt ? `The host changed the felt to ${FELTS.find((f) => f.id === c.felt)!.name}.`
       : `The host changed the card backs to ${BACKS.find((b) => b.id === c.cardBack)!.name}.`;
     this.config = c;
     await this.store.updateTable(this.code, { config: c });
@@ -998,7 +1007,7 @@ export class TableEngine {
       baseNet: h.settlement.baseNet, sideNet: h.settlement.sideNet,
     } : undefined;
     return {
-      seat: s.seat, playerId: s.playerId, name: s.name, avatar: s.avatar, balance: s.balance, connected: s.connected,
+      seat: s.seat, playerId: s.playerId, name: s.name, avatar: s.avatar, look: this.looks.get(s.playerId), balance: s.balance, connected: s.connected,
       isHost: s.playerId === this.hostId, status,
       bet: h ? { ante: h.ante, blind: h.blind, trips: h.trips, play: h.play, pairs: h.pairs, badBeat: h.badBeat, progressive: h.progressive, pairPlus: h.pairPlus, sixCard: h.sixCard }
              : { ante: s.pending.ante, blind: this.config.game === 'tcp' ? 0 : s.pending.ante, trips: s.pending.trips, play: 0, pairs: s.pending.pairs,
@@ -1020,6 +1029,7 @@ export class TableEngine {
       code: this.code, name: this.config.name, seated: this.seatedCount(), maxSeats: this.config.maxSeats,
       minAnte: this.config.minAnte, maxAnte: this.config.maxAnte, inHand: !!this.hand && !this.hand.settled,
       allowSpectators: this.config.allowSpectators, game: this.config.game,
+      players: this.seats.filter((s): s is Seat => !!s).map((s) => ({ name: s.name, look: this.looks.get(s.playerId) })),
     };
   }
 }

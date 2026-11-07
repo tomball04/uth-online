@@ -3,15 +3,33 @@
 What was actually run, where, and what it proved — and what was not tested.
 
 **Environment:** Linux, Node.js 22.23, PostgreSQL 16 (local), Google Chrome for Testing 153, run on 2 November 2026.
-**Result:** 142 of 142 automated tests passed (6 November 2026).
+**Result:** 167 of 167 automated tests passed (6 November 2026).
 
 ```
 npx tsc --noEmit                 → no type errors (client, server, shared, tests)
-npm test  (Vitest)               → 13 files, 134 tests passed   (78 unit + 56 multiplayer integration)
-npm run test:e2e (Playwright)    → 8 tests passed in real Chrome against the production build
+npm test  (Vitest)               → 15 files, 158 tests passed   (91 unit + 67 multiplayer integration)
+npm run test:e2e (Playwright)    → 9 tests passed in real Chrome against the production build
 ```
 
-Update 6 November 2026: refinement pass — Progressive/Envy audit under concurrency, rules version, Sit Out / Sit Back In, same bet every hand, decision countdowns and action tags, Tonight running tab and night recap, chips check, results presentation, six-browser test, restore code — section 1f.
+Update 6 November 2026: avatars, Style Credits and the Casino Boutique (§24) — section 1h.
+
+Earlier update: refinement pass — Progressive/Envy audit under concurrency, rules version, Sit Out / Sit Back In, same bet every hand, decision countdowns and action tags, Tonight running tab and night recap, chips check, results presentation, six-browser test, restore code — section 1f.
+
+## 1h. Avatars, Style Credits and the Casino Boutique (scope addendum §24)
+
+Built and tested in the addendum's order: Release 1 (Character Creator and portraits), then Release 2 (Style Credits, Boutique, inventory, history), then Release 3 (outfits, collections, chip skins, card backs, frames, victory effects, achievements, public profile).
+
+**Unit (13).** Catalog: unique ids, valid slots, whole-credit prices; the addendum's nine example items at its example prices; every collection has 4+ items and an earn-only reward; free basics exist in every slot. Rewards contain no wager/win/loss/jackpot criteria. Appearance parsing accepts only enumerated values (markup, fractional and out-of-range indices are rejected). Equip checks: ownership, wrong slot, unknown item, collar and jacket compatibility, and dropping a tie when switching to a tee. Renderer: one self-contained `<svg>` with no scripts, event handlers, links, `foreignObject` or images over 40 random looks; hostile input is ignored rather than echoed; six random players get six different portraits; every catalog item previews. Service: price/reward/availability overrides; reward checks read only counts and pay once.
+
+**Integration (11, PostgreSQL + memory store).** New guests get a distinct saved look and 300 credits once. Portraits appear on seats; a saved look reaches the other player live; the first save pays +50 once. Rejected: script in appearance, SVG markup, unowned item, incompatible bow tie, a client claiming ownership, buying a free or earned item, unknown item, missing key. Purchases: two simultaneous requests with the same key → one `ok`, one `duplicate`, charged once; a new key for an owned item → `owned`, not charged; two different items at once with credits for one → exactly one succeeds; no negative balance anywhere in history. Another player (even same display name) can't wear your item. Credits never touch chips: stack = ledger sum before and after 5,000 credits and six purchases; finishing Classic Vegas unlocks its frame. A $100 winner and a $5 folder earn exactly the same (first hand + game night = 200) and both get the `style:earned` notice. Looks stay on seats after switching to Three Card Poker and through a TCP hand; only the host can set effects. Reaction sets enforced. Public profile/looks contain no balances, stacks or tokens. **Interruption:** after a purchase the server is shut down and a new server starts on the same database; retrying the same key returns `duplicate`; balance, owned items and look are unchanged.
+
+**Browser (Playwright, 1 iPhone + 5 desktop).** On a phone: 300 credits shown; Character Creator → Mohawk → *Unsaved changes* → Save → 350; Boutique → Hats → Try on (Mirror) → Buy (confirmation shows 200 left) → Wear it → Owned badge, 200 credits, history line. Six players join: six portraits on every screen, all different; everyone sees Ava's fedora; on the phone no portrait overlaps another seat's plate or cards. A Hold'em hand with different bets → both a $25 and a $5 player see *First hand +100*. Host switches to Three Card Poker: same portraits on the same seats. No page errors.
+
+**By eye.** Phone 393×659 and desktop with six dressed players: frames, hats and the forearm-and-watch stay inside each portrait circle; personal card backs (Art Deco, Saloon) and chip skins at seats; chat portraits; Character Creator and Boutique on phone and desktop; lobby portraits.
+
+**Test harness fix.** Browser tests now close every browser context after each test. Before, six-player tests left their 6 browsers open, and with portraits on every seat the later six-player tests could run slow enough for a result screen to clear mid-check. With the fix the whole browser suite runs in about 3 minutes and passed twice in a row.
+
+**Not verified:** a real iPhone/Safari; screen readers on the creator tiles; victory animations captured mid-flight (they run 1–2.5 s and were checked in code and by triggering, not in a screenshot); load beyond six players. No real-money flow exists or was tested.
 
 ## 1g. Three Card Poker (scope addendum §23)
 

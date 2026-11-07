@@ -1,3 +1,4 @@
+import { lazyPortrait } from '../cosmetics.js';
 // Hand replay built strictly from the saved server record — it never re-deals or recomputes money.
 
 import { api } from '../api.js';
@@ -52,7 +53,7 @@ export async function openReplay(handId: string) {
       ...r.players.map((p) => {
         const mine = p.playerId === data.you;
         const visible = mine || (showdown && p.hole);
-        return h('div', { class: `rp-row ${mine ? 'mine' : ''}` }, h('span', { class: 'rp-who' }, p.name),
+        return h('div', { class: `rp-row ${mine ? 'mine' : ''}` }, h('span', { class: 'rp-who' }, lazyPortrait(p.playerId, p.name, 'lb-av'), p.name),
           h('div', { class: 'cards-row' }, ...(p.hole ?? [null, null]).map((c) => cardEl(visible ? c : null, 'sm'))),
           showdown ? h('span', { class: `rp-hand ${(p.net ?? 0) > 0 ? 'pos' : (p.net ?? 0) < 0 ? 'neg' : ''}` },
             `${p.folded ? 'Folded' : p.handName ?? ''} · ${p.net === null ? '' : money(p.net, true)}`, sideLine(p)) : h('span', { class: 'rp-hand muted' },

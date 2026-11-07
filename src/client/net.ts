@@ -1,6 +1,7 @@
 import { io, type Socket } from 'socket.io-client';
 import type { Ack, ClientToServer, ServerToClient } from '../shared/protocol.js';
 import { session } from './api.js';
+import { earnedToast, setBalance } from './cosmetics.js';
 
 export type GameSocket = Socket<ServerToClient, ClientToServer>;
 
@@ -18,6 +19,7 @@ export function getSocket(): GameSocket {
     if (currentCode) socket!.emit('table:join', { code: currentCode, asSpectator: true }, () => {});
   });
   socket.on('disconnect', () => statusListeners.forEach((l) => l('reconnecting')));
+  socket.on('style:earned', (p) => { setBalance(p.balance); earnedToast(p.rewards); });
   socket.io.on('reconnect_failed', () => statusListeners.forEach((l) => l('offline')));
   return socket;
 }

@@ -5,6 +5,7 @@ import { h, modal, money, toast } from '../dom.js';
 import { resetSocket } from '../net.js';
 import { openHelp, readSideBetFields, sideBetFields } from './help.js';
 import { openSettings } from './settingsModal.js';
+import { credits, loadMine, portrait } from '../cosmetics.js';
 
 export function mountHome(root: HTMLElement, nav: (path: string) => void, opts: { joinCode?: string; message?: string } = {}) {
   const me = session.me;
@@ -44,10 +45,20 @@ export function mountHome(root: HTMLElement, nav: (path: string) => void, opts: 
     nav(`/table/${c}`);
   };
 
+  const meCard = h('div', { class: 'me-card' }, portrait(null, me.name, { cls: 'me-portrait' }),
+    h('div', { class: 'me-info' }, h('b', {}, me.name), h('span', { class: 'credits-pill' }, '…')),
+    h('div', { class: 'me-btns' },
+      h('button', { class: 'btn small', onclick: () => nav('/avatar') }, 'Edit avatar'),
+      h('button', { class: 'btn small gold', onclick: () => nav('/boutique') }, 'Boutique')));
+  loadMine(true).then((m) => {
+    meCard.querySelector('.me-portrait')!.replaceWith(portrait({ appearance: m.avatar.appearance, equipped: m.avatar.equipped }, me.name, { cls: 'me-portrait' }));
+    meCard.querySelector('.credits-pill')!.textContent = credits(m.balance);
+  }).catch(() => {});
+
   root.replaceChildren(h('main', { class: 'home' },
     h('section', { class: 'hero' }, fan,
       h('h1', {}, 'Ultimate Texas Hold’em'),
-      h('p', { class: 'lede' }, `Welcome back, ${me.name}.`),
+      meCard,
       h('div', { class: 'cta-row' },
         h('button', { class: 'btn gold big', onclick: () => openCreate(nav) }, 'Create a private table'),
         h('form', { class: 'join-form', onsubmit: join }, codeInput, h('button', { class: 'btn big' }, 'Join'))),
@@ -66,7 +77,7 @@ export function mountHome(root: HTMLElement, nav: (path: string) => void, opts: 
       publicList.replaceChildren(tables.length ? h('table', { class: 'tables' },
         h('thead', {}, h('tr', {}, h('th', {}, 'Table'), h('th', {}, 'Game'), h('th', {}, 'Seats'), h('th', {}, 'Ante'), h('th', {}, 'Status'), h('th', {}))),
         h('tbody', {}, ...tables.map((t) => h('tr', {},
-          h('td', {}, t.name), h('td', {}, t.game === 'tcp' ? 'Three Card Poker' : 'Ultimate Hold’em'), h('td', { class: 'num' }, `${t.seated} / ${t.maxSeats}`),
+          h('td', {}, h('div', {}, t.name), h('div', { class: 'lobby-avs' }, ...(t.players ?? []).map((p) => portrait(p.look ?? null, p.name, { cls: 'lb-av', frame: false })))), h('td', {}, t.game === 'tcp' ? 'Three Card Poker' : 'Ultimate Hold’em'), h('td', { class: 'num' }, `${t.seated} / ${t.maxSeats}`),
           h('td', { class: 'num' }, `${money(t.minAnte)}–${money(t.maxAnte)}`),
           h('td', {}, t.inHand ? 'Hand in progress' : 'Between hands'),
           h('td', {}, t.seated < t.maxSeats ? h('button', { class: 'btn small gold', onclick: () => nav(`/table/${t.code}`) }, 'Sit down')

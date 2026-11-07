@@ -5,6 +5,8 @@ import { BACKS, FELTS, prefs, type CardBack, type FeltColor, type Prefs } from '
 import { cardEl } from '../cardView.js';
 import { session } from '../api.js';
 import { unlockAudio } from '../sound.js';
+import { styleEvent } from '../cosmetics.js';
+import { EFFECTS } from '../../shared/themes.js';
 
 export function openSettings(opts: { inTable?: boolean; view?: () => TableView | null } = {}) {
   const p = prefs.get();
@@ -12,7 +14,7 @@ export function openSettings(opts: { inTable?: boolean; view?: () => TableView |
     h('input', { type: 'range', min: 0, max: 1, step: 0.05, value: p[key], oninput: (e: Event) => { unlockAudio(); prefs.set({ [key]: Number((e.target as HTMLInputElement).value) } as Partial<Prefs>); } }));
   const radio = <K extends 'motion' | 'trainer'>(key: K, label: string, options: [Prefs[K], string, string][]) =>
     h('fieldset', {}, h('legend', {}, label), ...options.map(([v, l, d]) =>
-      h('label', { class: 'radio' }, h('input', { type: 'radio', name: key, value: v, checked: p[key] === v, onchange: () => prefs.set({ [key]: v } as Partial<Prefs>) }),
+      h('label', { class: 'radio' }, h('input', { type: 'radio', name: key, value: v, checked: p[key] === v, onchange: () => { prefs.set({ [key]: v } as Partial<Prefs>); if (key === 'trainer' && v !== 'casino') styleEvent('trainer'); } }),
         h('span', {}, h('b', {}, l), h('small', {}, d)))));
 
   const v = opts.view?.();
@@ -39,6 +41,9 @@ export function openSettings(opts: { inTable?: boolean; view?: () => TableView |
       ['fast', 'Fast play', 'The same animations at about twice the speed.'],
       ['off', 'Reduced motion', 'Cards and chips appear without movement.'],
     ]),
+    h('fieldset', {}, h('legend', {}, 'Avatars'),
+      h('label', { class: 'radio' }, h('input', { type: 'checkbox', checked: p.cosmeticFx, onchange: (e: Event) => prefs.set({ cosmeticFx: (e.target as HTMLInputElement).checked }) }),
+        h('span', {}, h('b', {}, 'Cosmetic animations'), h('small', {}, 'Animated frames and victory effects from other players. Off keeps everything still on this device.')))),
     h('fieldset', {}, h('legend', {}, 'Cards'),
       h('label', { class: 'radio' }, h('input', { type: 'checkbox', checked: p.fourColorDeck, onchange: (e: Event) => prefs.set({ fourColorDeck: (e.target as HTMLInputElement).checked }) }),
         h('span', {}, h('b', {}, 'Four-colour deck'), h('small', {}, 'Blue diamonds and green clubs, easier to tell apart on small screens. Just for you.')))),
@@ -69,6 +74,14 @@ export function tableLook(v: TableView) {
     host ? null : h('p', { class: 'muted tiny' }, 'The host chooses the felt and card backs for everyone at this table.'),
     swatches('felt', 'Felt', FELTS, v.config.felt, !host),
     swatches('cardBack', 'Card backs', BACKS, v.config.cardBack, !host),
+    h('div', { class: 'swatch-group' }, h('span', { class: 'swatch-label' }, 'Player cosmetics'),
+      h('div', { class: 'seg' }, ...EFFECTS.map((e) => h('button', { class: `seg-btn ${v.config.effects === e.id ? 'on' : ''}`, title: e.note, disabled: !host,
+        onclick: async (ev: MouseEvent) => {
+          const r = await call('host:theme', { effects: e.id });
+          if (!r.ok) return toast(r.error, 'error');
+          (ev.currentTarget as HTMLElement).parentElement!.querySelectorAll('.seg-btn').forEach((b) => b.classList.toggle('on', b === ev.currentTarget));
+        } }, e.name))),
+      h('small', { class: 'muted tiny' }, EFFECTS.find((e) => e.id === v.config.effects)?.note ?? '')),
     h('div', { class: 'theme-preview', 'aria-hidden': 'true' }, h('div', { class: 'cards-row' }, cardEl('Ah'), cardEl('Kd'), cardEl('Qc'), cardEl(null))));
 }
 

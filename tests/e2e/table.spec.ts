@@ -1,8 +1,13 @@
-import { expect, test, devices, type Browser, type Page } from '@playwright/test';
+import { expect, test, devices, type Browser, type BrowserContext, type Page } from '@playwright/test';
+
+// Close every browser context a test opened, so six-player tests don't pile up and slow the next one.
+const openContexts: BrowserContext[] = [];
+test.afterEach(async () => { await Promise.all(openContexts.splice(0).map((c) => c.close().catch(() => {}))); });
 
 async function newPlayer(browser: Browser, name: string, device: 'desktop' | 'iphone' = 'desktop') {
   const { defaultBrowserType: _ignored, ...iphone } = devices['iPhone 13'];
   const ctx = await browser.newContext(device === 'iphone' ? iphone : { viewport: { width: 1366, height: 860 } });
+  openContexts.push(ctx);
   const page = await ctx.newPage();
   const errors: string[] = [];
   page.on('pageerror', (e) => errors.push(e.message));
@@ -427,4 +432,84 @@ test('six players: host switches to Three Card Poker, two hands, then back to Ho
   }));
   await expect(ps[1].page.locator('.dock-msg')).toContainText(/Ready|waiting/i);
   for (const p of ps) expect(p.errors, p.name).toEqual([]);
+});
+
+test('§24: earn, buy and wear in the Boutique, then six distinct portraits at the table in both games (phone)', async ({ browser }) => {
+  test.setTimeout(240_000);
+  const names = ['Ava', 'Ben', 'Cy', 'Dee', 'Eli', 'Fay'];
+  const kinds: ('desktop' | 'iphone')[] = ['iphone', 'desktop', 'desktop', 'desktop', 'desktop', 'desktop'];
+  const ps = await Promise.all(names.map((n, i) => newPlayer(browser, n, kinds[i])));
+  const ava = ps[0].page;
+  await signIn(ava, 'Ava');
+  await expect(ava.locator('.me-card .credits-pill')).toHaveText('300 credits', { timeout: 10000 });
+
+  // Character Creator: change the hairstyle, save (+50 for the first save).
+  await ava.getByRole('button', { name: 'Edit avatar' }).click();
+  await ava.getByRole('tab', { name: 'Hair' }).click();
+  await ava.locator('.tile', { hasText: 'Mohawk' }).click();
+  await expect(ava.locator('.cr-dirty')).toHaveText('Unsaved changes');
+  await ava.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(ava.locator('.credits-pill')).toHaveText('350 credits', { timeout: 10000 });
+
+  // Boutique: try on, buy, wear.
+  await ava.getByRole('button', { name: 'Casino Boutique' }).click();
+  await ava.locator('.bq-tab', { hasText: 'Hats' }).click();
+  const fedora = ava.locator('.bq-card', { hasText: 'Classic Black Fedora' });
+  await fedora.getByRole('button', { name: 'Try on' }).click();
+  await expect(ava.locator('.bq-mirror-note')).toContainText('Classic Black Fedora');
+  await fedora.getByRole('button', { name: /Buy/ }).click();
+  await expect(ava.locator('.modal')).toContainText('You’ll have 200 credits left.');
+  await ava.getByRole('button', { name: 'Buy for 150' }).click();
+  await ava.getByRole('button', { name: 'Wear it' }).click();
+  await expect(fedora.locator('.owned-badge')).toBeVisible();
+  await expect(ava.locator('.credits-pill')).toHaveText('200 credits');
+  await ava.locator('.bq-tab', { hasText: 'Credit history' }).click();
+  await expect(ava.locator('.hist')).toContainText('Bought Classic Black Fedora');
+
+  // Table with six players.
+  await ava.getByRole('button', { name: '← Lobby' }).click();
+  await ava.getByRole('button', { name: 'Create a private table' }).click();
+  await ava.getByRole('button', { name: 'Create table' }).click();
+  await ava.waitForURL(/\/table\/[A-Z0-9]{8}$/);
+  const path = new URL(ava.url()).pathname;
+  for (let i = 1; i < 6; i++) await signIn(ps[i].page, names[i], path);
+  for (const p of ps) await expect(p.page.locator('.seat:not(.empty-seat) .avatar .portrait svg')).toHaveCount(6, { timeout: 15000 });
+
+  const looks = (p: Page) => p.locator('.seat:not(.empty-seat) .avatar .portrait').evaluateAll((els) => els.map((e) => (e as HTMLElement).dataset.key));
+  const ben = ps[1].page;
+  expect(new Set(await looks(ben)).size).toBe(6);                                       // six distinct people
+  const avaSeatKey = (p: Page) => p.locator('.seat:not(.empty-seat)', { hasText: 'Ava' }).locator('.portrait').getAttribute('data-key');
+  expect(await avaSeatKey(ben)).toContain('fedora-black');                              // everyone sees what Ava bought
+
+  // Phone: portraits never overlap a neighboring seat's plate or cards.
+  const boxes = await ava.locator('.seat:not(.empty-seat)').evaluateAll((seats) => seats.map((s) => ({
+    av: s.querySelector('.avatar')!.getBoundingClientRect().toJSON(),
+    others: seats.filter((o) => o !== s).flatMap((o) => [o.querySelector('.plate')!, ...o.querySelectorAll('.cards-row .card')]).map((x) => x.getBoundingClientRect().toJSON()),
+  })));
+  const hit = (a: DOMRect, b: DOMRect) => a.left < b.right - 1 && b.left < a.right - 1 && a.top < b.bottom - 1 && b.top < a.bottom - 1;
+  for (const b of boxes) for (const o of b.others) expect(hit(b.av as DOMRect, o as DOMRect)).toBe(false);
+
+  // Play a Hold'em hand: everyone earns the same credits whatever their bet.
+  await Promise.all(ps.map(async ({ page }, i) => {
+    await page.locator(i === 0 ? '.rack .chip.c25' : '.rack .chip.c5').click();
+    await page.locator('.spot-ante').click();
+    await page.getByRole('button', { name: 'Deal me in' }).click();
+  }));
+  await Promise.all(ps.map(({ page }) => page.getByRole('button', { name: 'Check' }).click({ timeout: 20000 })));
+  await Promise.all(ps.map(({ page }) => page.getByRole('button', { name: 'Check' }).click({ timeout: 20000 })));
+  await Promise.all(ps.map(({ page }) => page.getByRole('button', { name: /^Play 1×/ }).click({ timeout: 20000 })));
+  await expect(ava.locator('.toast')).toContainText('Style Credits: First hand +100', { timeout: 20000 });
+  await expect(ben.locator('.toast')).toContainText('Style Credits: First hand +100', { timeout: 20000 });
+
+  // Switch to Three Card Poker: same portraits on the same seats.
+  await expect(ava.getByRole('button', { name: 'Deal me in' })).toBeVisible({ timeout: 20000 });
+  const beforeKeys = await looks(ben);
+  await ava.getByRole('button', { name: 'Table menu' }).click();
+  await ava.getByRole('button', { name: /Host controls/ }).click();
+  await ava.locator('.game-option', { hasText: 'Three Card Poker' }).click();
+  await ava.getByRole('button', { name: 'Switch to Three Card Poker' }).click();
+  await expect(ben.locator('.table-screen')).toHaveAttribute('data-game', 'tcp', { timeout: 10000 });
+  expect(await looks(ben)).toEqual(beforeKeys);
+  expect(await avaSeatKey(ben)).toContain('fedora-black');
+  for (const p of ps) expect(p.errors).toEqual([]);
 });

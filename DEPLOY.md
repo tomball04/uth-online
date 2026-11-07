@@ -69,6 +69,16 @@ Or locally with the bundled database: `docker compose --profile app up --build` 
 
   Then set `TRUST_PROXY=1`.
 
+## Optional settings: Boutique prices and rewards
+
+Set any of these as environment variables (JSON). Leave them out to use the built-in values.
+
+* `COSMETIC_PRICES` — price overrides in Style Credits, e.g. `{"fedora-black":200,"frame-royal":2000}`.
+* `STYLE_REWARDS` — reward overrides, e.g. `{"welcome":500,"session":75}`.
+* `COSMETIC_UNAVAILABLE` — item ids to hide from the Boutique, e.g. `["tux-white"]`. Owners keep them.
+
+Item and reward ids are listed in `src/shared/cosmetics.ts`.
+
 ## Operations
 
 * **Backups:** the database holds identities, stacks, hand history, nights and the ledger. Neon keeps a point-in-time restore window (its length depends on your plan); for a longer history run `pg_dump "$DATABASE_URL" > uth-$(date +%F).sql` now and then and keep the file. Restoring is `psql "$DATABASE_URL" < file.sql` into an empty database.

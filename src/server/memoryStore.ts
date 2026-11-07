@@ -6,9 +6,10 @@ import { handNameRank, type HandName } from '../shared/evaluator.js';
 import { PROGRESSIVE } from '../shared/progressive.js';
 import type { NightHand } from '../shared/recap.js';
 import type { GameId } from '../shared/rules.js';
+import type { AvatarData, PublicLook } from '../shared/cosmetics.js';
 import {
   InsufficientFunds, type HandStart, type SettlementBuilder, type PlayerRow, type PlayerSettlementRow, type PlayerStats,
-  type DebtEvent, type NightRow, type RecentHandRow, type ReplayData, type StackRow, type Store, type TableRow,
+  type DebtEvent, type NightRow, type CosmeticState, type PurchaseResult, type RewardFacts, type StyleTx, type RecentHandRow, type ReplayData, type StackRow, type Store, type TableRow,
 } from './store.js';
 
 interface HP {
@@ -337,6 +338,68 @@ export class MemoryStore implements Store {
   async ledgerSum(p: string, c: string) {
     return this.ledger.filter((l) => l.playerId === p && l.code === c).reduce((s, l) => s + l.amount, 0);
   }
+
+  // ---- §24 cosmetics (separate from stacks and the chip ledger)
+  avatars = new Map<string, AvatarData>();
+  wallets = new Map<string, number>();
+  styleTx: (StyleTx & { key: string; playerId: string })[] = [];
+  items = new Map<string, Map<string, { method: string; at: number }>>();
+
+  async getCosmetics(pid: string): Promise<CosmeticState> {
+    return {
+      balance: this.wallets.get(pid) ?? 0,
+      owned: [...(this.items.get(pid) ?? new Map()).entries()].map(([itemId, v]) => ({ itemId, method: v.method, at: v.at })),
+      avatar: this.avatars.has(pid) ? structuredClone(this.avatars.get(pid)!) : null,
+      rewards: this.styleTx.filter((t) => t.playerId === pid && t.rewardId).map((t) => ({ rewardId: t.rewardId!, at: t.at })),
+    };
+  }
+  async saveAvatar(pid: string, data: AvatarData) { this.avatars.set(pid, structuredClone(data)); }
+  async publicLooks(ids: string[]) {
+    const m = new Map<string, PublicLook>();
+    for (const id of ids) { const a = this.avatars.get(id); if (a) m.set(id, { appearance: a.appearance, equipped: a.equipped }); }
+    return m;
+  }
+  private own(pid: string, itemId: string, method: string) {
+    let m = this.items.get(pid);
+    if (!m) this.items.set(pid, (m = new Map()));
+    if (!m.has(itemId)) m.set(itemId, { method, at: Date.now() });
+  }
+  async grant(pid: string, g: { key: string; rewardId: string | null; amount: number; items: string[]; method: 'reward' | 'collection'; note: string }) {
+    const bal = this.wallets.get(pid) ?? 0;
+    if (this.styleTx.some((t) => t.key === g.key)) return { applied: false, balance: bal };
+    if (g.amount < 0) throw new Error('grant amount must be >= 0');
+    const after = bal + g.amount;
+    this.wallets.set(pid, after);
+    this.styleTx.push({ id: this.styleTx.length + 1, key: g.key, playerId: pid, kind: 'earn', amount: g.amount, balanceAfter: after, itemId: g.items[0] ?? null, rewardId: g.rewardId, note: g.note, at: Date.now() });
+    for (const it of g.items) this.own(pid, it, g.method);
+    return { applied: true, balance: after };
+  }
+  async purchase(pid: string, itemId: string, price: number, key: string, note: string): Promise<PurchaseResult> {
+    const bal = this.wallets.get(pid) ?? 0;
+    if (this.styleTx.some((t) => t.key === key)) return { status: 'duplicate', balance: bal };
+    if (this.items.get(pid)?.has(itemId)) return { status: 'owned', balance: bal };
+    if (!Number.isInteger(price) || price < 0) throw new Error('bad price');
+    if (bal < price) return { status: 'insufficient', balance: bal };
+    const after = bal - price;
+    this.wallets.set(pid, after);
+    this.styleTx.push({ id: this.styleTx.length + 1, key, playerId: pid, kind: 'purchase', amount: -price, balanceAfter: after, itemId, rewardId: null, note, at: Date.now() });
+    this.own(pid, itemId, 'purchase');
+    return { status: 'ok', balance: after };
+  }
+  async styleHistory(pid: string, limit: number) {
+    return this.styleTx.filter((t) => t.playerId === pid).reverse().slice(0, limit).map(({ key: _k, playerId: _p, ...t }) => t);
+  }
+  async rewardFacts(pid: string, nightId: string | null): Promise<RewardFacts> {
+    const mine = [...this.hands.values()].filter((h) => h.status === 'settled' && h.players.some((p) => p.playerId === pid && p.settled));
+    const ds = this.decisions.filter((d) => d.playerId === pid);
+    return {
+      hands: mine.length, games: [...new Set(mine.map((h) => h.game))],
+      friendHands: mine.filter((h) => h.participants > 1).length,
+      nights: new Set(mine.map((h) => h.nightId).filter(Boolean)).size,
+      nightHands: nightId ? mine.filter((h) => h.nightId === nightId).length : 0,
+      decisions: ds.length, correct: ds.filter((d) => d.correct).length,
+    };
+  }
 }
 
 function sideStats(rows: { stake: number; net: number; combo: string | null }[]) {
@@ -352,4 +415,5 @@ function sideStats(rows: { stake: number; net: number; combo: string | null }[])
     biggestPayout: Math.max(0, ...wins.map((w) => w.net)),
     combos: [...combos].map(([combo, count]) => ({ combo, count })).sort((a, b) => b.count - a.count),
   };
+
 }
