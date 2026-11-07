@@ -3,11 +3,11 @@
 What was actually run, where, and what it proved — and what was not tested.
 
 **Environment:** Linux, Node.js 22.23, PostgreSQL 16 (local), Google Chrome for Testing 153, run on 2 November 2026.
-**Result:** 123 of 123 automated tests passed (6 November 2026).
+**Result:** 121 of 121 automated tests passed (6 November 2026).
 
 ```
 npx tsc --noEmit                 → no type errors (client, server, shared, tests)
-npm test  (Vitest)               → 11 files, 116 tests passed   (65 unit + 51 multiplayer integration)
+npm test  (Vitest)               → 11 files, 114 tests passed   (65 unit + 49 multiplayer integration)
 npm run test:e2e (Playwright)    → 7 tests passed in real Chrome against the production build
 ```
 
@@ -31,8 +31,6 @@ Update 6 November 2026: refinement pass — Progressive/Envy audit under concurr
 **Restore code (Playwright).** Copy the code from Settings on a desktop browser; on an iPhone-sized browser a wrong code is refused, the right one signs in as the same player.
 
 **By eye (393×659 iPhone viewport, desktop 1366×860).** Seconds left on every deciding player's avatar; Checked / Deciding / Folded tags; amounts float over the name plate rather than the cards; the winning five light up first and the compact breakdown fades in after; Tonight tab and recap modal on phone and desktop; Same bet every hand row.
-
-**Pay off and pawn shop (integration, PostgreSQL).** Zero refused; $10 paid leaves $20 owed and $5 in chips with the dealer's chat line; asking for $500 pays only the $5 you have; with no chips it's refused; mid-hand it's refused; ledger still equals the stack and the chips check reports *balanced*; the pawn-shop list has the two markers and two payoffs in order with the pawned item; reloading afterwards adds a new marker. Checked by eye on an iPhone viewport: IOU and Pay off under the bet circles, the payoff sheet, the Pawn shop list.
 
 **Not verified in this pass:** a real iPhone or Safari (emulation only); the share image on an actual phone's share sheet (the canvas drawing runs without errors in Chrome; download is the fallback); the 4-hour automatic night rollover (logic shared with the tested manual path, but no test waits 4 hours or mocks the clock); the deploy notes' roll-back claim.
 

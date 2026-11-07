@@ -15,7 +15,7 @@ import { motionScale, prefs, setTableTheme } from '../settings.js';
 import { sfx, unlockAudio } from '../sound.js';
 import { openSettings, tableLook } from './settingsModal.js';
 import { openReplay } from './replay.js';
-import { fetchChips, fetchPawns, fetchRecap, openPastNights, openRecap, renderNight } from './night.js';
+import { fetchChips, fetchRecap, openPastNights, openRecap, renderNight } from './night.js';
 import { openHelp, openPayTables, readSideBetFields, sideBetFields } from './help.js';
 import { outsEl, outsText } from './outs.js';
 import { outsFor } from '../../shared/strategy.js';
@@ -572,7 +572,7 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
         h('span', {}, 'On the table ', h('b', {}, money(committed))),
         reserve ? h('span', {}, 'Reserved for 1× Play ', h('b', {}, money(reserve))) : null,
         h('span', {}, betting ? 'Free after bets ' : 'Stack ', h('b', {}, money(betting ? s.balance - committed - reserve : s.balance))),
-        null]);
+        s.debt ? h('span', { class: 'debt-line', title: `To cover it, pawn ${pawnFor(s.debt).item}` }, 'Debt ', h('b', {}, money(s.debt))) : null]);
     } else totals.hidden = true;
     renderPairsFlash(v, s);
     renderAuto(v, s);
@@ -746,16 +746,12 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
   }
   function renderAuto(v: TableView, s: SeatView | null) {
     const auto = v.you.autoRebet;
-    const showAuto = !!s && (!!auto || (v.phase === 'betting' && (!!draft.ante || !!v.you.lastBet)));
-    // Markers owed, with Pay off between hands.
-    const debt = s?.debt ? h('span', { class: 'debt-pill' }, 'IOU ', h('b', {}, money(s.debt)),
-      !inHandNow(v) && s.balance > 0 ? h('button', { class: 'link', onclick: () => openPayoff() }, 'Pay off') : null) : null;
-    autoRow.hidden = !showAuto && !debt;
+    autoRow.hidden = !s || (!auto && !(v.phase === 'betting' && (draft.ante || v.you.lastBet)));
     if (autoRow.hidden) return;
-    autoRow.replaceChildren(!showAuto ? '' : auto
+    autoRow.replaceChildren(auto
       ? h('span', { class: 'auto-on' }, h('b', {}, '↻ Same bet every hand'), h('small', {}, betLabel(auto)),
         h('button', { class: 'link', onclick: () => setAuto(false) }, 'Stop'))
-      : h('button', { class: 'link auto-off', onclick: () => confirmAuto() }, '↻ Same bet every hand…'), debt ?? '');
+      : h('button', { class: 'link auto-off', onclick: () => confirmAuto() }, '↻ Same bet every hand…'));
   }
   async function confirmAuto() {
     if (!view) return;
@@ -915,11 +911,10 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     if (nightLoading) { nightAgain = true; return; }
     nightLoading = true;
     try {
-      const [r, chips, pawns] = await Promise.all([fetchRecap(code), view?.you.seat !== null ? fetchChips(code) : Promise.resolve(null), fetchPawns(code)]);
+      const [r, chips] = await Promise.all([fetchRecap(code), view?.you.seat !== null ? fetchChips(code) : Promise.resolve(null)]);
       nightPane.replaceChildren(renderNight(r, {
         meId: me.id, isHost: !!view?.you.isHost && !view.config.solo, live: !!r && r.endedAt === null, chips,
         onReplay: (id) => openReplay(id), onEnd: () => endNight(), onPast: () => openPastNights(code, me.id, openReplay),
-        pawns, onPay: () => openPayoff(),
       }));
     } catch (e) {
       nightPane.replaceChildren(h('p', { class: 'muted' }, (e as Error).message));
@@ -927,28 +922,6 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
       nightLoading = false;
       if (nightAgain) { nightAgain = false; refreshNight(); }
     }
-  }
-  const inHandNow = (v: TableView) => !!v.handId && v.phase !== 'settled' && v.phase !== 'betting' && (myView()?.cards.length ?? 0) > 0;
-  /** Pay markers back from your stack: all of it, or just what's above a starting stack. */
-  function openPayoff() {
-    const s = myView();
-    if (!view || !s?.debt) return;
-    const all = Math.min(s.debt, s.balance);
-    const winnings = Math.min(s.debt, Math.max(0, s.balance - view.config.startingBankroll));
-    const pay = async (amount: number) => {
-      m.close();
-      const r = await call<{ balance: number; debt: number; paid: number }>('player:payDebt', { amount });
-      if (!r.ok) return toast(r.error, 'error');
-      sfx.chip();
-      toast(r.debt ? `Paid ${money(r.paid)}. You still owe ${money(r.debt)}.` : `Debt free! Paid ${money(r.paid)}.`, 'success');
-      if (isPanelVisible('night')) refreshNight();
-    };
-    const body = h('div', { class: 'stack' },
-      h('p', {}, `You owe the house ${money(s.debt)} in markers. Pawned: ${pawnFor(s.debt).item}.`),
-      winnings > 0 && winnings < all ? h('button', { class: 'btn', onclick: () => pay(winnings) }, `Pay ${money(winnings)} — your winnings above a starting stack`) : null,
-      h('button', { class: 'btn gold', disabled: !all, onclick: () => pay(all) }, all >= s.debt ? `Pay it all off — ${money(all)}` : `Pay ${money(all)} — everything in front of you`),
-      h('p', { class: 'muted tiny' }, 'Just for fun: paying off moves chips from your stack back to the house. Bets on the layout that no longer fit are taken back.'));
-    const m = modal('Pay off markers', body);
   }
   async function endNight() {
     if (!confirm('End the night for everyone? Everyone gets the recap, and the next hand starts a new night.')) return;

@@ -7,7 +7,7 @@ import { PROGRESSIVE } from '../shared/progressive.js';
 import type { NightHand } from '../shared/recap.js';
 import {
   InsufficientFunds, type HandStart, type SettlementBuilder, type PlayerRow, type PlayerSettlementRow, type PlayerStats,
-  type DebtEvent, type NightRow, type RecentHandRow, type ReplayData, type StackRow, type Store, type TableRow,
+  type NightRow, type RecentHandRow, type ReplayData, type StackRow, type Store, type TableRow,
 } from './store.js';
 
 interface HP {
@@ -82,37 +82,14 @@ export class MemoryStore implements Store {
     }
     return { ...this.stacks.get(k)! };
   }
-  debtLog: DebtEvent[] = [];
-  private debtCode = new Map<number, string>();
-  private logDebt(p: string, c: string, e: Omit<DebtEvent, 'id' | 'playerId' | 'at'>) {
-    const id = this.debtLog.length + 1;
-    this.debtLog.push({ id, playerId: p, at: Date.now(), ...e });
-    this.debtCode.set(id, c);
-  }
-  async reloadStack(p: string, c: string, amount: number, pawn?: { name: string; item: string }) {
+  async reloadStack(p: string, c: string, amount: number) {
     const s = this.stacks.get(this.sk(p, c));
     if (!s) throw new Error('No stack');
     s.reloads++;
-    const added = Math.max(0, amount - s.balance);
-    s.debt += added;
-    if (pawn && added) this.logDebt(p, c, { name: pawn.name, kind: 'marker', amount: added, debtAfter: s.debt, item: pawn.item });
+    s.debt += Math.max(0, amount - s.balance);
     this.post({ key: `${c}:${p}:reload:${s.reloads}`, playerId: p, code: c, kind: 'reload', amount: amount - s.balance, after: amount });
     s.balance = amount;
     return { ...s };
-  }
-
-  async payDebt(p: string, c: string, amount: number, pawn: { name: string; item: (debtAfter: number) => string }) {
-    const s = this.stacks.get(this.sk(p, c));
-    if (!s) throw new Error('No stack');
-    const paid = Math.max(0, Math.min(amount, s.debt, s.balance));
-    if (!paid) return { ...s, paid: 0 };
-    s.balance -= paid; s.debt -= paid;
-    this.post({ key: `${c}:${p}:payoff:${this.debtLog.length + 1}`, playerId: p, code: c, kind: 'reload', amount: -paid, after: s.balance });
-    this.logDebt(p, c, { name: pawn.name, kind: 'payoff', amount: paid, debtAfter: s.debt, item: pawn.item(s.debt) });
-    return { ...s, paid };
-  }
-  async debtEvents(code: string, limit: number) {
-    return this.debtLog.filter((e) => this.debtCode.get(e.id) === code).reverse().slice(0, limit);
   }
 
   private debit(p: string, c: string, handId: string, amount: number, key: string): number | null {

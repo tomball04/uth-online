@@ -6,7 +6,7 @@ import { PROGRESSIVE } from '../shared/progressive.js';
 import type { NightHand } from '../shared/recap.js';
 import {
   InsufficientFunds, JACKPOT_ID, type HandStart, type SettlementBuilder, type PlayerRow, type PlayerSettlementRow, type PlayerStats,
-  type DebtEvent, type NightRow, type RecentHandRow, type ReplayData, type StackRow, type Store, type TableRow,
+  type NightRow, type RecentHandRow, type ReplayData, type StackRow, type Store, type TableRow,
 } from './store.js';
 
 // BIGINT -> number (all our values are well inside Number.MAX_SAFE_INTEGER)
@@ -98,7 +98,7 @@ export class PgStore implements Store {
       return stackRow((await c.query('SELECT balance,reloads,debt FROM stacks WHERE player_id=$1 AND table_code=$2', [playerId, code])).rows[0]);
     });
   }
-  async reloadStack(playerId: string, code: string, amount: number, pawn?: { name: string; item: string }): Promise<StackRow> {
+  async reloadStack(playerId: string, code: string, amount: number): Promise<StackRow> {
     return this.tx(async (c) => {
       const cur = (await c.query('SELECT balance,reloads,debt FROM stacks WHERE player_id=$1 AND table_code=$2 FOR UPDATE', [playerId, code])).rows[0];
       if (!cur) throw new Error('No stack');
@@ -107,34 +107,8 @@ export class PgStore implements Store {
       await c.query('UPDATE stacks SET balance=$3, reloads=$4, debt=$5, updated_at=now() WHERE player_id=$1 AND table_code=$2', [playerId, code, amount, n, debt]);
       await c.query(`INSERT INTO ledger(tx_key,player_id,table_code,kind,amount,balance_after) VALUES ($1,$2,$3,'reload',$4,$5)`,
         [`${code}:${playerId}:reload:${n}`, playerId, code, amount - cur.balance, amount]);
-      if (pawn && debt > Number(cur.debt))
-        await c.query(`INSERT INTO debt_events(player_id,table_code,name,kind,amount,debt_after,item) VALUES ($1,$2,$3,'marker',$4,$5,$6)`,
-          [playerId, code, pawn.name, debt - Number(cur.debt), debt, pawn.item]);
       return { balance: amount, reloads: n, debt };
     });
-  }
-
-  async payDebt(playerId: string, code: string, amount: number, pawn: { name: string; item: (debtAfter: number) => string }) {
-    return this.tx(async (c) => {
-      const cur = (await c.query('SELECT balance,reloads,debt FROM stacks WHERE player_id=$1 AND table_code=$2 FOR UPDATE', [playerId, code])).rows[0];
-      if (!cur) throw new Error('No stack');
-      const paid = Math.max(0, Math.min(amount, Number(cur.debt), Number(cur.balance)));
-      if (!paid) return { ...stackRow(cur), paid: 0 };
-      const balance = Number(cur.balance) - paid, debt = Number(cur.debt) - paid;
-      await c.query('UPDATE stacks SET balance=$3, debt=$4, updated_at=now() WHERE player_id=$1 AND table_code=$2', [playerId, code, balance, debt]);
-      const n = (await c.query(`SELECT COUNT(*)::int n FROM debt_events WHERE player_id=$1 AND table_code=$2`, [playerId, code])).rows[0].n;
-      await c.query(`INSERT INTO ledger(tx_key,player_id,table_code,kind,amount,balance_after) VALUES ($1,$2,$3,'reload',$4,$5)`,
-        [`${code}:${playerId}:payoff:${n + 1}`, playerId, code, -paid, balance]);
-      await c.query(`INSERT INTO debt_events(player_id,table_code,name,kind,amount,debt_after,item) VALUES ($1,$2,$3,'payoff',$4,$5,$6)`,
-        [playerId, code, pawn.name, paid, debt, pawn.item(debt)]);
-      return { balance, reloads: Number(cur.reloads), debt, paid };
-    });
-  }
-
-  async debtEvents(code: string, limit: number) {
-    return (await this.pool.query('SELECT * FROM debt_events WHERE table_code=$1 ORDER BY id DESC LIMIT $2', [code, limit])).rows.map((r: any) => ({
-      id: Number(r.id), playerId: r.player_id, name: r.name, kind: r.kind, amount: Number(r.amount), debtAfter: Number(r.debt_after), item: r.item,
-      at: new Date(r.created_at).getTime() }));
   }
 
   private async debit(c: Q, playerId: string, code: string, handId: string, amount: number, key: string): Promise<number | null> {
