@@ -21,6 +21,7 @@ export interface HandStart {
   pairsVariant: string; badBeatVariant: string;
   nightId: string; rulesVersion: string;
 }
+export interface DebtEvent { id: number; playerId: string; name: string; kind: 'marker' | 'payoff'; amount: number; debtAfter: number; item: string; at: number }
 export interface NightRow { id: string; tableCode: string; startedAt: number; endedAt: number | null; hands: number }
 export interface PlayerSettlementRow {
   playerId: string; credit: number; net: number; outcome: string; handName: string; handRank: number;
@@ -81,7 +82,11 @@ export interface Store {
 
   getStack(playerId: string, code: string): Promise<StackRow | null>;
   createStack(playerId: string, code: string, amount: number): Promise<StackRow>;
-  reloadStack(playerId: string, code: string, amount: number): Promise<StackRow>;
+  reloadStack(playerId: string, code: string, amount: number, pawn?: { name: string; item: string }): Promise<StackRow>;
+  /** Pays back up to `amount` of the stack's debt from its balance. Returns the new stack and what was paid. */
+  payDebt(playerId: string, code: string, amount: number, pawn: { name: string; item: (debtAfter: number) => string }): Promise<StackRow & { paid: number }>;
+  /** The table's pawn-shop log, newest first. */
+  debtEvents(code: string, limit: number): Promise<DebtEvent[]>;
 
   /** Atomically records the hand, debits every initial wager, and adds progressive contributions to the meter. */
   startHand(h: HandStart): Promise<{ balances: Map<string, number>; jackpot: number }>;

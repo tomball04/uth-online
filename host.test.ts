@@ -99,4 +99,33 @@ describe('debt counter (just for fun)', () => {
     const st = (await s.api('/api/stats/me', ed.token)).body.stats;
     expect(st.debt).toBe($(30));
   });
+
+  it('pays markers back from the stack; the pawn shop keeps a running list', async () => {
+    await ed.waitState((v) => v.phase === 'betting');
+    expect((await ed.emit('player:payDebt', { amount: 0 })).ok).toBe(false);
+    let r = await ed.emit('player:payDebt', { amount: $(10) });
+    expect(r).toMatchObject({ ok: true, paid: $(10), debt: $(20), balance: $(5) });
+    await ed.waitState(() => ed.chat.some((m) => /Ed pays \$10 on their markers\. Still owes \$20/.test(m.text)), 2000);
+    // Asking for more than you have pays what you have, never more than you owe.
+    r = await ed.emit('player:payDebt', { amount: $(500) });
+    expect(r).toMatchObject({ ok: true, paid: $(5), debt: $(15), balance: 0 });
+    expect((await ed.emit('player:payDebt', { amount: $(1) })).ok).toBe(false);          // no chips left
+    expect(await s.store.ledgerSum(ed.id, code)).toBe(0);
+    expect((await s.store.getStack(ed.id, code))!.debt).toBe($(15));
+    const chips = (await s.api(`/api/tables/${code}/chips`, ed.token)).body.chips;
+    expect(chips).toMatchObject({ balanced: true, balance: 0, debt: $(15), reloads: $(30) - $(15) });
+    const events = (await s.api(`/api/tables/${code}/pawns`, ed.token)).body.events;
+    expect(events.map((e: any) => [e.kind, e.amount, e.debtAfter])).toEqual([
+      ['payoff', $(5), $(15)], ['payoff', $(10), $(20)], ['marker', $(15), $(30)], ['marker', $(15), $(15)]]);
+    expect(events[3].item).toMatch(/AirPods/);
+    // Reloading again adds a new marker on top.
+    expect(await ed.emit('player:reload')).toMatchObject({ ok: true, debt: $(30) });
+  });
+
+  it('cannot pay off mid-hand', async () => {
+    s.decks.push(rigDeck(['Kc Kd'], '2s 3h', 'Ks 9h 9d 4c Jh'));
+    await ed.bet($(5)); await ed.ready();
+    await ed.waitState((v) => v.phase === 'preflop');
+    expect((await ed.emit('player:payDebt', { amount: $(5) })).error).toMatch(/between hands/);
+  });
 });

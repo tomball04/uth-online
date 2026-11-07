@@ -32,7 +32,7 @@ export function withSideBetDefaults(c: TableConfig): TableConfig {
   };
 }
 import { newId, sha256 } from './rng.js';
-import { debtLine } from '../shared/debt.js';
+import { debtLine, pawnFor } from '../shared/debt.js';
 import { NIGHT_IDLE_MS } from '../shared/recap.js';
 import { BACKS, DEFAULT_BACK, DEFAULT_FELT, FELTS, isBack, isFelt } from '../shared/themes.js';
 import type { PlayerRow, Store } from './store.js';
@@ -605,7 +605,8 @@ export class TableEngine {
     const s = this.requireSeat(pid);
     if (this.inActiveHand(pid)) throw new EngineError('You can reload between hands.');
     if (requiredToStart(this.config.minAnte) <= s.balance) throw new EngineError('You can reload once your stack can no longer cover a minimum hand.');
-    const st = await this.store.reloadStack(pid, this.code, this.config.startingBankroll);
+    const debtAfter = s.debt + Math.max(0, this.config.startingBankroll - s.balance);
+    const st = await this.store.reloadStack(pid, this.code, this.config.startingBankroll, { name: s.name, item: pawnFor(debtAfter).item });
     const borrowed = st.debt - s.debt;
     s.balance = st.balance;
     s.reloads = st.reloads;
@@ -615,6 +616,25 @@ export class TableEngine {
     const out = { balance: st.balance, debt: st.debt };
     this.say(borrowed > 0 ? debtLine(s.name, borrowed, st.debt, st.reloads) : `${s.name} reloads to ${formatMoney(st.balance)} in virtual chips.`);
     return out;
+  }
+
+  /** Pay back markers from your stack, between hands. Just for fun: it only moves chips you own to the house. */
+  async payDebt(pid: string, amount: number) {
+    const s = this.requireSeat(pid);
+    if (this.inActiveHand(pid)) throw new EngineError('You can pay off your markers between hands.');
+    if (!s.debt) throw new EngineError('You don’t owe the house anything.');
+    if (!Number.isInteger(amount) || amount <= 0) throw new EngineError('Choose an amount to pay.');
+    const before = s.debt;
+    const r = await this.store.payDebt(pid, this.code, amount, { name: s.name, item: () => pawnFor(before).item });
+    if (!r.paid) throw new EngineError('You have no chips to pay with.');
+    s.balance = r.balance; s.debt = r.debt;
+    // A bet that no longer fits is taken back.
+    if (s.pending.ante && validateInitialBet(s.pending, s.balance, this.limits())) { s.pending = { ...NO_BETS }; s.ready = false; s.autoRebet = null; }
+    this.say(r.debt
+      ? `${s.name} pays ${formatMoney(r.paid)} on their markers. Still owes ${formatMoney(r.debt)} — ${pawnFor(r.debt).item.replace(/^your /, 'their ')} stays at the pawn shop.`
+      : `${s.name} pays off all ${formatMoney(r.paid)} in markers and gets ${pawnFor(before).item.replace(/^your /, 'their ')} back from the pawn shop. Debt free!`);
+    await this.checkStart();
+    return { balance: r.balance, debt: r.debt, paid: r.paid };
   }
 
   async setPrefs(pid: string, p: { timeoutPolicy?: 'default' | 'strategy'; sitOut?: boolean; autoRebet?: boolean }) {

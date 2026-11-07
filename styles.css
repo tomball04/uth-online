@@ -758,3 +758,12 @@ label.radio small { color: var(--muted); font-size: 14px; }
 .habit p { margin: 4px 0 0; }
 .restore-link { margin-top: 10px; font-size: 14px; }
 .restore-code { flex: 1; min-width: 0; font-family: ui-monospace, monospace; }
+.payoff-link { margin-left: 8px; font-size: 13px; }
+.pawn-shop ul { list-style: none; margin: 0 0 8px; padding: 0; display: flex; flex-direction: column; gap: 6px; font-size: 14px; }
+.pawn-shop li { display: grid; grid-template-columns: auto 1fr auto; gap: 8px; align-items: baseline; padding: 4px 0; border-bottom: 1px dashed rgba(201, 164, 92, .18); }
+.pawn-time { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.pawn-owes { font-size: 12px; white-space: nowrap; }
+.auto-row { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center; }
+.debt-pill { display: inline-flex; gap: 6px; align-items: baseline; font-size: 14px; color: var(--muted); }
+.debt-pill b { color: #ff8f80; }
+.debt-pill .link { font-size: 13px; }

@@ -12,6 +12,25 @@ export interface Chips { start: number; reloads: number; wagered: number; paid: 
 export async function fetchRecap(code: string, nightId?: string): Promise<NightRecap | null> {
   return (await api<{ recap: NightRecap | null }>(`/api/tables/${code}/night${nightId ? `?id=${encodeURIComponent(nightId)}` : ''}`)).recap;
 }
+export interface PawnEvent { id: number; playerId: string; name: string; kind: 'marker' | 'payoff'; amount: number; debtAfter: number; item: string; at: number }
+export async function fetchPawns(code: string): Promise<PawnEvent[]> {
+  try { return (await api<{ events: PawnEvent[] }>(`/api/tables/${code}/pawns`)).events; } catch { return []; }
+}
+const theirs = (item: string) => item.replace(/^your /, 'their ');
+
+/** The pawn shop: every marker taken and paid back at this table, newest first. Just for fun. */
+export function renderPawnShop(events: PawnEvent[], meId: string, onPay?: () => void) {
+  if (!events.length) return null;
+  return h('section', { class: 'pawn-shop' }, h('h4', {}, 'Pawn shop'),
+    h('ul', {}, ...events.map((e) => h('li', { class: e.kind },
+      h('span', { class: 'pawn-time' }, timeOf(e.at)),
+      h('span', {}, e.kind === 'marker'
+        ? [h('b', {}, e.name), ` pawned ${theirs(e.item)} for a `, h('span', { class: 'neg' }, money(e.amount)), ' marker']
+        : [h('b', {}, e.name), ' paid ', h('span', { class: 'pos' }, money(e.amount)), e.debtAfter ? ' back' : ` and got ${theirs(e.item)} back`]),
+      h('span', { class: 'pawn-owes muted' }, e.debtAfter ? `owes ${money(e.debtAfter)}` : 'debt free')))),
+    onPay ? h('button', { class: 'btn small', onclick: onPay }, 'Pay off my markers') : null);
+}
+
 export async function fetchChips(code: string): Promise<Chips | null> {
   try { return (await api<{ chips: Chips }>(`/api/tables/${code}/chips`)).chips; } catch { return null; }
 }
@@ -37,10 +56,13 @@ function moment(label: string, m: RecapMoment | null, onReplay: (id: string) => 
 export function renderNight(r: NightRecap | null, o: {
   meId: string; isHost: boolean; live: boolean; chips: Chips | null;
   onReplay: (id: string) => void; onEnd?: () => void; onPast?: () => void;
+  pawns?: PawnEvent[]; onPay?: () => void;
 }) {
+  const shop = o.pawns ? renderPawnShop(o.pawns, o.meId, o.chips?.debt ? o.onPay : undefined) : null;
   if (!r || !r.hands) {
     return h('div', { class: 'night' },
       h('p', { class: 'muted' }, 'No hands yet tonight. The running tab starts with the first deal.'),
+      shop,
       o.chips ? chipsCheck(o.chips) : null,
       o.onPast ? h('button', { class: 'link', onclick: o.onPast }, 'Past nights') : null);
   }
@@ -65,6 +87,7 @@ export function renderNight(r: NightRecap | null, o: {
         h('span', {}, h('b', {}, b.name), ` · ${b.bet}${b.detail ? ` — ${b.detail}` : ''}`), h('span', { class: 'pos num' }, money(b.amount, true)))))) : null,
     r.fun.length ? h('section', {}, h('h4', {}, 'Tonight’s awards'),
       h('ul', { class: 'fun-list' }, ...r.fun.map((f) => h('li', {}, h('b', {}, f.label), h('span', {}, f.text))))) : null,
+    shop,
     o.chips ? chipsCheck(o.chips) : null,
     h('div', { class: 'night-actions' },
       h('button', { class: 'btn small', onclick: () => shareRecap(r) }, 'Share recap'),
@@ -78,8 +101,9 @@ function chipsCheck(c: Chips) {
   return h('section', { class: 'chips-check' },
     h('h4', {}, 'Your chips at this table'),
     h('dl', { class: 'kv' },
-      ...row('Starting chips', c.start, false), ...row('Reloads (markers)', c.reloads), ...row('Wagered', -c.wagered),
+      ...row('Starting chips', c.start, false), ...row('Markers (minus payoffs)', c.reloads), ...row('Wagered', -c.wagered),
       ...row('Paid back to you', c.paid), ...(c.refunded ? row('Refunded', c.refunded) : []),
+      ...(c.debt ? [h('dt', {}, 'Still owed to the house'), h('dd', { class: 'num neg' }, money(c.debt))] : []),
       h('dt', { class: 'total' }, 'Equals'), h('dd', { class: 'num total' }, money(c.ledgerTotal))),
     h('p', { class: c.balanced ? 'pos tiny' : 'neg tiny' }, c.balanced
       ? `✓ Matches your stack of ${money(c.balance)} exactly.`

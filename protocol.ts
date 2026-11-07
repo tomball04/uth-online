@@ -146,6 +146,7 @@ export interface ClientToServer {
   'bet:clear': (p: { actionId: string }, ack: (r: Ack) => void) => void;
   'player:ready': (p: { actionId: string; ready: boolean }, ack: (r: Ack) => void) => void;
   'player:decide': (p: { actionId: string; handId: string; phase: DecisionPhase; decision: Decision }, ack: (r: Ack) => void) => void;
+  'player:payDebt': (p: { amount: number }, ack: (r: Ack<{ balance: number; debt: number; paid: number }>) => void) => void;
   'player:reload': (ack: (r: Ack<{ balance: number; debt: number }>) => void) => void;
   'player:prefs': (p: { timeoutPolicy?: 'default' | 'strategy'; sitOut?: boolean; autoRebet?: boolean }, ack: (r: Ack) => void) => void;
   'chat:send': (p: { text: string }, ack: (r: Ack) => void) => void;

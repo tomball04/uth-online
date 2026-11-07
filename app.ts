@@ -274,6 +274,11 @@ export async function createApp(opts: AppOptions) {
     if (!(await nightAccess(code, res.locals.player.id))) { res.status(404).json({ error: 'Table not found.' }); return; }
     res.json({ nights: await store.listNights(code, 30) });
   }));
+  app.get('/api/tables/:code/pawns', requireAuth, wrap(async (req, res) => {
+    const code = String(req.params.code).toUpperCase();
+    if (!(await nightAccess(code, res.locals.player.id))) { res.status(404).json({ error: 'Table not found.' }); return; }
+    res.json({ events: await store.debtEvents(code, 50) });
+  }));
   app.get('/api/tables/:code/night', requireAuth, wrap(async (req, res) => {
     const code = String(req.params.code).toUpperCase();
     const t = await nightAccess(code, res.locals.player.id);
@@ -392,6 +397,7 @@ export async function createApp(opts: AppOptions) {
       await e.decide(socket.data.player.id, x.actionId, String(x.handId), x.phase, x.decision);
     });
     on('player:reload', async (e) => e.reload(socket.data.player.id));
+    on('player:payDebt', async (e, p) => e.payDebt(socket.data.player.id, Number(obj(p).amount)));
     on('player:prefs', async (e, p) => e.setPrefs(socket.data.player.id, obj(p)));
     on('host:kick', async (e, p) => e.kick(socket.data.player.id, String(obj(p).playerId)));
     on('host:close', async (e) => e.close(socket.data.player.id));
