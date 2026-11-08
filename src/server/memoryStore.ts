@@ -1,3 +1,5 @@
+import type { RivalryEvent, RivalryRow } from './roast.js';
+import type { QHand } from '../shared/quality.js';
 // In-memory Store with the same semantics as PgStore. Used when DATABASE_URL is not set
 // (zero-config local play) and in fast engine tests. Data is lost on restart.
 
@@ -10,6 +12,7 @@ import type { AvatarData, PublicLook } from '../shared/cosmetics.js';
 import {
   InsufficientFunds, type HandStart, type SettlementBuilder, type PlayerRow, type PlayerSettlementRow, type PlayerStats,
   type DebtEvent, type NightRow, type CosmeticState, type PurchaseResult, type RewardFacts, type StyleTx, type RecentHandRow, type ReplayData, type StackRow, type Store, type TableRow,
+  toQHand,
 } from './store.js';
 
 interface HP {
@@ -66,6 +69,7 @@ export class MemoryStore implements Store {
     this.tables.set(code, { code, hostId, config, handCounter: 0, closed: false });
   }
   async loadTable(code: string) { const t = this.tables.get(code); return t ? structuredClone(t) : null; }
+  async updateDealer(code: string, dealerId: string, rounds: number) { const t = this.tables.get(code); if (t) t.dealer = { dealerId, rounds }; }
   async updateTable(code: string, p: { config?: TableConfig; hostId?: string; closed?: boolean; handCounter?: number }) {
     const t = this.tables.get(code);
     if (!t) return;
@@ -157,14 +161,21 @@ export class MemoryStore implements Store {
     return bal;
   }
 
+  async extraWager(handId: string, p: string, c: string, amount: number, key: string, totals: { extra: number; insurance: number }) {
+    const h = this.hands.get(handId);
+    if (h?.status !== 'active') throw new Error('Hand is not active');
+    const bal = this.debit(p, c, handId, amount, key);
+    if (bal !== null) { const x = h.players.find((y) => y.playerId === p) as any; x.bjExtra = totals.extra; x.bjInsurance = totals.insurance; }
+    return bal;
+  }
   async recordDecision(handId: string, playerId: string, d: DecisionRecord, state: { play: number; folded: boolean }) {
     if (this.decisions.some((x) => x.handId === handId && x.playerId === playerId && x.phase === d.phase)) return;
     this.decisions.push({ ...d, handId, playerId, at: new Date() });
     if (state.folded) { const hp = this.hands.get(handId)?.players.find((x) => x.playerId === playerId); if (hp) hp.folded = true; }
   }
-  async updateDecisionEV(handId: string, playerId: string, phase: string, evCost: number, exact: boolean) {
+  async updateDecisionEV(handId: string, playerId: string, phase: string, evCost: number, exact: boolean, cents?: number) {
     const d = this.decisions.find((x) => x.handId === handId && x.playerId === playerId && x.phase === phase);
-    if (d) { d.evCost = evCost; d.evExact = exact; }
+    if (d) { d.evCost = evCost; d.evExact = exact; if (cents !== undefined) d.evCostCents = cents; }
   }
 
   async settleHand(handId: string, code: string, dealer: { hand: string; qualifies: boolean }, build: SettlementBuilder) {
@@ -209,12 +220,43 @@ export class MemoryStore implements Store {
     return { hands, refunds };
   }
 
+  private rivals = new Map<string, RivalryRow>();
+  async rivalries(dealerId: string, playerIds: string[]) {
+    const out = new Map<string, RivalryRow>();
+    for (const p of playerIds) { const r = this.rivals.get(`${dealerId}|${p}`); if (r) out.set(p, structuredClone(r)); }
+    return out;
+  }
+  async bumpRivalry(dealerId: string, playerId: string, d: Partial<Record<'witnessed' | 'wins' | 'jackpots' | 'mockedThenWon', number>>, ev?: RivalryEvent) {
+    const k = `${dealerId}|${playerId}`;
+    const r = this.rivals.get(k) ?? { witnessed: 0, wins: 0, jackpots: 0, mockedThenWon: 0, events: [] };
+    r.witnessed += d.witnessed ?? 0; r.wins += d.wins ?? 0; r.jackpots += d.jackpots ?? 0; r.mockedThenWon += d.mockedThenWon ?? 0;
+    if (ev) { r.events.push(ev); if (r.events.length > 8) r.events.shift(); }
+    this.rivals.set(k, r);
+  }
+
+  async qualityHands(pid: string, game?: GameId): Promise<QHand[]> {
+    const out: QHand[] = [];
+    for (const h of [...this.hands.values()].filter((x) => x.status === 'settled' && (!game || x.game === game)).sort((a, b) => a.settledAt!.getTime() - b.settledAt!.getTime())) {
+      const p = h.players.find((x) => x.playerId === pid && x.settled);
+      if (!p) continue;
+      out.push(toQHand({
+        handId: h.id, handNumber: h.handNumber, tableCode: h.tableCode, game: h.game, at: h.settledAt!.getTime(), nightId: h.nightId,
+        mainNet: p.row?.baseNet ?? (p.net ?? 0) - (p.tripsNet ?? 0), totalNet: p.net ?? 0, folded: p.folded, hole: p.hole, community: h.community, dealer: h.dealer,
+        ante: p.ante, settlement: p.settlement,
+        decisions: this.decisions.filter((d) => d.handId === h.id && d.playerId === pid).sort((a, b) => a.at.getTime() - b.at.getTime())
+          .map((d) => ({ ...d, evCents: d.evCostCents ?? null, evCost: d.evCost ?? null })),
+      }));
+    }
+    return out;
+  }
+
   async playerStats(pid: string, game?: GameId): Promise<PlayerStats> {
     const all: { hp: HP; h: H }[] = [];
     for (const h of this.hands.values()) for (const hp of h.players) if (hp.playerId === pid && hp.settled) all.push({ hp, h });
     all.sort((a, b) => a.h.settledAt!.getTime() - b.h.settledAt!.getTime());
     const rows = game ? all.filter((r) => r.h.game === game) : all;
-    const ds = this.decisions.filter((d) => d.playerId === pid && (!game || this.hands.get(d.handId)?.game === game));
+    const ds = this.decisions.filter((d) => d.playerId === pid && d.graded !== false && (!game || this.hands.get(d.handId)?.game === game))
+      .map((d) => ({ ...d, phase: (d.phase.startsWith('bj-') ? 'bj' : d.phase) as typeof d.phase }));
     const nets = rows.map((r) => r.hp.net!);
     const best = rows.reduce<{ name: string; rank: number } | null>((b, r) => (!b || (r.hp.handRank ?? -1) > b.rank ? { name: r.hp.handName!, rank: r.hp.handRank ?? -1 } : b), null)?.name ?? null;
     const group = <K extends string>(arr: typeof ds, key: (d: (typeof ds)[0]) => K) => {

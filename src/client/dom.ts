@@ -53,6 +53,13 @@ export function modal(title: string, body: Node, opts: { wide?: boolean; onClose
   return { close, panel };
 }
 
+/** Compact money for tight spaces (seat plates): $1.25M, $3.4B. Exact amounts stay in tooltips and breakdowns. */
+export const moneyShort = (cents: number) => {
+  const a = Math.abs(cents) / 100;
+  if (a < 1_000_000) return money(cents);
+  const [v, u] = a >= 1e12 ? [a / 1e12, 'T'] : a >= 1e9 ? [a / 1e9, 'B'] : [a / 1e6, 'M'];
+  return `${cents < 0 ? '−' : ''}$${(Math.floor(v * 100) / 100).toLocaleString('en-US', { maximumFractionDigits: 2 })}${u}`;
+};
 export const money = (cents: number, sign = false) => {
   const neg = cents < 0;
   const a = Math.abs(cents);

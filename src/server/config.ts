@@ -1,6 +1,7 @@
 import type { TableConfig } from '../shared/protocol.js';
 import { cleanName } from './engine.js';
 import { DEFAULT_BACK, DEFAULT_FELT, isBack, isEffects, isFelt } from '../shared/themes.js';
+import { DEFAULT_DEALER_SETTINGS, parseDealerSettings } from '../shared/dealers.js';
 import { DEFAULT_BAD_BEAT_VARIANT, DEFAULT_PAIRS_VARIANT, isBadBeatVariant, isPairsVariant } from '../shared/sidebets.js';
 
 export const MULTI_DEFAULTS: Omit<TableConfig, 'name'> = {
@@ -8,7 +9,7 @@ export const MULTI_DEFAULTS: Omit<TableConfig, 'name'> = {
   minAnte: 500, maxAnte: 10_000, maxTrips: 2_500, maxPairs: 2_500, maxBadBeat: 2_500, startingBankroll: 100_000,
   pairsVariant: DEFAULT_PAIRS_VARIANT, badBeatVariant: DEFAULT_BAD_BEAT_VARIANT, progressive: true, felt: DEFAULT_FELT, cardBack: DEFAULT_BACK, effects: 'all',
   game: 'uth', maxPairPlus: 2_500, maxSixCard: 2_500,
-  decisionSeconds: 25, bettingSeconds: 20, solo: false,
+  decisionSeconds: 25, bettingSeconds: 20, solo: false, bjSurrender: false, dealer: DEFAULT_DEALER_SETTINGS,
 };
 
 export const SOLO_DEFAULTS: Omit<TableConfig, 'name'> = {
@@ -16,7 +17,7 @@ export const SOLO_DEFAULTS: Omit<TableConfig, 'name'> = {
   minAnte: 100, maxAnte: 50_000, maxTrips: 10_000, maxPairs: 10_000, maxBadBeat: 10_000, startingBankroll: 50_000,
   pairsVariant: DEFAULT_PAIRS_VARIANT, badBeatVariant: DEFAULT_BAD_BEAT_VARIANT, progressive: true, felt: DEFAULT_FELT, cardBack: DEFAULT_BACK, effects: 'all',
   game: 'uth', maxPairPlus: 10_000, maxSixCard: 10_000,
-  decisionSeconds: 0, bettingSeconds: 5, solo: true,
+  decisionSeconds: 0, bettingSeconds: 5, solo: true, bjSurrender: false, dealer: DEFAULT_DEALER_SETTINGS,
 };
 
 /** Build a validated config from untrusted input. Throws Error with a user-facing message. */
@@ -47,23 +48,26 @@ export function buildConfig(input: unknown, hostName: string): TableConfig {
     isPublic: solo ? false : i.isPublic === true,
     allowSpectators: solo ? false : i.allowSpectators !== false,
     maxSeats: solo ? 1 : int('maxSeats', 2, 6, base.maxSeats),
-    minAnte: dollars('minAnte', 100, 1_000_000, base.minAnte),
-    maxAnte: dollars('maxAnte', 100, 1_000_000, base.maxAnte),
+    minAnte: dollars('minAnte', 100, 100_000_000, base.minAnte),
+    maxAnte: dollars('maxAnte', 100, 100_000_000, base.maxAnte),
     maxTrips: dollars('maxTrips', 0, 1_000_000, base.maxTrips),
     maxPairs: dollars('maxPairs', 0, 1_000_000, base.maxPairs),
     maxBadBeat: dollars('maxBadBeat', 0, 1_000_000, base.maxBadBeat),
     pairsVariant: variant('pairsVariant', isPairsVariant, base.pairsVariant),
     badBeatVariant: variant('badBeatVariant', isBadBeatVariant, base.badBeatVariant),
     progressive: i.progressive !== false,
-    game: i.game === 'tcp' ? 'tcp' : 'uth',
+    game: i.game === 'tcp' || i.game === 'bj' ? i.game : 'uth',
+    bjSurrender: i.bjSurrender === true,
     maxPairPlus: dollars('maxPairPlus', 0, 1_000_000, base.maxPairPlus),
     maxSixCard: dollars('maxSixCard', 0, 1_000_000, base.maxSixCard),
     felt: variant('felt', isFelt, base.felt),
     cardBack: variant('cardBack', isBack, base.cardBack),
     effects: variant('effects', isEffects, base.effects),
-    startingBankroll: dollars('startingBankroll', 1_000, 100_000_000, base.startingBankroll),
+    startingBankroll: dollars('startingBankroll', 1_000, 100_000_000_000, base.startingBankroll),
     decisionSeconds: solo ? int('decisionSeconds', 0, 300, 0) : int('decisionSeconds', 5, 120, base.decisionSeconds),
     bettingSeconds: int('bettingSeconds', 5, 120, base.bettingSeconds),
+    // §32: private tables default to the "Asshole" attitude (v1 "Savage"); public tables to Smartass. Hosts can go up to No Mercy.
+    dealer: parseDealerSettings(i.dealer, { ...base.dealer, attitude: i.isPublic === true && !solo ? 'smartass' : 'asshole' }),
   };
   if (c.maxAnte < c.minAnte) throw new Error('Maximum ante must be at least the minimum ante.');
   if (c.startingBankroll < c.minAnte * 3) throw new Error('Starting bankroll must cover at least one minimum hand (3× the minimum ante).');

@@ -1,3 +1,4 @@
+import { GAME_NAME } from '../../shared/rules.js';
 import type { PublicTableListing } from '../../shared/protocol.js';
 import { api, restoreWithCode, session, signIn } from '../api.js';
 import { cardEl } from '../cardView.js';
@@ -77,7 +78,7 @@ export function mountHome(root: HTMLElement, nav: (path: string) => void, opts: 
       publicList.replaceChildren(tables.length ? h('table', { class: 'tables' },
         h('thead', {}, h('tr', {}, h('th', {}, 'Table'), h('th', {}, 'Game'), h('th', {}, 'Seats'), h('th', {}, 'Ante'), h('th', {}, 'Status'), h('th', {}))),
         h('tbody', {}, ...tables.map((t) => h('tr', {},
-          h('td', {}, h('div', {}, t.name), h('div', { class: 'lobby-avs' }, ...(t.players ?? []).map((p) => portrait(p.look ?? null, p.name, { cls: 'lb-av', frame: false })))), h('td', {}, t.game === 'tcp' ? 'Three Card Poker' : 'Ultimate Hold’em'), h('td', { class: 'num' }, `${t.seated} / ${t.maxSeats}`),
+          h('td', {}, h('div', {}, t.name), h('div', { class: 'lobby-avs' }, ...(t.players ?? []).map((p) => portrait(p.look ?? null, p.name, { cls: 'lb-av', frame: false })))), h('td', {}, GAME_NAME[t.game] ?? 'Ultimate Hold’em'), h('td', { class: 'num' }, `${t.seated} / ${t.maxSeats}`),
           h('td', { class: 'num' }, `${money(t.minAnte)}–${money(t.maxAnte)}`),
           h('td', {}, t.inHand ? 'Hand in progress' : 'Between hands'),
           h('td', {}, t.seated < t.maxSeats ? h('button', { class: 'btn small gold', onclick: () => nav(`/table/${t.code}`) }, 'Sit down')

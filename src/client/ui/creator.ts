@@ -1,7 +1,7 @@
 // Character Creator (§24.2–24.6): live preview, poses, randomize, per-category reset, restore saved, save, outfits.
 import {
   BODY, BROWS, EYE_COLOR, EYES, FACE, FACIAL_HAIR, HAIR, HAIR_COLOR, ITEM, MOUTH, NOSE, OUTFIT_PRESETS, PRESET_NAME, SKIN,
-  fitEquipped, randomAvatar, validateEquipped, type Appearance, type AvatarData, type Equipped, type OutfitPreset, type Slot,
+  fitEquipped, ownsItem, randomAvatar, validateEquipped, type Appearance, type AvatarData, type Equipped, type OutfitPreset, type Slot,
 } from '../../shared/cosmetics.js';
 import { renderAvatar, renderItemPreview, type Pose } from '../../shared/avatarSvg.js';
 import { catalog, credits, loadMine, saveAvatar, type CatalogItem, type Mine } from '../cosmetics.js';
@@ -14,7 +14,7 @@ const TAB_SLOTS: Partial<Record<Tab, Slot[]>> = {
   clothing: ['outfit'], accessories: ['hat', 'eyewear', 'neckwear', 'lapel', 'earrings', 'necklace', 'watch'],
   frame: ['frame', 'background'], table: ['chips', 'cardBack', 'emotes', 'victory'],
 };
-const SLOT_NAME: Record<Slot, string> = {
+const SLOT_NAME: Partial<Record<Slot, string>> = {
   outfit: 'Outfit', hat: 'Hat', eyewear: 'Eyewear', earrings: 'Earrings', necklace: 'Necklace', watch: 'Watch', neckwear: 'Tie, bow tie or scarf',
   lapel: 'Lapel & pocket', frame: 'Frame', background: 'Backdrop', chips: 'Poker chips', cardBack: 'Card backs', emotes: 'Reactions', victory: 'Victory animation',
 };
@@ -41,7 +41,7 @@ export function mountCreator(root: HTMLElement, nav: (p: string) => void) {
     ...(['left', 'front', 'right'] as Pose[]).map((p) => h('button', { class: 'seg-btn', 'data-p': p, onclick: () => { pose = p; drawPreview(); } }, p === 'front' ? 'Front' : p === 'left' ? '◂ Left' : 'Right ▸')));
 
   const owned = () => new Set(mine?.owned.map((o) => o.itemId) ?? []);
-  const canUse = (id: string) => { const it = ITEM.get(id); return !!it && (!!it.free || owned().has(id)); };
+  const canUse = (id: string) => ownsItem(owned(), id);
   const dirty = () => !!draft && !!saved && JSON.stringify(draft) !== JSON.stringify(saved);
 
   root.replaceChildren(h('main', { class: 'creator' },

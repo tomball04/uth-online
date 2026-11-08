@@ -1,3 +1,4 @@
+import { ATTITUDES, ATTITUDE_LABEL, ATTITUDE_LABEL_CLEAN, LEVEL_OF } from '../../shared/roast/meta.js';
 import type { TableView } from '../../shared/protocol.js';
 import { h, modal, toast } from '../dom.js';
 import { call } from '../net.js';
@@ -29,6 +30,23 @@ export function openSettings(opts: { inTable?: boolean; view?: () => TableView |
       if (!r.ok) toast(r.error, 'error');
     } }), h('span', {}, h('b', {}, 'Sit out'), h('small', {}, 'Keep your seat but skip hands until you uncheck this.')))) : null;
 
+  // §32: dealer banter — everything here is this player's own choice and never changes anyone else's view.
+  const rp = p.roast;
+  const rcheck = (key: 'targeting' | 'profanity' | 'subtitles' | 'speech' | 'mute', label: string, desc: string) =>
+    h('label', { class: 'radio' }, h('input', { type: 'checkbox', name: `roast-${key}`, checked: rp[key], onchange: (e: Event) => prefs.setRoast({ [key]: (e.target as HTMLInputElement).checked, ...(key === 'targeting' ? { asked: true } : {}) }) }),
+      h('span', {}, h('b', {}, label), h('small', {}, desc)));
+  const speechOk = typeof speechSynthesis !== 'undefined';
+  const dealerPrefs = h('fieldset', { 'data-testid': 'roast-prefs' }, h('legend', {}, 'Dealer'),
+    rcheck('mute', 'Mute dealer commentary', 'Hide the dealer’s banter. Game announcements still show.'),
+    h('label', {}, 'Maximum roast intensity for me',
+      h('select', { name: 'roast-max', onchange: (e: Event) => prefs.setRoast({ max: Number((e.target as HTMLSelectElement).value) as 0 | 1 | 2 | 3 | 4 }) },
+        ...ATTITUDES.map((a) => h('option', { value: String(LEVEL_OF[a]), selected: LEVEL_OF[a] === rp.max }, (rp.profanity ? ATTITUDE_LABEL : ATTITUDE_LABEL_CLEAN)[a])))),
+    rcheck('targeting', 'Roast me by name', 'Opt in to personal roasts about your plays. Off = the dealer never singles you out, at any attitude.'),
+    rcheck('profanity', 'Profanity', 'Off swaps every swear word for a clean one.'),
+    rcheck('subtitles', 'Roast subtitles', 'Captions over the table (the chat always has the text).'),
+    rcheck('speech', 'Spoken dialogue', speechOk ? 'Uses your browser’s built-in voice. Nothing is sent anywhere.' : 'Your browser has no speech voice — text only.'),
+    h('label', {}, 'Dealer voice volume', h('input', { type: 'range', min: 0, max: 100, value: rp.volume, oninput: (e: Event) => prefs.setRoast({ volume: Number((e.target as HTMLInputElement).value) }) })));
+
   const body = h('div', { class: 'stack settings' },
     radio('trainer', 'Strategy trainer', [
       ['casino', 'Casino', 'No hints during the hand. Mistakes and their outs are still shown afterwards.'],
@@ -36,14 +54,17 @@ export function openSettings(opts: { inTable?: boolean; view?: () => TableView |
       ['challenge', 'Challenge', 'No hints during the hand; every decision is graded afterwards.'],
     ]),
     h('fieldset', {}, h('legend', {}, 'Sound'), range('fxVolume', 'Effects'), range('ambientVolume', 'Casino ambience')),
+    dealerPrefs,
     radio('motion', 'Animation', [
       ['full', 'Full', 'Dealt cards, chip movement and reveals.'],
       ['fast', 'Fast play', 'The same animations at about twice the speed.'],
       ['off', 'Reduced motion', 'Cards and chips appear without movement.'],
     ]),
     h('fieldset', {}, h('legend', {}, 'Avatars'),
-      h('label', { class: 'radio' }, h('input', { type: 'checkbox', checked: p.cosmeticFx, onchange: (e: Event) => prefs.set({ cosmeticFx: (e.target as HTMLInputElement).checked }) }),
-        h('span', {}, h('b', {}, 'Cosmetic animations'), h('small', {}, 'Animated frames and victory effects from other players. Off keeps everything still on this device.')))),
+      ...(([['full', 'Full animations', 'Borders, frames and victory effects move.'], ['subtle', 'Subtle animations', 'Slow, gentle motion.'], ['static', 'Static borders', 'Borders show, nothing moves. Victory effects off.'], ['hide', 'Hide all cosmetic effects', 'Plain portraits — borders and victory effects hidden.']] as const)
+        .map(([v, t, d]) => h('label', { class: 'radio' }, h('input', { type: 'radio', name: 'fxLevel', checked: (p.fxLevel ?? 'full') === v,
+          onchange: () => prefs.set({ fxLevel: v, cosmeticFx: v === 'full' || v === 'subtle' }) }), h('span', {}, h('b', {}, t), h('small', {}, d))))),
+      h('small', { class: 'muted' }, 'Only changes what you see on this device. Other players keep their borders, and nothing you own changes.')),
     h('fieldset', {}, h('legend', {}, 'Cards'),
       h('label', { class: 'radio' }, h('input', { type: 'checkbox', checked: p.fourColorDeck, onchange: (e: Event) => prefs.set({ fourColorDeck: (e.target as HTMLInputElement).checked }) }),
         h('span', {}, h('b', {}, 'Four-colour deck'), h('small', {}, 'Blue diamonds and green clubs, easier to tell apart on small screens. Just for you.')))),

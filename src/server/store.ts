@@ -1,3 +1,5 @@
+import type { RivalryEvent, RivalryRow } from './roast.js';
+import type { QHand } from '../shared/quality.js';
 // Persistence interface. Two implementations: PgStore (production, PostgreSQL) and MemoryStore
 // (zero-config local dev and fast tests). Both enforce the same invariants:
 //   * every balance change is a ledger row with a unique tx_key (idempotent),
@@ -11,7 +13,7 @@ import type { AvatarData, PublicLook } from '../shared/cosmetics.js';
 
 export interface PlayerRow { id: string; name: string; avatar: string }
 export interface StackRow { balance: number; reloads: number; debt: number }
-export interface TableRow { code: string; hostId: string; config: TableConfig; handCounter: number; closed: boolean }
+export interface TableRow { code: string; hostId: string; config: TableConfig; handCounter: number; closed: boolean; dealer?: { dealerId: string | null; rounds: number } }
 
 export interface HandStartPlayer {
   playerId: string; seat: number; name: string; hole: string[];
@@ -93,6 +95,8 @@ export interface Store {
 
   createTable(code: string, hostId: string, config: TableConfig): Promise<void>;
   loadTable(code: string): Promise<TableRow | null>;
+  /** §25: the dealer working this table and rounds into the shift (presentation only). */
+  updateDealer(code: string, dealerId: string, rounds: number): Promise<void>;
   updateTable(code: string, p: { config?: TableConfig; hostId?: string; closed?: boolean; handCounter?: number }): Promise<void>;
 
   getStack(playerId: string, code: string): Promise<StackRow | null>;
@@ -109,8 +113,10 @@ export interface Store {
   getJackpot(): Promise<number>;
   /** Debits a Play wager. Returns new balance, or null if this tx_key was already applied. */
   wager(handId: string, playerId: string, code: string, amount: number, key: string): Promise<number | null>;
+  /** Blackjack: debits a double, split or insurance wager (idempotent by key) and records the round's running totals. */
+  extraWager(handId: string, playerId: string, code: string, amount: number, key: string, totals: { extra: number; insurance: number }): Promise<number | null>;
   recordDecision(handId: string, playerId: string, d: DecisionRecord, state: { play: number; folded: boolean }): Promise<void>;
-  updateDecisionEV(handId: string, playerId: string, phase: string, evCost: number, exact: boolean): Promise<void>;
+  updateDecisionEV(handId: string, playerId: string, phase: string, evCost: number, exact: boolean, cents?: number): Promise<void>;
   /**
    * Atomically credits payouts. `build` is called inside the transaction with the locked progressive meter and
    * returns the final rows plus the meter after any jackpot awards. `applied` is false if already settled/voided.
@@ -122,6 +128,11 @@ export interface Store {
 
   /** Statistics for one game, or all games when `game` is omitted. The bankroll series always covers every game. */
   playerStats(playerId: string, game?: GameId): Promise<PlayerStats>;
+  /** §31: every settled hand for this player with its recorded decisions (oldest first). */
+  qualityHands(playerId: string, game?: GameId): Promise<QHand[]>;
+  /** §32: comedic dealer-vs-player records (never read by dealing or settlement). */
+  rivalries(dealerId: string, playerIds: string[]): Promise<Map<string, RivalryRow>>;
+  bumpRivalry(dealerId: string, playerId: string, d: Partial<Record<'witnessed' | 'wins' | 'jackpots' | 'mockedThenWon', number>>, ev?: RivalryEvent): Promise<void>;
   recentHands(code: string, limit: number): Promise<RecentHandRow[]>;
   handReplay(handId: string): Promise<ReplayData | null>;
   /**
@@ -165,3 +176,22 @@ export type SettlementBuilder = (jackpot: number) => {
 export const JACKPOT_ID = 'five-card-5';
 
 export class InsufficientFunds extends Error {}
+
+/** Normalizes a raw row from either store into a §31 QHand (fills EV cents from ante units for older rows). */
+export function toQHand(x: {
+  handId: string; handNumber: number; tableCode: string; game: GameId; at: number; nightId: string | null; mainNet: number; totalNet: number;
+  folded: boolean; hole: string[]; community: string[]; dealer: string[]; ante: number; settlement: unknown; decisions: any[];
+}): QHand {
+  const st = x.game === 'bj' && x.settlement && typeof x.settlement === 'object' ? x.settlement as { hands?: { cards: string[] }[]; dealer?: string[] } : null;
+  return {
+    handId: x.handId, handNumber: x.handNumber, tableCode: x.tableCode, game: x.game, at: x.at, nightId: x.nightId,
+    mainNet: x.mainNet, totalNet: x.totalNet, folded: x.folded, hole: x.hole, community: x.game === 'uth' ? x.community : [],
+    dealer: st?.dealer ?? x.dealer, bjHands: st?.hands?.map((h) => h.cards),
+    decisions: x.decisions.map((d) => {
+      const evCost = d.evCost === null || d.evCost === undefined ? null : Number(d.evCost);
+      const evCents = d.evCents !== null && d.evCents !== undefined ? Number(d.evCents) : evCost !== null ? Math.round(evCost * x.ante) : null;
+      return { phase: d.phase, action: d.action, recommended: d.recommended, correct: !!d.correct, graded: d.graded !== false, timedOut: !!d.timedOut,
+        reason: d.reason ?? '', evCost: d.correct ? 0 : evCost, evCents: d.correct ? 0 : evCents };
+    }),
+  };
+}

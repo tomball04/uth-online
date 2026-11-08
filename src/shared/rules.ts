@@ -242,8 +242,22 @@ export interface InitialBets { ante: number; trips: number; pairs: number; badBe
 export const NO_BETS: InitialBets = { ante: 0, trips: 0, pairs: 0, badBeat: 0, progressive: 0, pairPlus: 0, sixCard: 0 };
 export const sideTotal = (b: { trips: number; pairs?: number; badBeat?: number; progressive?: number; pairPlus?: number; sixCard?: number }) =>
   b.trips + (b.pairs ?? 0) + (b.badBeat ?? 0) + (b.progressive ?? 0) + (b.pairPlus ?? 0) + (b.sixCard ?? 0);
-export type GameId = 'uth' | 'tcp';
-export const GAME_NAME: Record<GameId, string> = { uth: 'Ultimate Texas Hold’em', tcp: 'Three Card Poker' };
+export type GameId = 'uth' | 'tcp' | 'bj';
+export const GAME_NAME: Record<GameId, string> = { uth: 'Ultimate Texas Hold’em', tcp: 'Three Card Poker', bj: 'Blackjack' };
+export const GAMES: GameId[] = ['uth', 'tcp', 'bj'];
+export const isGame = (x: unknown): x is GameId => x === 'uth' || x === 'tcp' || x === 'bj';
+/** Blackjack: one main wager per player, no side bets. Whole dollars keep 3:2 and half-bet insurance exact. */
+export function validateBjBet(b: InitialBets, balance: number, limits: { minAnte: number; maxAnte: number }): string | null {
+  const vals = [b.ante, b.trips, b.pairs, b.badBeat, b.progressive, b.pairPlus, b.sixCard];
+  if (!vals.every((x) => typeof x === 'number' && Number.isSafeInteger(x))) return 'Bets must be whole amounts.';
+  if (vals.some((x) => x < 0)) return 'Bets cannot be negative.';
+  if (vals.slice(1).some((x) => x > 0)) return 'Blackjack has a single wager — no side bets at this table.';
+  if (b.ante < limits.minAnte) return `Minimum bet is $${limits.minAnte / 100}.`;
+  if (b.ante > limits.maxAnte) return `Maximum bet is $${limits.maxAnte / 100}.`;
+  if (b.ante % 100) return 'Blackjack bets are whole dollars.';
+  if (b.ante > balance) return 'Not enough chips for that bet.';
+  return null;
+}
 
 /** Amount that must be available to start a hand: Ante + Blind + every side bet + a reserved 1x Play. */
 export function requiredToStart(ante: number, sideBets = 0): number {

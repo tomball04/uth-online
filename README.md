@@ -187,6 +187,68 @@ Every player has an illustrated 2D portrait (layered SVG, `src/shared/avatarSvg.
 * **Server-authoritative:** the server alone decides ownership and balances. Saved looks are re-validated against the bundled catalog (only enumerated values; no markup, SVG or URLs are ever stored or rendered). Purchases carry an idempotency key, lock the wallet row, and can never go negative; a retried purchase is answered `duplicate` and not charged.
 * **Prices are configurable** without code changes: `COSMETIC_PRICES='{"fedora-black":200}'`, `STYLE_REWARDS='{"welcome":500}'`, `COSMETIC_UNAVAILABLE='["tux-white"]'` (items already owned stay usable). There are no real-money purchases; adding any would need a separate, approved project.
 
+## Rotating dealers (scope addendum §25–26)
+
+Twelve dealers take turns at every table: Vincent, Sophia, Marcus, Elena, James, Naomi, Rafael, Claire, André, Victoria, Daniel and Isabella (`src/shared/dealers.ts`). Each has one appearance definition (skin, face, hair, uniform) used everywhere they appear, an introduction, a personality and their own chat lines and voice cue. **Dealers are presentation only** — every dealer deals the same shuffled deck, the same rules and the same odds; the shuffle never looks at who is dealing.
+
+* **Shift:** the dealer hands over after **25 completed rounds** (counted only when a hand's settlement is applied — voided hands don't count), after the results, never mid-hand, and never to the same dealer. The count belongs to the table and carries across game switches and restarts (`game_tables.dealer_id`, `dealer_rounds`, migration `010_dealers.sql`).
+* **Early hand-over after a major win:** a single player's main-game or bonus win of at least the greater of **$2,500** or **100× their opening wager**, or a progressive payout of **$10,000** or more. Uses settled results only.
+* **Host settings** (Host controls → Dealer): rotation on/off, every 10 / 25 / 50 / 100 rounds, major-win hand-overs and thresholds, introduction full / short / off, chatter often / normal / rare / off, voice volume; pick a specific dealer between hands.
+* **Animations:** greeting, dealing, waiting, win and loss expressions; on a hand-over the outgoing dealer waves and slides out and the new one slides in with an introduction card. All respect reduced motion.
+* **Character consistency (§26):** every avatar (players and dealers) is drawn from one definition by one renderer. Hair is anchored to each face shape (`hairFit`) and drawn in three layers (back, front, under-hat clipped at the hat line — never reshaped), so the same person looks identical in the creator, the lobby, a desktop or phone seat, chat, results and replays. Unit tests compare the hair markup across contexts; the browser test compares it between the creator, lobby and two devices at the table.
+
+## Blackjack (scope addendum §27)
+
+The host can switch any table to **Blackjack** between hands (Host controls → Game) — players keep their seats and chips.
+
+* **Rules (`bj-2026.11`, shown before betting):** six decks with a visible shoe, cut card (reshuffle after ~75%) and discard tray; Blackjack pays **3:2** (exact, $1 → $1.50); dealer **stands on all 17s**; double on any first two cards, including after splits; split up to 4 hands; no resplitting aces, split aces get one card each; 21 after a split pays 1:1; insurance up to half the bet on a dealer Ace, pays 2:1; dealer **peeks** with an Ace or ten showing; late surrender optional (host setting, off by default).
+* **Turns:** players act in seat order, one at a time, on a server timer (time out → Stand; insurance time out → decline). Double and split need a second bet equal to the original wager, checked by the server.
+* **Layout:** dedicated felt print, dealer hand, shoe and discard tray; split hands shown side by side (compact on phones).
+* **Trainer:** Casino (no hints), Training (best play highlighted with the reason), Challenge (graded after the hand) and a **practice drill** (☰ → Blackjack practice, no chips). Advice and grading follow the active rules; decisions where the recommended double/split was unaffordable are recorded as *constrained* and not graded. Blackjack accuracy is tracked separately in Statistics.
+* **Storage:** `hands.game='bj'`, `hand_players.bj_extra` (doubles/splits) and `bj_insurance`, `decisions.graded` and `decisions.ev_cost_cents` (migration `011_blackjack.sql`).
+
+## Chips (scope addendum §28)
+
+Nine denominations: **$1, $5, $25, $100, $500, $1,000, $5,000, $25,000 and the $100,000 plaque**. The rack shows the five most useful values for the table's limits plus a **high-limit tray**; bet spots show consolidated stacks (largest chips first) and balances of $1M+ are shortened on seat plates (exact in tooltips and results). Limits go up to a $1,000,000 Ante and a $1,000,000,000 starting bankroll.
+
+**Fifteen chip collections × nine designs** (Classic Vegas free; Emerald Elite, Midnight Blue, Crimson, Vintage Poker, Art Deco, Desert, Saloon, Royal, Platinum, Neon, Marble, Carbon, Cosmic, Diamond Reserve), all procedural SVG. Boutique → *Custom Poker Chips*: spinning 3D preview, preview on the felt, buy the whole set or a single denomination (a fifth of the set price), equip a set for your tray, override single denominations, unequip, back to Classic. A design never changes what a chip is worth.
+
+## Animated borders (scope addendum §29)
+
+Fifteen animated portrait borders in four price tiers (250–2,500 Style Credits): Golden Halo, Emerald Pulse, Midnight Neon, Royal Diamonds, Platinum Orbit, Card Shark, Vegas Lights, Black Smoke, Art Deco, Crimson Flame, Electric Ace, High Roller, Cosmic, Royal Flush and Diamond Crown. Each is a distinct CSS animation of transforms and opacity only (GPU-friendly), drawn inside the portrait circle so it never covers cards or seats.
+
+* **Settings → Avatars:** *Full*, *Subtle* (slow), *Static* (no motion) or *Hide all cosmetic effects*. Local to your device; other players are unaffected.
+* Animations pause while a portrait is scrolled off-screen or the tab is hidden, stop under reduced motion and when the host sets table effects to Subtle, and are hidden when the host turns effects off.
+
+## Decision Quality vs. Results — "Wrong Call Wins" (scope addendum §31)
+
+Statistics → **Decision Quality vs. Results** separates how you played from how the cards fell, for Ultimate Hold'em, Three Card Poker and Blackjack:
+
+* Every completed round is classified once (a split Blackjack round counts once): **wrong call** (at least one graded decision differed from the strategy), **right call** (graded decisions and no deviation) or **ungraded** (nothing gradable — e.g. a natural, or only an unaffordable double/split). The result is the sign of the **main-game** net: side bets, bonuses, the progressive and insurance never turn a loss into a win, and a folded hand is a loss even if its bonus bet paid.
+* Shown: Wrong Call Wins / Losses / Pushes, Right Call Wins / Losses / Pushes, Ungraded (all of which add up to the rounds played), Wrong Call Win Rate (= wrong-call wins ÷ all hands with a wrong call), Right Call Win Rate, hands with a deviation and individual mistakes, total EV lost, and the profit from Wrong Call Wins (labelled as luck). Lifetime, current session (latest run of hands without an hour's gap, across tables and games) and per-game tabs.
+* **Hand history** filter **Wrong Call Wins** (plus Wrong Call Losses, Right Call Losses, all wrong calls, ungraded, all): game, hand number, your cards, the board and dealer cards, each wrong action with the recommended action, the reason and its EV cost, the main-game result (and the total with side bets) and whether you won despite the mistake.
+* **EV cost** is fixed when the decision is recorded and never changes with the result. Hold'em: exact on the river, trainer EV on earlier streets; Three Card Poker: exact; Blackjack: infinite-deck, dealer-peeked calculation (within a few thousandths of a bet of six-deck values), insurance at 1/13 of the stake.
+* Computed only on the server from the immutable `decisions` rows and settled `hand_players` rows (`GET /api/stats/quality`, `GET /api/stats/history`); there is no endpoint to submit a classification or change a counter.
+
+## Dealer Roast Engine (scope addendum §32)
+
+The dealers trash-talk bad plays, by name, in their own voices — profanity-heavy at the top settings, and only for players who opt in. **Presentation only:** the roast engine reads settled, public facts after the fact; it never touches the shuffle, the cards, settlement or networking, and nothing waits on it.
+
+* **Dealer Attitude** (Host controls → Dealer): Professional · Smartass · Asshole · Complete Fucking Menace · No Mercy. Private tables start at Asshole, public tables at Smartass. It's the table's *maximum*.
+* **Consent and personal controls** (asked on your first hand at a roasting table; Settings → Dealer any time): roast me by name (off until you say yes — at any attitude, the dealer never singles out someone who hasn't opted in), maximum intensity for me (also caps lines aimed at you), profanity on/off (swaps every swear word), subtitles, spoken dialogue (your browser's own speech voice; nothing is sent anywhere), dealer voice volume, mute dealer commentary. All of it is per device and never changes anyone else's view.
+* **Only verified claims:** a dealer calls a play a mistake only when the strategy engine graded it wrong (constrained or ungraded decisions never count). Counts like "your 7th wrong-call win tonight" are real, recomputed from the database after a restart. Hold'em and Three Card Poker roasts wait until the hand is settled and every card is face up; Blackjack cards are public, so hitting 20 or splitting tens gets a short remark straight away.
+* **Engine:** priorities (jackpots > Blackjack blunders > Wrong Call Wins > folds > …), per-player and per-situation cooldowns, at most one personal and one group line per round, never the same line within the last 100 comments (when a situation runs dry the dealer stays quiet), rare meltdowns (Menace and No Mercy only, at most once per 30 rounds), and comedic dealer-vs-player records (`dealer_rivalries`, migration `012_roast.sql`) for grudge callbacks — never read by dealing or payouts. No external AI or voice service is used.
+* **Library:** `src/shared/roast/lines.ts` (one section per situation), every line tagged with id, dealer, category, intensity, facts it needs, profanity class, size, priority, cooldown and speech style. A content test checks 15+ distinct lines per dealer per authored category, no shared lines between dealers, and that the clean filter removes every swear word.
+
+* **Rivalry callbacks:** once per shift, a dealer who has already dealt a consenting player 25+ hands on earlier shifts says so with the real count from `dealer_rivalries.witnessed` (one per settled hand that dealer dealt them).
+* **When the dealer changes:** at a roasting table the outgoing dealer's farewell, the shift-end note and the new dealer's introduction come from the library; at a Professional table (or Intro off) the original fixed lines are used.
+
+**Library status: complete — 6,300 lines.** All 25 primary situations × 12 dealers × 15 lines = **4,500**, plus all 10 additional pools × 12 × 15 = **1,800** (introductions, farewells, greetings, chat comebacks, meltdowns, Blackjack naturals, comeback wins, rivalry callbacks, side-bet wins, improbable hands). Each dealer/situation has 3 Smartass, 4 Asshole, 4 Complete Menace and 4 No Mercy lines. Run `npx vitest run tests/unit -t roast` to print the exact report.
+
+To add or change lines, edit the situation's section in `src/shared/roast/lines.ts` (format `'<level>|<text>'`, facts in braces such as `{name}` or `{total}`); the content test catches duplicates, recycled jokes, unknown facts and banned subjects.
+
+**Project layout: 99 files.** To keep the project at 99 files, the roast lines live in a single `lines.ts`, all unit tests are in `tests/unit/all.test.ts` and all integration tests are in `tests/integration/all.test.ts` (one `describe` section per former file; `tests/integration/harness.ts` is unchanged). Run one area with `-t`, e.g. `npx vitest run -t blackjack`.
+
 ## Using it
 
 * **Create a private table** → copy the invite link (`/table/XXXXXXXX`) → friends open it, pick a name, and land in a free seat.
@@ -204,6 +266,6 @@ Every player has an illustrated 2D portrait (layered SVG, `src/shared/avatarSvg.
 * **Pay off and the pawn shop:** between hands, tap *Pay off* next to your IOU to pay markers back from your stack — your winnings above a starting stack, or everything in front of you. The Tonight tab keeps a running *Pawn shop* list of every marker and payoff at the table (who pawned what, for how much, and what they still owe; paying in full gets the item back). Payoffs are ledger rows (kind `reload`, negative), so the chips check still balances. Migration `007_pawn_shop.sql`.
 * **Rules version:** `2026.11`, recorded on every hand and shown in the pay tables and replays.
 * **Restore code:** Settings → Use another device shows a private code; paste it under *Have a restore code?* on another device to play as the same guest.
-* **Debt counter (just for fun):** each reload is a "marker" from the house. The marker total is kept per table (`stacks.debt`, migration `005_debt.sql`), shown under the player's balance as *IOU $…* and in the dock, and totalled in Statistics. Every new marker gets a dealer joke in chat plus the cheapest thing you could pawn to cover the whole debt — from your AirPods up to a private island (`src/shared/debt.ts`). Virtual chips only; debt never changes balances or payouts.
+* **Debt counter (just for fun):** each reload is a "marker" from the house. The marker total is kept per table (`stacks.debt`, migration `005_debt.sql`), shown under the player's balance as *IOU $…* and in the dock, and totalled in Statistics. Every new marker gets a dealer joke in chat (25 of them, rotating) and something to pawn that covers the whole debt, picked at random from that price level: 15 items at every $1,000 step up to $10,000, then 8 each at $20k, $60k, $250k, $1M and $20M — from your AirPods to a private island. The pawn shop remembers exactly what each player pawned, and paying in full gets that same item back. To add or change items or jokes, edit the lists at the top of `src/shared/debt.ts` (instructions are in the file). Virtual chips only; debt never changes balances or payouts.
 * **Phones:** one compact top bar (back, table name, jackpot, Chat, ☰ menu with Invite, History, Host controls, Settings, Rules, Leave); seat cards use large corner indices instead of a centre pip; status shows as small tags (Ready / Folded / Away) instead of text under the plate; the table stretches to fill the screen (no dark side margins) with larger cards; Ante, Blind, Play and a round Bonus button share one evenly spaced row (Bonus opens the side-bet circles underneath); between hands the bet controls use the full width; the dock scrolls if a result is long.
 * **Keyboard**: 4 / 3 / 2 / 1 to play, C check, F fold, Enter to deal in.

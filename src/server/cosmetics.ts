@@ -2,7 +2,7 @@
 // The server alone decides ownership and balances. Nothing here reads or writes casino chips.
 
 import {
-  CATALOG, COLLECTIONS, DEFAULT_AVATAR, ITEM, OUTFIT_PRESETS, REWARD, REWARDS, cleanEquipped, collectionItems, fitEquipped,
+  CATALOG, COLLECTIONS, DEFAULT_AVATAR, ITEM, OUTFIT_PRESETS, ownsItem, REWARD, REWARDS, cleanEquipped, collectionItems, fitEquipped,
   parseAppearance, validateEquipped, type AvatarData, type Equipped, type Item, type OutfitPreset, type PublicLook,
 } from '../shared/cosmetics.js';
 import type { Store } from './store.js';
@@ -117,6 +117,8 @@ export class Cosmetics {
     if (!it.available || this.hidden.has(it.id)) throw new CosmeticError(`${it.name} isn’t available right now.`);
     const price = this.price(it.id);
     return this.serial(pid, async () => {
+      const { st, owned } = await this.ownedSet(pid);
+      if (it.chipOf && ownsItem(owned, it.id)) return { status: 'owned' as const, balance: st.balance, item: it.id, bonus: null };
       const r = await this.store.purchase(pid, it.id, price, `buy:${pid}:${key}`, it.name);
       if (r.status === 'insufficient') throw new CosmeticError(`Not enough Style Credits — ${it.name} costs ${price}.`);
       let bonus: string | null = null;
@@ -136,7 +138,7 @@ export class Cosmetics {
   }
 
   /** Owned = bought, earned or a free item. */
-  owns(owned: Set<string>, id: string) { const it = ITEM.get(id); return !!it && (!!it.free || owned.has(id)); }
+  owns(owned: Set<string>, id: string) { return ownsItem(owned, id); }
 
   /** The player's saved look, or a default. */
   async look(pid: string): Promise<AvatarData> {

@@ -79,6 +79,17 @@ Set any of these as environment variables (JSON). Leave them out to use the buil
 
 Item and reward ids are listed in `src/shared/cosmetics.ts`.
 
+## What the newer releases add to the database
+
+Migrations run on start, in order, once each, and only add tables and columns:
+
+* `009_cosmetics.sql` — avatars, Style Credits, owned items (§24; chips and borders reuse it — no new table).
+* `010_dealers.sql` — `game_tables.dealer_id`, `dealer_rounds` (rotating dealers, §25).
+* `011_blackjack.sql` — `'bj'` allowed in the game checks; `hand_players.bj_extra`, `bj_insurance`; `decisions.graded`, `decisions.ev_cost_cents` (§27, §31).
+* `012_roast.sql` — `dealer_rivalries` (comedic dealer-vs-player records for §32 roasts; never read by dealing or settlement). `witnessed` = settled hands that dealer has dealt the player; it feeds the rivalry callback (25+). No schema change: in builds before the complete library it counted mistakes, so old rows start from that total.
+
+No new environment variables are required. The roast engine needs no external API (it works offline). Dealer attitude, dealer rotation, Blackjack surrender and table limits are host settings per table. Chip collections (`chips-*`, `chip-<collection>-<value>`) and borders (`border-*`) are ordinary Boutique items, so `COSMETIC_PRICES` and `COSMETIC_UNAVAILABLE` work for them too. Decision-quality statistics are computed on request from existing rows — nothing to backfill; hands recorded before migration 011 count as graded, and their EV comes from the stored ante-unit EV.
+
 ## Operations
 
 * **Backups:** the database holds identities, stacks, hand history, nights and the ledger. Neon keeps a point-in-time restore window (its length depends on your plan); for a longer history run `pg_dump "$DATABASE_URL" > uth-$(date +%F).sql` now and then and keep the file. Restoring is `psql "$DATABASE_URL" < file.sql` into an empty database.

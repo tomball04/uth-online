@@ -3,11 +3,51 @@
 // Everything except the frame is clipped to the portrait circle, so hats and hair can never spill onto cards
 // or neighboring seats.
 
-import { DEFAULT_APPEARANCE, EYE_COLOR, HAIR_COLOR, ITEM, SKIN, parseAppearance, cleanEquipped, type Appearance, type Equipped, type Item } from './cosmetics.js';
+import { DEFAULT_APPEARANCE, EYE_COLOR, HAIR_COLOR, ITEM, SKIN, SLOTS, parseAppearance, type Appearance, type Equipped, type Item } from './cosmetics.js';
+import { DEALER_ITEMS } from './dealers.js';
+import { CHIP_COLLECTIONS, renderChip, type ChipCollectionId, type Denom } from './chips.js';
+const COLLECTION_IDS: Record<string, true> = Object.fromEntries(CHIP_COLLECTIONS.map((c) => [c.id, true]));
+
+/** Everything the renderer can draw: the catalog plus dealer-only uniforms (rendering only). */
+const RENDER_ITEM = new Map<string, Item>([...ITEM, ...DEALER_ITEMS.map((i) => [i.id, i] as [string, Item])]);
+function cleanEquipped(eq: unknown): Equipped {
+  const out: Equipped = {};
+  if (!eq || typeof eq !== 'object') return out;
+  for (const [slot, id] of Object.entries(eq as Record<string, unknown>)) {
+    if ((SLOTS as readonly string[]).includes(slot) && typeof id === 'string' && RENDER_ITEM.get(id)?.slot === slot) out[slot as keyof Equipped] = id;
+  }
+  return out;
+}
 
 export type Pose = 'front' | 'left' | 'right';
 export type Crop = 'face' | 'chest' | 'wrist';
-export interface RenderOpts { pose?: Pose; frame?: boolean; background?: boolean; id?: string; crop?: Crop }
+/**
+ * Momentary expression (dealer reactions, results). Changes only eyes, brows and mouth — never hair, head
+ * shape or clothing — so the character always stays recognisably the same person (§26).
+ */
+export type Expression = 'neutral' | 'smile' | 'grin' | 'laugh' | 'surprised' | 'wink' | 'concerned' | 'focused';
+export const EXPRESSIONS: Expression[] = ['neutral', 'smile', 'grin', 'laugh', 'surprised', 'wink', 'concerned', 'focused'];
+export interface RenderOpts { pose?: Pose; frame?: boolean; background?: boolean; id?: string; crop?: Crop; expression?: Expression }
+
+/**
+ * Head anchors per face shape (§26.2). Hair, hats and facial hair are drawn once in a canonical head space
+ * (half-width 17, crown at y=23, chin at y=65, centre x=50) and fitted to the actual head with one transform,
+ * so a hairstyle has exactly the same geometry on every face, pose, expression and size.
+ */
+export const HEAD: Record<Appearance['face'], { w: number; top: number; chin: number }> = {
+  oval: { w: 17, top: 23, chin: 65 },
+  round: { w: 18.5, top: 24.5, chin: 63.5 },
+  long: { w: 15.5, top: 22, chin: 66 },
+  square: { w: 17, top: 23, chin: 65 },
+  heart: { w: 17.5, top: 23, chin: 65 },
+};
+const r2 = (n: number) => Math.round(n * 1000) / 1000;
+/** Fits canonical hair/hat space to this head. */
+export const hairFit = (face: Appearance['face']) => { const h = HEAD[face]; return `translate(50 ${r2(h.top - 23)}) scale(${r2(h.w / 17)} 1) translate(-50 0)`; };
+/** Fits canonical jaw space (facial hair) to this head. */
+const jawFit = (face: Appearance['face']) => { const h = HEAD[face]; return `translate(50 44) scale(${r2(h.w / 17)} ${r2((h.chin - 44) / 21)}) translate(-50 -44)`; };
+/** Where a hat's crown meets the head: hair above this line is under the hat. */
+const HAT_LINE: Record<string, number | undefined> = { fedora: 26.5, cowboy: 27, cap: 25.5 };
 const CROP: Record<Crop, string> = { face: '20 8 60 60', chest: '22 52 56 48', wrist: '48 66 34 34' };
 
 let uid = 0;
@@ -21,7 +61,7 @@ const safeColor = (c: string | undefined, d: string) => (c && /^#[0-9a-fA-F]{3,6
 
 function item(eq: Equipped, slot: keyof Equipped): Item | undefined {
   const id = eq[slot];
-  const it = id ? ITEM.get(id) : undefined;
+  const it = id ? RENDER_ITEM.get(id) : undefined;
   return it && it.slot === slot ? it : undefined;
 }
 
@@ -37,12 +77,15 @@ function faceShape(face: Appearance['face'], skin: string) {
   }
 }
 
-function eyes(a: Appearance, dx: number) {
+function eyes(a: Appearance, dx: number, ex?: Expression) {
   const iris = EYE_COLOR[a.eyeColor] ?? EYE_COLOR[0];
   const out: string[] = [];
   for (const x of [43 + dx, 57 + dx]) {
-    if (a.eyes === 'smiling') { out.push(`<path d="M${x - 2.8} 43 Q${x} 40.4 ${x + 2.8} 43" fill="none" stroke="#2a1d14" stroke-width="1.1" stroke-linecap="round"/>`); continue; }
-    const [rx, ry] = a.eyes === 'round' ? [2.4, 2.2] : a.eyes === 'wide' ? [3, 1.9] : [2.7, 1.6];
+    const closed = (ex === 'wink' && x > 50) || ex === 'laugh' || (!ex && a.eyes === 'smiling');
+    if (closed) { out.push(`<path d="M${x - 2.8} 43 Q${x} 40.4 ${x + 2.8} 43" fill="none" stroke="#2a1d14" stroke-width="1.1" stroke-linecap="round"/>`); continue; }
+    let [rx, ry] = a.eyes === 'round' ? [2.4, 2.2] : a.eyes === 'wide' || a.eyes === 'smiling' ? [3, 1.9] : [2.7, 1.6];
+    if (ex === 'surprised') { rx += 0.3; ry += 0.8; }
+    if (ex === 'focused') ry = Math.max(1.1, ry - 0.5);
     out.push(`<ellipse cx="${x}" cy="42.5" rx="${rx}" ry="${ry}" fill="#fbfaf7"/>`);
     out.push(`<circle cx="${x + dx * 0.15}" cy="42.6" r="1.35" fill="${iris}"/><circle cx="${x + dx * 0.15}" cy="42.6" r="0.6" fill="#120c08"/>`);
     out.push(`<circle cx="${x + 0.5}" cy="42" r="0.35" fill="#fff"/>`);
@@ -51,15 +94,18 @@ function eyes(a: Appearance, dx: number) {
   return out.join('');
 }
 
-function brows(a: Appearance, dx: number, hair: string) {
+function brows(a: Appearance, dx: number, hair: string, ex?: Expression) {
+  const lift = ex === 'surprised' ? -1.6 : ex === 'concerned' ? -0.6 : ex === 'focused' ? 0.6 : 0;
   const c = a.hair === 'bald' || a.hair === 'buzz' ? shade(hair, 0.1) : hair;
   const w = a.brows === 'bold' ? 1.8 : a.brows === 'thin' ? 0.7 : 1.15;
   return [43 + dx, 57 + dx].map((x, i) => {
     const s = i === 0 ? -1 : 1;
     const outer = x + 3.2 * s, inner = x - 2.6 * s;
-    const d = a.brows === 'straight' ? `M${inner} 38.4 L${outer} 38.2`
-      : a.brows === 'arched' ? `M${inner} 38.8 Q${x + 0.8 * s} 35.6 ${outer} 38.6`
-      : `M${inner} 38.6 Q${x} 37 ${outer} 38.4`;
+    const tilt = ex === 'concerned' ? -1.2 : ex === 'focused' ? 0.8 : 0;   // inner end up (worried) or down (focused)
+    const yi = (v: number) => r2(v + lift + tilt), yo = (v: number) => r2(v + lift);
+    const d = a.brows === 'straight' ? `M${inner} ${yi(38.4)} L${outer} ${yo(38.2)}`
+      : a.brows === 'arched' ? `M${inner} ${yi(38.8)} Q${x + 0.8 * s} ${yo(35.6)} ${outer} ${yo(38.6)}`
+      : `M${inner} ${yi(38.6)} Q${x} ${yo(37)} ${outer} ${yo(38.4)}`;
     return `<path d="${d}" fill="none" stroke="${c}" stroke-width="${w}" stroke-linecap="round"/>`;
   }).join('');
 }
@@ -75,9 +121,12 @@ function nose(a: Appearance, dx: number, skin: string) {
   }
 }
 
-function mouth(a: Appearance, dx: number) {
+const EXPR_MOUTH: Partial<Record<Expression, Appearance['mouth']>> = { neutral: 'neutral', smile: 'smile', grin: 'grin', laugh: 'laugh', wink: 'smirk', focused: 'neutral' };
+function mouth(a: Appearance, dx: number, ex?: Expression) {
   const x = 50 + dx, lip = '#9b4a43';
-  switch (a.mouth) {
+  if (ex === 'surprised') return `<ellipse cx="${x}" cy="55.6" rx="2.2" ry="2.6" fill="#5a1f1b"/>`;
+  if (ex === 'concerned') return `<path d="M${x - 3.8} 56.2 Q${x} 54.2 ${x + 3.8} 56.2" fill="none" stroke="${lip}" stroke-width="1.1" stroke-linecap="round"/>`;
+  switch ((ex && EXPR_MOUTH[ex]) || a.mouth) {
     case 'grin': return `<path d="M${x - 5} 54.4 Q${x} 59.4 ${x + 5} 54.4 Z" fill="#5a1f1b"/><path d="M${x - 4.4} 54.8 L${x + 4.4} 54.8 L${x + 3.6} 56 L${x - 3.6} 56 Z" fill="#fbfaf7"/>`;
     case 'neutral': return `<path d="M${x - 3.6} 55.2 L${x + 3.6} 55.2" stroke="${lip}" stroke-width="1.1" stroke-linecap="round"/>`;
     case 'smirk': return `<path d="M${x - 3.8} 55.4 Q${x + 0.5} 56.2 ${x + 4} 53.8" fill="none" stroke="${lip}" stroke-width="1.1" stroke-linecap="round"/>`;
@@ -86,8 +135,8 @@ function mouth(a: Appearance, dx: number) {
   }
 }
 
-function facialHair(a: Appearance, dx: number, hair: string) {
-  const x = 50 + dx;
+function facialHair(a: Appearance, hair: string) {
+  const x = 50;
   switch (a.facialHair) {
     case 'stubble': return `<path d="M35 50 Q37 64 50 65.5 Q63 64 65 50 Q60 58 50 58.5 Q40 58 35 50 Z" fill="${hair}" opacity="0.22"/>`;
     case 'mustache': return `<path d="M${x - 5.5} 53.2 Q${x - 2.5} 50.6 ${x} 52 Q${x + 2.5} 50.6 ${x + 5.5} 53.2 Q${x} 53.6 ${x - 5.5} 53.2 Z" fill="${hair}"/>`;
@@ -113,10 +162,10 @@ function hairBack(a: Appearance, c: string) {
 }
 
 /** Hair drawn over the forehead. */
-function hairFront(a: Appearance, c: string, dx: number) {
+function hairFront(a: Appearance, c: string) {
   const hi = shade(c, 0.18);
   switch (a.hair) {
-    case 'bald': return `<ellipse cx="${45 + dx}" cy="28" rx="5" ry="2.2" fill="#fff" opacity="0.14"/>`;
+    case 'bald': return `<ellipse cx="45" cy="28" rx="5" ry="2.2" fill="#fff" opacity="0.14"/>`;
     case 'buzz': return `<path d="M33 38 Q32 22 50 22 Q68 22 67 38 Q64 28 50 27.5 Q36 28 33 38 Z" fill="${c}" opacity="0.55"/>`;
     case 'short': return `<path d="M32.4 40 Q30 19 50 19.5 Q70 19 67.6 40 Q66 30 60 28 Q50 31 42 28.5 Q35 30 32.4 40 Z" fill="${c}"/>`;
     case 'side-part': return `<path d="M32.4 41 Q30 19 50 19 Q70 19 67.6 41 Q66 31 62 28 Q48 33 38 30 Q34 34 32.4 41 Z" fill="${c}"/><path d="M41 21.5 Q40 26 38.6 30" stroke="${hi}" stroke-width="0.8" fill="none"/>`;
@@ -132,13 +181,14 @@ function hairFront(a: Appearance, c: string, dx: number) {
   }
 }
 
-function ears(skin: string, it: Item | undefined) {
-  const e = `<ellipse cx="32.4" cy="45" rx="2.6" ry="4" fill="${skin}" stroke="${shade(skin, -0.25)}" stroke-width="0.6"/><ellipse cx="67.6" cy="45" rx="2.6" ry="4" fill="${skin}" stroke="${shade(skin, -0.25)}" stroke-width="0.6"/>`;
+function ears(skin: string, it: Item | undefined, face: Appearance['face'] = 'oval') {
+  const L = r2(50 - HEAD[face].w - 0.6), R = r2(50 + HEAD[face].w + 0.6);
+  const e = `<ellipse cx="${L}" cy="45" rx="2.6" ry="4" fill="${skin}" stroke="${shade(skin, -0.25)}" stroke-width="0.6"/><ellipse cx="${R}" cy="45" rx="2.6" ry="4" fill="${skin}" stroke="${shade(skin, -0.25)}" stroke-width="0.6"/>`;
   if (!it) return e;
   const c = safeColor(it.look.a, '#d4af37');
   const j = it.look.kind === 'hoops'
-    ? `<circle cx="32.2" cy="51" r="2.4" fill="none" stroke="${c}" stroke-width="0.9"/><circle cx="67.8" cy="51" r="2.4" fill="none" stroke="${c}" stroke-width="0.9"/>`
-    : `<circle cx="32.2" cy="48.6" r="0.95" fill="${c}"/><circle cx="67.8" cy="48.6" r="0.95" fill="${c}"/>`;
+    ? `<circle cx="${L}" cy="51" r="2.4" fill="none" stroke="${c}" stroke-width="0.9"/><circle cx="${R}" cy="51" r="2.4" fill="none" stroke="${c}" stroke-width="0.9"/>`
+    : `<circle cx="${L}" cy="48.6" r="0.95" fill="${c}"/><circle cx="${R}" cy="48.6" r="0.95" fill="${c}"/>`;
   return e + j;
 }
 
@@ -155,10 +205,10 @@ function eyewear(it: Item | undefined, dx: number) {
   }
 }
 
-function hat(it: Item | undefined, dx: number) {
+function hat(it: Item | undefined) {
   if (!it) return '';
   const a = safeColor(it.look.a, '#1b1b1f'), b = safeColor(it.look.b, shade(a, -0.35));
-  const x = 50 + dx * 0.6;
+  const x = 50;
   switch (it.look.kind) {
     case 'fedora': return `<g><ellipse cx="${x}" cy="27.5" rx="27" ry="5" fill="${shade(a, -0.15)}"/><path d="M${x - 15} 27 Q${x - 16} 12 ${x - 6} 9.5 Q${x} 13 ${x + 6} 9.5 Q${x + 16} 12 ${x + 15} 27 Z" fill="${a}"/><path d="M${x - 15} 23.5 L${x + 15} 23.5 L${x + 15} 27 L${x - 15} 27 Z" fill="${b}"/></g>`;
     case 'cowboy': return `<g><path d="M${x - 31} 24 Q${x - 26} 32 ${x} 30.5 Q${x + 26} 32 ${x + 31} 24 Q${x + 22} 28 ${x} 27 Q${x - 22} 28 ${x - 31} 24 Z" fill="${shade(a, -0.12)}"/><path d="M${x - 14} 28 Q${x - 16} 10 ${x - 7} 9 Q${x} 13 ${x + 7} 9 Q${x + 16} 10 ${x + 14} 28 Z" fill="${a}"/><path d="M${x - 14.6} 24.6 L${x + 14.6} 24.6 L${x + 14.2} 27.6 L${x - 14.2} 27.6 Z" fill="${shade(a, -0.4)}"/></g>`;
@@ -271,6 +321,58 @@ function frame(it: Item | undefined, gid: string) {
     case 'marquee': return ring(3.6, '#5a3520') + `<g class="fx-blink">${around(22, (x, y) => `<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="1.15" fill="${a}"/>`, 46.7)}</g>`;
     case 'wanted': return `<path d="M2 2 H98 V98 H2 Z M7 7 V93 H93 V7 Z" fill="${a}" fill-rule="evenodd"/><path d="M2 2 H98 V98 H2 Z" fill="none" stroke="#6a4026" stroke-width="1"/>`;
     case 'rope': return ring(3.6, a) + ring(3.6, b, 'stroke-dasharray="2.4 2.4"');
+    default: return it.look.kind.startsWith('b-') ? border(it.look.kind.slice(2), gid) : '';
+  }
+}
+
+
+/**
+ * §29 animated borders. Each is a small, fixed SVG drawn inside the portrait box (so it can never cover cards or
+ * names). Motion comes from CSS classes (bx-*), which pause off-screen, slow down for "subtle", stop for
+ * "static", and stop for reduced motion. At most a dozen moving parts per border.
+ */
+function border(kind: string, gid: string): string {
+  const R = 47;
+  const base = (c: string, w = 3) => `<circle cx="50" cy="50" r="${R}" fill="none" stroke="${c}" stroke-width="${w}"/>`;
+  const at = (n: number, r: number, f: (x: number, y: number, deg: number, i: number) => string) =>
+    Array.from({ length: n }, (_, i) => { const t = (i / n) * Math.PI * 2 - Math.PI / 2; return f(50 + r * Math.cos(t), 50 + r * Math.sin(t), (t * 180) / Math.PI + 90, i); }).join('');
+  const n2 = (x: number) => x.toFixed(2);
+  const g = (cls: string, body: string, extra = '') => `<g class="bx ${cls}"${extra}>${body}</g>`;
+  switch (kind) {
+    case 'golden-halo':
+      return `<defs><linearGradient id="${gid}h" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#7a5a1e"/><stop offset=".45" stop-color="#fff2c4"/><stop offset=".55" stop-color="#f3d77a"/><stop offset="1" stop-color="#7a5a1e"/></linearGradient></defs>`
+        + base('#8c6a2e', 3.4) + g('bx-spin slow', `<circle cx="50" cy="50" r="${R}" fill="none" stroke="url(#${gid}h)" stroke-width="3.4"/>`);
+    case 'emerald-pulse':
+      return base('#0f5a3e', 3) + g('bx-pulse', `<circle cx="50" cy="50" r="${R}" fill="none" stroke="#5fe0a6" stroke-width="3"/><circle cx="50" cy="50" r="${R - 2.6}" fill="none" stroke="#5fe0a6" stroke-width=".8" opacity=".6"/>`);
+    case 'midnight-neon':
+      return `<defs><filter id="${gid}n" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="1.4"/></filter></defs>`
+        + base('#0d1426', 3.4) + g('bx-flicker', `<circle cx="50" cy="50" r="${R}" fill="none" stroke="#3fa8ff" stroke-width="3" filter="url(#${gid}n)"/><circle cx="50" cy="50" r="${R}" fill="none" stroke="#bfe6ff" stroke-width="1"/>`);
+    case 'royal-diamonds':
+      return base('#6a3f99', 3) + at(10, R, (x, y, _d, i) => g(`bx-twinkle d${i % 5}`, `<path d="M${n2(x)} ${n2(y - 2.6)} l2 2.6 l-2 2.6 l-2 -2.6 Z" fill="#dff3ff" stroke="#9fd0f0" stroke-width=".4"/>`, ` style="transform-origin:${n2(x)}px ${n2(y)}px"`));
+    case 'platinum-orbit':
+      return base('#9aa2ad', 2.6) + [0, 1, 2].map((i) => g(`bx-spin o${i}`, `<circle cx="50" cy="${50 - R}" r="${1.8 - i * .35}" fill="#f4f6f8"/><circle cx="50" cy="${50 - R}" r="${3.4 - i * .5}" fill="#f4f6f8" opacity=".25"/>`)).join('');
+    case 'card-shark':
+      return base('#1b1b1f', 3.6) + g('bx-spin slow', at(4, R, (x, y, deg, i) => `<text x="${n2(x)}" y="${n2(y + 2.4)}" font-size="7" text-anchor="middle" fill="${i % 2 ? '#e0453a' : '#f4f1ea'}" transform="rotate(${n2(deg)} ${n2(x)} ${n2(y)})">${'♠♥♣♦'[i]}</text>`));
+    case 'vegas-lights':
+      return base('#5a3520', 4) + at(16, R, (x, y, _d, i) => g(`bx-chase c${i % 4}`, `<circle cx="${n2(x)}" cy="${n2(y)}" r="1.25" fill="#ffd77a"/>`));
+    case 'black-smoke':
+      return base('#1b1b1f', 3) + [0, 1, 2].map((i) => g(`bx-smoke s${i}`, `<path d="M${30 + i * 14} 8 q4 -4 8 0 t8 0" fill="none" stroke="#3a3a40" stroke-width="2.2" stroke-linecap="round" opacity=".8"/>`)).join('');
+    case 'art-deco-shimmer':
+      return base('#c9a45c', 2.6) + at(12, R - .5, (x, y, deg, i) => g(`bx-wave w${i % 6}`, `<rect x="${n2(x - 1)}" y="${n2(y - 3)}" width="2" height="6" fill="#f3d77a" transform="rotate(${n2(deg)} ${n2(x)} ${n2(y)})"/>`));
+    case 'crimson-flame':
+      return base('#8b1420', 3) + at(10, R - 1, (x, y, deg, i) => g(`bx-flame f${i % 3}`, `<path d="M${n2(x - 2)} ${n2(y)} Q${n2(x)} ${n2(y - 7)} ${n2(x + 2)} ${n2(y)} Z" fill="${i % 2 ? '#ff6a3d' : '#e0283a'}"/>`, ` style="transform-origin:${n2(x)}px ${n2(y)}px;transform:rotate(${n2(deg)}deg)"`));
+    case 'electric-ace':
+      return base('#0d1d3a', 3) + g('bx-arc', `<path d="${at(18, R, (x, y, _d, i) => `${i ? 'L' : 'M'}${n2(x + (i % 2 ? 1.6 : -1.6))} ${n2(y)}`)} Z" fill="none" stroke="#7fd2ff" stroke-width="1.2" stroke-dasharray="14 40" stroke-linejoin="round"/>`)
+        + g('bx-arc late', `<path d="${at(18, R, (x, y, _d, i) => `${i ? 'L' : 'M'}${n2(x + (i % 2 ? -1.4 : 1.4))} ${n2(y)}`)} Z" fill="none" stroke="#e8f7ff" stroke-width=".7" stroke-dasharray="8 46"/>`);
+    case 'high-roller-chips':
+      return base('#c9a45c', 3) + g('bx-spin slower', at(6, R, (x, y) => `<circle cx="${n2(x)}" cy="${n2(y)}" r="3" fill="#d4af37" stroke="#7a5a1e" stroke-width=".6"/><circle cx="${n2(x)}" cy="${n2(y)}" r="1.6" fill="none" stroke="#fff2c4" stroke-width=".6" stroke-dasharray="1 .8"/>`));
+    case 'cosmic':
+      return base('#1b1035', 4) + g('bx-spin slower', at(9, R, (x, y, _d, i) => `<circle cx="${n2(x)}" cy="${n2(y)}" r="${i % 3 ? .7 : 1.2}" fill="#fff"/>`)) + at(3, R, (x, y, _d, i) => g(`bx-twinkle d${i}`, `<circle cx="${n2(x)}" cy="${n2(y)}" r="1.4" fill="#c9b8ff"/>`, ` style="transform-origin:${n2(x)}px ${n2(y)}px"`));
+    case 'royal-flush-seq':
+      return base('#c9a45c', 3) + at(5, R - .5, (x, y, deg, i) => g(`bx-seq q${i}`, `<g transform="rotate(${n2(deg - 90 + 90)} ${n2(x)} ${n2(y)})"><rect x="${n2(x - 3)}" y="${n2(y - 4)}" width="6" height="8" rx=".8" fill="#fbfaf7" stroke="#c9a45c" stroke-width=".5"/><text x="${n2(x)}" y="${n2(y + 1.4)}" font-size="3.8" text-anchor="middle" font-weight="700" fill="#141418">${['10', 'J', 'Q', 'K', 'A'][i]}</text></g>`));
+    case 'diamond-crown':
+      return base('#dff3ff', 2.6) + g('bx-bob', `<path d="M38 9 L41 1.5 L46 6 L50 0 L54 6 L59 1.5 L62 9 Z" fill="#d4af37" stroke="#7a5a1e" stroke-width=".6"/><circle cx="50" cy="3" r="1.4" fill="#e0453a"/>`)
+        + at(8, R, (x, y, _d, i) => i === 0 ? '' : g(`bx-twinkle d${i % 5}`, `<path d="M${n2(x)} ${n2(y - 2)} l1.6 2 l-1.6 2 l-1.6 -2 Z" fill="#dff3ff"/>`, ` style="transform-origin:${n2(x)}px ${n2(y)}px"`));
     default: return '';
   }
 }
@@ -288,28 +390,38 @@ export function renderAvatar(look: { appearance?: unknown; equipped?: unknown } 
   const hairC = HAIR_COLOR[a.hairColor] ?? HAIR_COLOR[1];
   const outfit = item(eq, 'outfit');
   const hatIt = item(eq, 'hat');
+  const ex = opts.expression;
+  const head = `rotate(${tilt} 50 60)`;
+  const fit = hairFit(a.face);
+  // Under a hat, hair above the hat line is hidden (not reshaped): the hairstyle's geometry never changes.
+  const hatLine = hatIt ? HAT_LINE[hatIt.look.kind] : undefined;
+  const hairClip = hatLine !== undefined ? ` clip-path="url(#${gid}h)"` : '';
+  const hairDefs = hatLine !== undefined ? `<clipPath id="${gid}h" clipPathUnits="userSpaceOnUse"><rect x="0" y="${hatLine}" width="100" height="100"/></clipPath>` : '';
+  const back = hairBack(a, hairC);
   const body = [
     opts.background === false ? '' : background(item(eq, 'background'), gid),
-    hairBack(a, hairC),
+    back ? `<g class="hair-back" data-hair="${a.hair}" transform="${head} ${fit}"><g${hairClip}>${back}</g></g>` : '',
     torso(a, eq, skin),
     necklace(item(eq, 'necklace')),
     neckwear(item(eq, 'neckwear')),
     lapel(item(eq, 'lapel'), a.body === 'broad'),
-    `<g transform="rotate(${tilt} 50 60)">`,
-    ears(skin, item(eq, 'earrings')),
+    `<g class="head" transform="${head}">`,
+    ears(skin, item(eq, 'earrings'), a.face),
     faceShape(a.face, skin),
     `<ellipse cx="${41 + dx}" cy="50" rx="3" ry="1.8" fill="#e88" opacity="0.16"/><ellipse cx="${59 + dx}" cy="50" rx="3" ry="1.8" fill="#e88" opacity="0.16"/>`,
-    eyes(a, dx), brows(a, dx, hairC), nose(a, dx, skin), facialHair(a, dx, hairC), mouth(a, dx),
+    eyes(a, dx, ex), brows(a, dx, hairC, ex), nose(a, dx, skin),
+    a.facialHair !== 'none' ? `<g class="facial-hair" transform="translate(${dx} 0) ${jawFit(a.face)}">${facialHair(a, hairC)}</g>` : '',
+    mouth(a, dx, ex),
     eyewear(item(eq, 'eyewear'), dx),
-    hatIt && (a.hair === 'afro' || a.hair === 'mohawk') ? '' : hairFront(a, hairC, dx),
-    hat(hatIt, dx),
+    `<g class="hair-front" data-hair="${a.hair}" transform="${fit}"><g${hairClip}>${hairFront(a, hairC)}</g></g>`,
+    hatIt ? `<g class="hat" transform="${fit}">${hat(hatIt)}</g>` : '',
     `</g>`,
     watch(item(eq, 'watch'), safeColor(outfit?.look.a, '#3a3d42'), skin),
   ].join('');
   const fr = opts.frame === false ? '' : frame(item(eq, 'frame'), gid);
   const square = item(eq, 'frame')?.look.kind === 'wanted';
   const clip = square ? `<rect x="5" y="5" width="90" height="90"/>` : `<circle cx="50" cy="50" r="${fr ? 45.5 : 50}"/>`;
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${opts.crop ? CROP[opts.crop] : '0 0 100 100'}" class="av-svg" aria-hidden="true"><defs><clipPath id="${gid}c">${clip}</clipPath></defs><g clip-path="url(#${gid}c)">${body}</g>${fr}</svg>`;
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${opts.crop ? CROP[opts.crop] : '0 0 100 100'}" class="av-svg" aria-hidden="true"><defs><clipPath id="${gid}c">${clip}</clipPath>${hairDefs}</defs><g clip-path="url(#${gid}c)">${body}</g>${fr}</svg>`;
 }
 
 /** Small item preview used by the Boutique: the item worn by a neutral mannequin, or a swatch for non-wearables. */
@@ -317,9 +429,10 @@ export function renderItemPreview(itemId: string, base?: { appearance?: unknown;
   const it = ITEM.get(itemId);
   if (!it) return '';
   const gid = `ip${(++uid).toString(36)}`;
-  if (it.slot === 'chips') {
-    const c = CHIP_SKINS[it.look.kind] ?? CHIP_SKINS.classic;
-    return `<svg viewBox="0 0 100 100" class="av-svg" aria-hidden="true">${[[30, 60, 0], [50, 40, 1], [70, 60, 2]].map(([x, y, i]) => chipSvg(x, y, c[i])).join('')}</svg>`;
+  if (it.slot === 'chips' || it.chipOf) {
+    const col = (it.look.kind in COLLECTION_IDS ? it.look.kind : 'classic') as ChipCollectionId;
+    if (it.chipOf) return `<div class="chip-preview one">${renderChip(Number(it.look.a) as Denom, col)}</div>`;
+    return `<div class="chip-preview">${([100, 2_500, 10_000, 100_000] as Denom[]).map((d) => renderChip(d, col)).join('')}</div>`;
   }
   if (it.slot === 'cardBack') {
     const a = safeColor(it.look.a, '#1d3c7a'), b = safeColor(it.look.b, '#0f2350');

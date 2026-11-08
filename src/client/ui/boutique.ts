@@ -1,9 +1,10 @@
 // Casino Boutique (§24.7–24.9): catalog, try-on, purchases, inventory, ways to earn and history.
 // Prices and ownership come from the server; this page never decides either.
-import { CATEGORIES, ITEM, fitEquipped, validateEquipped, type Equipped } from '../../shared/cosmetics.js';
+import { CATEGORIES, ITEM, fitEquipped, ownsItem, validateEquipped, type Equipped } from '../../shared/cosmetics.js';
 import { renderAvatar, renderItemPreview } from '../../shared/avatarSvg.js';
 import { catalog, credits, loadMine, purchase, saveAvatar, type Catalog, type CatalogItem, type Mine } from '../cosmetics.js';
 import { h, modal, toast } from '../dom.js';
+import { chipBrowser } from './chipBrowser.js';
 
 type View = string; // category id | 'inventory' | 'earn' | 'history'
 const WEARABLE = new Set(['outfit', 'hat', 'eyewear', 'earrings', 'necklace', 'watch', 'neckwear', 'lapel', 'frame', 'background']);
@@ -14,6 +15,7 @@ export function mountBoutique(root: HTMLElement, nav: (p: string) => void) {
   let mine: Mine | null = null;
   let view: View = 'featured';
   let tryOn: Equipped = {};
+  let chips: ReturnType<typeof chipBrowser> | null = null;
   const focus = new URLSearchParams(location.search).get('item');
 
   const wallet = h('span', { class: 'credits-pill' });
@@ -45,13 +47,14 @@ export function mountBoutique(root: HTMLElement, nav: (p: string) => void) {
   })();
 
   const owned = () => new Set(mine?.owned.map((o) => o.itemId) ?? []);
-  const has = (it: CatalogItem) => !!it.free || owned().has(it.id);
+  const has = (it: CatalogItem) => ownsItem(owned(), it.id);
 
-  function drawAll() { drawNav(); drawMain(); drawMirror(); }
+  function drawAll() { drawNav(); drawMain(); drawMirror(); mirrorAside().hidden = view === 'chips' || view === 'earn' || view === 'history'; }
+  const mirrorAside = () => root.querySelector('.bq-mirror') as HTMLElement;
 
   function drawNav() {
     wallet.textContent = mine ? credits(mine.balance) : '';
-    const btn = (id: View, text: string) => h('button', { class: `bq-tab ${view === id ? 'on' : ''}`, onclick: () => { view = id; drawNav(); drawMain(); } }, text);
+    const btn = (id: View, text: string) => h('button', { class: `bq-tab ${view === id ? 'on' : ''}`, onclick: () => { view = id; drawAll(); } }, text);
     const cats = [...CATEGORIES.filter((c) => c.id === 'featured'), ...CATEGORIES.filter((c) => c.id !== 'featured')];
     nav2.replaceChildren(...cats.map((c) => btn(c.id, c.name)), h('hr'), btn('inventory', 'Your items'), btn('earn', 'Ways to earn'), btn('history', 'Credit history'));
   }
@@ -157,6 +160,12 @@ export function mountBoutique(root: HTMLElement, nav: (p: string) => void) {
           : h('p', { class: 'muted' }, 'No credits yet.'));
       return;
     }
+    if (view === 'chips') {
+      chips ??= chipBrowser({ mine: () => mine!, items: cat.items, buy: (it) => confirmBuy(it), refresh: async () => { mine = await loadMine(); drawNav(); chips?.redraw(); } });
+      chips.redraw();
+      grid.replaceChildren(chips.root);
+      return;
+    }
     const list = cat.items.filter((i) => i.category === view && (i.available || owned().has(i.id)));
     grid.replaceChildren(h('h2', {}, CATEGORIES.find((c) => c.id === view)?.name ?? ''), h('div', { class: 'bq-cards' }, ...list.map(card)));
   }
@@ -176,7 +185,7 @@ export function mountBoutique(root: HTMLElement, nav: (p: string) => void) {
       try {
         const r = await purchase(it.id);
         mine = await loadMine();
-        m.close(); drawAll();
+        m.close(); drawAll(); chips?.redraw();
         const bonus = r.bonus ? ITEM.get(r.bonus) : null;
         toast(r.status === 'owned' ? `You already own ${it.name}.` : `${it.name} is yours.${bonus ? ` Collection complete — ${bonus.name} unlocked!` : ''}`, 'success', 5000);
         if (WEARABLE.has(it.slot) && r.status !== 'owned') offerWear(it);

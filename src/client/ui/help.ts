@@ -1,3 +1,4 @@
+import { BJ_RULES_VERSION, DEFAULT_BJ_RULES, rulesSummary } from '../../shared/blackjack.js';
 import { styleEvent } from '../cosmetics.js';
 import { BLIND_PAYTABLE, RULES_VERSION, TRIPS_PAYTABLE } from '../../shared/rules.js';
 import type { TableConfig } from '../../shared/protocol.js';
@@ -46,6 +47,14 @@ export function openHelp() {
       h('li', {}, 'The dealer qualifies with Queen high or better. If not, your Ante pays 1:1 and Play pushes. If so, the higher hand wins Ante and Play 1:1; a tie pushes.'),
       h('li', {}, 'Three-card ranks: Straight Flush, Three of a Kind, Straight, Flush, Pair, High Card — a straight beats a flush. A-2-3 is the lowest straight, A-K-Q the highest.')),
     h('div', { class: 'pay-grid' }, ...tcpTables()),
+    h('h3', {}, 'Blackjack'),
+    h('p', {}, 'The host can also switch to Blackjack. Everyone plays against the dealer from one six-deck shoe, taking turns in seat order.'),
+    h('ol', { class: 'steps' },
+      h('li', {}, 'Place one bet (whole dollars). You get two cards face up; the dealer gets one up and one face down.'),
+      h('li', {}, 'If the dealer shows an Ace you may take insurance (up to half your bet; pays 2:1 if the dealer has blackjack). With an Ace or a ten showing, the dealer then checks for blackjack.'),
+      h('li', {}, 'On your turn: Hit, Stand, Double (one more card for a second bet), Split a pair into two hands (up to four), or Surrender if the host allows it. Doubling and splitting need a bet equal to your original wager.'),
+      h('li', {}, 'The dealer draws to 17 and stands on all 17s. Beat the dealer without going over 21 to win 1:1; a blackjack pays 3:2; ties push.')),
+    h('ul', {}, ...rulesSummary(DEFAULT_BJ_RULES).map((x) => h('li', {}, x))),
     h('h3', {}, 'Timers'),
     h('p', {}, 'At multiplayer tables the server runs a decision clock. If yours runs out you check pre-flop and on the flop, and fold on the river (or play basic strategy, if you turn that on in Settings). Disconnecting doesn’t stop the table; your seat is held for two minutes.'),
     h('h3', {}, 'Keyboard'),
@@ -92,6 +101,15 @@ export function progressiveTable(jackpot?: number) {
 
 /** The pay tables in force at one table — shown before anyone bets. */
 export function openPayTables(c: TableConfig, jackpot?: number) {
+  if (c.game === 'bj') {
+    const r = { ...DEFAULT_BJ_RULES, lateSurrender: !!c.bjSurrender };
+    modal(`Blackjack rules at ${c.name}`, h('div', { class: 'help' },
+      h('ul', {}, ...rulesSummary(r).map((x) => h('li', {}, x))),
+      h('div', { class: 'pay-grid' }, h('div', {}, h('h4', {}, 'Payouts'), payRows([['Blackjack (Ace + 10 on the first two cards)', '3 to 2'], ['Win', '1 to 1'], ['Insurance (dealer has blackjack)', '2 to 1'], ['Surrender', 'half your bet back'], ['Tie', 'push']]))),
+      h('p', { class: 'muted' }, `Bets ${'$'}${c.minAnte / 100}–${'$'}${c.maxAnte / 100}, whole dollars. Doubling and each split add a bet equal to your original wager, and are only offered when your stack covers it.`),
+      h('p', { class: 'muted tiny' }, `Rules ${BJ_RULES_VERSION}. The dealer never changes these rules, and the shoe is never reshuffled because of anyone's wins or losses.`)), { wide: true });
+    return;
+  }
   if (c.game === 'tcp') {
     modal(`Pay tables at ${c.name}`, h('div', { class: 'help' },
       h('p', {}, h('b', {}, 'Three Card Poker. '), 'Dealer qualifies with Queen high or better. Not qualified: Ante pays 1:1, Play pushes. Otherwise higher hand wins Ante and Play 1:1; a tie pushes.'),

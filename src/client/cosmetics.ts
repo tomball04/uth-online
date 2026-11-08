@@ -84,7 +84,17 @@ export function setPortrait(el: HTMLElement, look: PublicLook | null | undefined
   if (!look) { el.textContent = initials(name); el.classList.add('initials'); return; }
   el.classList.remove('initials');
   el.innerHTML = renderAvatar(look, { pose: opts.pose, frame: opts.frame });   // safe: enumerated values only (see avatarSvg.ts)
+  if (el.querySelector('.bx')) watchOffscreen(el);
 }
+
+// §29: animated borders pause while their portrait is scrolled out of view (or the tab is hidden).
+let io: IntersectionObserver | null = null;
+function watchOffscreen(el: HTMLElement) {
+  if (typeof IntersectionObserver === 'undefined') return;
+  io ??= new IntersectionObserver((es) => { for (const e of es) (e.target as HTMLElement).classList.toggle('paused', !e.isIntersecting); });
+  io.observe(el);
+}
+if (typeof document !== 'undefined') document.addEventListener('visibilitychange', () => { document.documentElement.classList.toggle('paused', document.hidden); });
 
 export const credits = (n: number) => `${n.toLocaleString('en-US')} credits`;
 

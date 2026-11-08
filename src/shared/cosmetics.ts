@@ -1,3 +1,4 @@
+import { CHIP_COLLECTIONS, DENOMS, DENOM_NAME, chipItemId, denomSlot, type ChipCollectionId } from './chips.js';
 // Avatars, cosmetics and Style Credits (scope addendum §24). Pure data + validation shared by server and client.
 // Cosmetics are visual only: nothing here is read by dealing, betting, settlement or the chip ledger.
 
@@ -26,13 +27,14 @@ export const DEFAULT_APPEARANCE: Appearance = {
 };
 
 // ------------------------------------------------------------------ equip slots and catalog
-export const SLOTS = ['outfit', 'hat', 'eyewear', 'earrings', 'necklace', 'watch', 'neckwear', 'lapel', 'frame', 'background', 'chips', 'cardBack', 'emotes', 'victory'] as const;
+export const SLOTS = ['outfit', 'hat', 'eyewear', 'earrings', 'necklace', 'watch', 'neckwear', 'lapel', 'frame', 'background', 'chips', 'cardBack', 'emotes', 'victory',
+  'c1', 'c5', 'c25', 'c100', 'c500', 'c1000', 'c5000', 'c25000', 'c100000'] as const;
 export type Slot = (typeof SLOTS)[number];
 export type Equipped = Partial<Record<Slot, string>>;
 
 export const CATEGORIES = [
   { id: 'clothing', name: 'Clothing' }, { id: 'hats', name: 'Hats' }, { id: 'eyewear', name: 'Eyewear' },
-  { id: 'jewelry', name: 'Jewelry & Watches' }, { id: 'facial', name: 'Facial Accessories' }, { id: 'frames', name: 'Avatar Frames' },
+  { id: 'jewelry', name: 'Jewelry & Watches' }, { id: 'facial', name: 'Facial Accessories' }, { id: 'frames', name: 'Avatar Frames' }, { id: 'borders', name: 'Animated Borders' },
   { id: 'chips', name: 'Custom Poker Chips' }, { id: 'cardBacks', name: 'Card Backs' }, { id: 'backgrounds', name: 'Profile Backgrounds' },
   { id: 'emotes', name: 'Emotes & Reactions' }, { id: 'victory', name: 'Victory Animations' }, { id: 'featured', name: 'Featured Collections' },
 ] as const;
@@ -44,10 +46,14 @@ export interface Look { kind: string; a?: string; b?: string; c?: string }
 export interface Item {
   id: string; name: string; description: string; category: Category; slot: Slot; price: number; look: Look;
   rarity: Rarity; collection?: string; available: boolean;
+  /** Animated borders (§29): what moves, and how heavy it is to draw. */
+  anim?: string; perf?: 'light' | 'medium';
   /** How it can be obtained without buying. */
   free?: boolean; unlock?: string;
   /** Outfit features other items depend on. */
   collar?: boolean; jacket?: boolean;
+  /** Single chip design: the set it belongs to. */
+  chipOf?: string;
   /** Compatibility: needs an outfit with a collar / a jacket. */
   needsCollar?: boolean; needsJacket?: boolean;
 }
@@ -125,13 +131,7 @@ export const CATALOG: Item[] = [
   I({ id: 'frame-deco-bonus', name: 'Chrysler Frame', description: 'Collection reward: complete Art Deco.', category: 'frames', slot: 'frame', price: 0, unlock: 'collection:art-deco', rarity: 'rare', look: { kind: 'deco', a: '#e8e8f0' } }),
 
   // ---- chips (visual only; values never change)
-  I({ id: 'chips-classic', name: 'Classic Vegas', description: 'The standard rack.', category: 'chips', slot: 'chips', price: 0, free: true, look: { kind: 'classic' } }),
-  I({ id: 'chips-ivory', name: 'Vintage Poker Chip Set', description: 'Clay chips with aged ivory faces.', category: 'chips', slot: 'chips', price: 500, rarity: 'fine', look: { kind: 'ivory' } }),
-  I({ id: 'chips-blackgold', name: 'Black and Gold', description: 'Matte black, gold inlays.', category: 'chips', slot: 'chips', price: 400, look: { kind: 'blackgold' } }),
-  I({ id: 'chips-highroller', name: 'High Roller', description: 'Pearl inlays and engraved rims.', category: 'chips', slot: 'chips', price: 600, rarity: 'rare', collection: 'high-roller', look: { kind: 'highroller' } }),
-  I({ id: 'chips-midnight', name: 'Midnight Blue', description: 'Deep blue with silver edge spots.', category: 'chips', slot: 'chips', price: 350, look: { kind: 'midnight' } }),
-  I({ id: 'chips-emerald', name: 'Emerald Casino', description: 'Green clay with gold spots.', category: 'chips', slot: 'chips', price: 350, look: { kind: 'emerald' } }),
-  I({ id: 'chips-saloon', name: 'Western Saloon', description: 'Hand-stamped, sun-faded.', category: 'chips', slot: 'chips', price: 500, collection: 'old-west', look: { kind: 'saloon' } }),
+  // Chip sets (§28): 15 collections, each drawn for all nine denominations. Built below from CHIP_COLLECTIONS.
 
   // ---- card backs (your seat's face-down cards; rank and suit are never shown)
   I({ id: 'back-table', name: 'Table Default', description: 'Use the host’s table backs.', category: 'cardBacks', slot: 'cardBack', price: 0, free: true, look: { kind: 'table' } }),
@@ -159,6 +159,57 @@ export const CATALOG: Item[] = [
   I({ id: 'win-royal', name: 'Royal Flush Flourish', description: 'Five spades fan out above your seat.', category: 'victory', slot: 'victory', price: 600, rarity: 'rare', look: { kind: 'royal' } }),
   I({ id: 'win-vegas', name: 'Classic Vegas Celebration', description: 'Marquee bulbs blink around your plate.', category: 'victory', slot: 'victory', price: 500, collection: 'classic-vegas', look: { kind: 'vegas' } }),
 ];
+
+// ---- §29 animated borders: 15 distinct animations, never randomized, never earned through wins.
+const BORDERS: [string, string, number, Rarity, 'light' | 'medium', string][] = [
+  ['golden-halo', 'Golden Halo', 350, 'standard', 'light', 'A slowly rotating band of gold light.'],
+  ['emerald-pulse', 'Emerald Pulse', 250, 'standard', 'light', 'A soft green glow breathes in and out.'],
+  ['midnight-neon', 'Midnight Neon', 300, 'standard', 'light', 'A blue neon edge with the odd flicker.'],
+  ['royal-diamonds', 'Royal Diamonds', 600, 'fine', 'medium', 'Ten small gemstones glitter in turn.'],
+  ['platinum-orbit', 'Platinum Orbit', 500, 'fine', 'light', 'Three silver sparks circle at different speeds.'],
+  ['card-shark', 'Card Shark', 450, 'fine', 'light', 'The four suits travel around the frame.'],
+  ['vegas-lights', 'Vegas Lights', 550, 'fine', 'medium', 'Marquee bulbs chase around the rim.'],
+  ['black-smoke', 'Black Smoke', 400, 'fine', 'light', 'Thin dark smoke drifts across the top.'],
+  ['art-deco-shimmer', 'Art Deco', 500, 'fine', 'medium', 'Geometric gold accents shimmer in a wave.'],
+  ['crimson-flame', 'Crimson Flame', 900, 'rare', 'medium', 'Stylized red flames lick upward.'],
+  ['electric-ace', 'Electric Ace', 1000, 'rare', 'light', 'Blue electric arcs trace the border.'],
+  ['high-roller-chips', 'High Roller', 1100, 'rare', 'light', 'Gold chips rotate slowly around you.'],
+  ['cosmic', 'Cosmic', 1200, 'rare', 'medium', 'Small stars drift through the frame.'],
+  ['royal-flush-seq', 'Royal Flush', 1800, 'legendary', 'medium', 'Ten, Jack, Queen, King, Ace light up in sequence.'],
+  ['diamond-crown', 'Diamond Crown', 2500, 'legendary', 'medium', 'A jeweled crown with gemstones that catch the light.'],
+];
+for (const [id, name, price, rarity, perf, anim] of BORDERS) {
+  CATALOG.push(I({ id: `border-${id}`, name, description: `${anim} Animated border (purely cosmetic).`, category: 'borders', slot: 'frame', price, rarity, perf, anim, look: { kind: `b-${id}` } }));
+}
+
+/** Set prices (credits). A set unlocks all nine denominations; single chips cost a fifth of the set each. */
+const CHIP_SET_PRICE: Record<ChipCollectionId, number> = {
+  classic: 0, emerald: 350, midnight: 350, crimson: 350, vintage: 500, deco: 450, desert: 350, saloon: 500, royal: 450,
+  platinum: 600, neon: 400, marble: 400, carbon: 350, cosmic: 450, diamond: 700,
+};
+const CHIP_RARITY: Partial<Record<ChipCollectionId, Rarity>> = { vintage: 'fine', platinum: 'rare', diamond: 'rare', cosmic: 'fine', deco: 'fine' };
+const CHIP_COLLECTION_TAG: Partial<Record<ChipCollectionId, string>> = { platinum: 'high-roller', saloon: 'old-west' };
+for (const c of CHIP_COLLECTIONS) {
+  const price = CHIP_SET_PRICE[c.id];
+  CATALOG.push(I({
+    id: c.setId, name: c.id === 'vintage' ? 'Vintage Poker Chip Set' : `${c.name} chip set`, description: `${c.blurb} All nine denominations, $1 to the $100K plaque.`,
+    category: 'chips', slot: 'chips', price, free: price === 0, rarity: CHIP_RARITY[c.id] ?? 'standard', collection: CHIP_COLLECTION_TAG[c.id], look: { kind: c.id },
+  }));
+  for (const d of DENOMS) CATALOG.push(I({
+    id: chipItemId(c.id, d), name: `${c.name} ${DENOM_NAME[d]}`, description: `Just the ${DENOM_NAME[d]} ${d === 10_000_000 ? 'plaque' : 'chip'} in ${c.name}.`,
+    category: 'chips', slot: denomSlot(d) as Slot, price: price ? Math.max(25, Math.round(price / 5 / 5) * 5) : 0, free: price === 0, rarity: CHIP_RARITY[c.id] ?? 'standard',
+    look: { kind: c.id, a: String(d) }, chipOf: c.setId,
+  }));
+}
+
+/** Owning a chip set counts as owning each of its single chips. */
+export function ownsItem(owned: Set<string> | ((id: string) => boolean), id: string): boolean {
+  const has = typeof owned === 'function' ? owned : (x: string) => owned.has(x);
+  const it = ITEM.get(id);
+  if (!it) return false;
+  if (it.free || has(id)) return true;
+  return !!it.chipOf && has(it.chipOf);
+}
 
 export const REACTION_SETS: Record<string, string[]> = {
   'emotes-classic': ['Nice hand!', 'Good luck!', 'Ouch!', 'Well played!', 'Wow!'],
@@ -242,7 +293,7 @@ export function validateEquipped(eq: unknown, owns: (itemId: string) => boolean)
     const it = typeof id === 'string' ? ITEM.get(id) : undefined;
     if (!it) return 'Unknown item.';
     if (it.slot !== slot) return `${it.name} doesn’t go in that slot.`;
-    if (!isFreeItem(it) && !owns(it.id)) return `You don’t own ${it.name} yet.`;
+    if (!ownsItem(owns, it.id)) return `You don’t own ${it.name} yet.`;
   }
   const outfit = typeof e.outfit === 'string' ? ITEM.get(e.outfit) : undefined;
   for (const id of Object.values(e)) {

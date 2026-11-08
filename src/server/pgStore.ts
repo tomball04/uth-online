@@ -1,3 +1,5 @@
+import type { RivalryEvent, RivalryRow } from './roast.js';
+import type { QHand } from '../shared/quality.js';
 import pg from 'pg';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -9,6 +11,7 @@ import type { AvatarData, PublicLook } from '../shared/cosmetics.js';
 import {
   InsufficientFunds, JACKPOT_ID, type HandStart, type SettlementBuilder, type PlayerRow, type PlayerSettlementRow, type PlayerStats,
   type DebtEvent, type NightRow, type CosmeticState, type PurchaseResult, type RewardFacts, type StyleTx, type RecentHandRow, type ReplayData, type StackRow, type Store, type TableRow,
+  toQHand,
 } from './store.js';
 
 // BIGINT -> number (all our values are well inside Number.MAX_SAFE_INTEGER)
@@ -72,9 +75,12 @@ export class PgStore implements Store {
     await this.pool.query('INSERT INTO game_tables(code,host_id,config) VALUES ($1,$2,$3)', [code, hostId, config]);
   }
   async loadTable(code: string): Promise<TableRow | null> {
-    const r = await this.pool.query('SELECT code,host_id,config,hand_counter,closed_at FROM game_tables WHERE code=$1', [code]);
+    const r = await this.pool.query('SELECT code,host_id,config,hand_counter,closed_at,dealer_id,dealer_rounds FROM game_tables WHERE code=$1', [code]);
     const t = r.rows[0];
-    return t ? { code: t.code, hostId: t.host_id, config: t.config, handCounter: t.hand_counter, closed: !!t.closed_at } : null;
+    return t ? { code: t.code, hostId: t.host_id, config: t.config, handCounter: t.hand_counter, closed: !!t.closed_at, dealer: { dealerId: t.dealer_id, rounds: t.dealer_rounds } } : null;
+  }
+  async updateDealer(code: string, dealerId: string, rounds: number) {
+    await this.pool.query('UPDATE game_tables SET dealer_id=$2, dealer_rounds=$3 WHERE code=$1', [code, dealerId, rounds]);
   }
   async updateTable(code: string, p: { config?: TableConfig; hostId?: string; closed?: boolean; handCounter?: number }) {
     await this.pool.query(
@@ -192,16 +198,26 @@ export class PgStore implements Store {
     });
   }
 
+  async extraWager(handId: string, playerId: string, code: string, amount: number, key: string, totals: { extra: number; insurance: number }) {
+    return this.tx(async (c) => {
+      const h = await c.query(`SELECT status FROM hands WHERE id=$1 FOR UPDATE`, [handId]);
+      if (h.rows[0]?.status !== 'active') throw new Error('Hand is not active');
+      const bal = await this.debit(c, playerId, code, handId, amount, key);
+      if (bal !== null) await c.query('UPDATE hand_players SET bj_extra=$3, bj_insurance=$4 WHERE hand_id=$1 AND player_id=$2', [handId, playerId, totals.extra, totals.insurance]);
+      return bal;
+    });
+  }
+
   async recordDecision(handId: string, playerId: string, d: DecisionRecord, state: { play: number; folded: boolean }) {
     await this.pool.query(
-      `INSERT INTO decisions(hand_id,player_id,phase,action,recommended,correct,timed_out,reason,outs)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING`,
-      [handId, playerId, d.phase, d.action, d.recommended, d.correct, d.timedOut, d.reason, d.outs ? JSON.stringify(d.outs) : null]);
+      `INSERT INTO decisions(hand_id,player_id,phase,action,recommended,correct,timed_out,reason,outs,graded,ev_cost_cents,ev_cost,ev_exact)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT DO NOTHING`,
+      [handId, playerId, d.phase, d.action, d.recommended, d.correct, d.timedOut, d.reason, d.outs ? JSON.stringify(d.outs) : null, d.graded !== false, d.evCostCents ?? null, d.evCost ?? null, d.evExact ?? null]);
     if (state.folded) await this.pool.query('UPDATE hand_players SET folded=true WHERE hand_id=$1 AND player_id=$2', [handId, playerId]);
   }
-  async updateDecisionEV(handId: string, playerId: string, phase: string, evCost: number, exact: boolean) {
-    await this.pool.query('UPDATE decisions SET ev_cost=$4, ev_exact=$5 WHERE hand_id=$1 AND player_id=$2 AND phase=$3',
-      [handId, playerId, phase, evCost, exact]);
+  async updateDecisionEV(handId: string, playerId: string, phase: string, evCost: number, exact: boolean, cents?: number) {
+    await this.pool.query('UPDATE decisions SET ev_cost=$4, ev_exact=$5, ev_cost_cents=COALESCE($6, ev_cost_cents) WHERE hand_id=$1 AND player_id=$2 AND phase=$3',
+      [handId, playerId, phase, evCost, exact, cents ?? null]);
   }
 
   async settleHand(handId: string, code: string, dealer: { hand: string; qualifies: boolean }, build: SettlementBuilder) {
@@ -274,7 +290,7 @@ export class PgStore implements Store {
   async playerStats(pid: string, game?: GameId): Promise<PlayerStats> {
     const q = (sql: string) => this.pool.query(sql, [pid]);
     // Game filter (a fixed enum, never user text): hand_players carry their game; decisions go through hands.
-    const G = game === 'uth' || game === 'tcp' ? ` AND game='${game}'` : '';
+    const G = game === 'uth' || game === 'tcp' || game === 'bj' ? ` AND game='${game}'` : '';
     const GD = G ? ` AND hand_id IN (SELECT id FROM hands WHERE game='${game}')` : '';
     const side = (stake: string, net: string, combo: string) => Promise.all([
       q(`SELECT COUNT(*)::int bets, COUNT(*) FILTER (WHERE ${net}>0)::int wins, COALESCE(SUM(${stake}),0) wagered,
@@ -298,13 +314,13 @@ export class PgStore implements Store {
             COUNT(*) FILTER (WHERE outcome='win')::int wins, COUNT(*) FILTER (WHERE outcome='lose')::int losses,
             COUNT(*) FILTER (WHERE outcome='push')::int pushes, COUNT(*) FILTER (WHERE outcome='fold')::int folds,
             COALESCE(MAX(net),0) biggest_win, COALESCE(MIN(net),0) biggest_loss,
-            COALESCE(SUM(ante+blind+trips+play+pairs+bad_beat+progressive+pair_plus+six_card),0) wagered
+            COALESCE(SUM(ante+blind+trips+play+pairs+bad_beat+progressive+pair_plus+six_card+bj_insurance),0) wagered
          FROM hand_players WHERE player_id=$1 AND settled${G}`),
       q(`SELECT hand_name FROM hand_players WHERE player_id=$1 AND settled${G} ORDER BY hand_rank DESC NULLS LAST LIMIT 1`),
-      q(`SELECT COUNT(*)::int n, COUNT(*) FILTER (WHERE correct)::int ok, COALESCE(SUM(ev_cost),0) ev FROM decisions WHERE player_id=$1${GD}`),
-      q(`SELECT phase, action, COUNT(*)::int count, COUNT(*) FILTER (WHERE correct)::int correct FROM decisions WHERE player_id=$1${GD} GROUP BY phase, action ORDER BY phase, action`),
-      q(`SELECT phase, action, recommended, COUNT(*)::int count, COALESCE(SUM(ev_cost),0) ev FROM decisions WHERE player_id=$1 AND NOT correct${GD}
-         GROUP BY phase, action, recommended ORDER BY count DESC LIMIT 5`),
+      q(`SELECT COUNT(*)::int n, COUNT(*) FILTER (WHERE correct)::int ok, COALESCE(SUM(ev_cost),0) ev FROM decisions WHERE player_id=$1 AND graded${GD}`),
+      q(`SELECT CASE WHEN phase LIKE 'bj-%' THEN 'bj' ELSE phase END phase, action, COUNT(*)::int count, COUNT(*) FILTER (WHERE correct)::int correct FROM decisions WHERE player_id=$1 AND graded${GD} GROUP BY 1, action ORDER BY 1, action`),
+      q(`SELECT CASE WHEN phase LIKE 'bj-%' THEN 'bj' ELSE phase END phase, action, recommended, COUNT(*)::int count, COALESCE(SUM(ev_cost),0) ev FROM decisions WHERE player_id=$1 AND graded AND NOT correct${GD}
+         GROUP BY 1, action, recommended ORDER BY count DESC LIMIT 5`),
       q(`SELECT COUNT(*)::int bets, COUNT(*) FILTER (WHERE trips_net>0)::int wins, COALESCE(SUM(trips_net),0) net FROM hand_players WHERE player_id=$1 AND settled AND trips>0${G}`),
       q(`SELECT COUNT(*)::int n FROM hand_players hp JOIN hands h ON h.id=hp.hand_id WHERE hp.player_id=$1 AND hp.settled AND h.participant_count>1${G ? ` AND h.game='${game}'` : ''}`),
       q(`SELECT COALESCE(SUM(reloads),0)::int reloads, COALESCE(SUM(debt),0) debt, COUNT(*)::int tables FROM stacks WHERE player_id=$1`),
@@ -326,6 +342,46 @@ export class PgStore implements Store {
       handsWithFriends: friends.rows[0].n, reloads: stacks.rows[0].reloads, tables: stacks.rows[0].tables, debt: Number(stacks.rows[0].debt),
       series: series.rows.reverse().map((r) => ({ at: new Date(r.at).toISOString(), cumulative: Number(r.cum) })),
     };
+  }
+
+  async rivalries(dealerId: string, playerIds: string[]): Promise<Map<string, RivalryRow>> {
+    const out = new Map<string, RivalryRow>();
+    if (!playerIds.length) return out;
+    const r = await this.pool.query('SELECT * FROM dealer_rivalries WHERE dealer_id=$1 AND player_id = ANY($2)', [dealerId, playerIds]);
+    for (const x of r.rows) out.set(x.player_id, { witnessed: x.witnessed, wins: x.wins, jackpots: x.jackpots, mockedThenWon: x.mocked_then_won, events: x.events ?? [] });
+    return out;
+  }
+  async bumpRivalry(dealerId: string, playerId: string, d: Partial<Record<'witnessed' | 'wins' | 'jackpots' | 'mockedThenWon', number>>, ev?: RivalryEvent) {
+    // Keep the 8 most recent memorable events. Comedic only — nothing in dealing or settlement reads this table.
+    await this.pool.query(
+      `INSERT INTO dealer_rivalries (dealer_id, player_id, witnessed, wins, jackpots, mocked_then_won, events)
+       VALUES ($1,$2,$3,$4,$5,$6, CASE WHEN $7::jsonb IS NULL THEN '[]'::jsonb ELSE jsonb_build_array($7::jsonb) END)
+       ON CONFLICT (dealer_id, player_id) DO UPDATE SET
+         witnessed = dealer_rivalries.witnessed + EXCLUDED.witnessed, wins = dealer_rivalries.wins + EXCLUDED.wins,
+         jackpots = dealer_rivalries.jackpots + EXCLUDED.jackpots, mocked_then_won = dealer_rivalries.mocked_then_won + EXCLUDED.mocked_then_won,
+         events = CASE WHEN $7::jsonb IS NULL THEN dealer_rivalries.events
+                  ELSE (SELECT COALESCE(jsonb_agg(e), '[]'::jsonb) FROM (SELECT e FROM jsonb_array_elements(dealer_rivalries.events || jsonb_build_array($7::jsonb)) e OFFSET GREATEST(jsonb_array_length(dealer_rivalries.events) + 1 - 8, 0)) t) END,
+         updated_at = now()`,
+      [dealerId, playerId, d.witnessed ?? 0, d.wins ?? 0, d.jackpots ?? 0, d.mockedThenWon ?? 0, ev ? JSON.stringify(ev) : null]);
+  }
+
+  async qualityHands(playerId: string, game?: GameId): Promise<QHand[]> {
+    const G = game === 'uth' || game === 'tcp' || game === 'bj' ? game : null;
+    const r = await this.pool.query(
+      `SELECT h.id, h.hand_number, h.table_code, h.game, h.settled_at, h.night_id, h.community, h.dealer_cards,
+              hp.hole, hp.folded, hp.net, hp.ante, COALESCE(hp.base_net, hp.net - COALESCE(hp.trips_net,0)) base,
+              CASE WHEN h.game='bj' THEN hp.settlement END settlement,
+              COALESCE((SELECT json_agg(json_build_object('phase',d.phase,'action',d.action,'recommended',d.recommended,'correct',d.correct,
+                'graded',d.graded,'timedOut',d.timed_out,'reason',d.reason,'evCost',d.ev_cost,'evCents',d.ev_cost_cents) ORDER BY d.created_at)
+                FROM decisions d WHERE d.hand_id=h.id AND d.player_id=hp.player_id), '[]'::json) ds
+       FROM hand_players hp JOIN hands h ON h.id=hp.hand_id
+       WHERE hp.player_id=$1 AND hp.settled AND h.status='settled' AND ($2::text IS NULL OR h.game=$2)
+       ORDER BY h.settled_at, h.id`, [playerId, G]);
+    return r.rows.map((x) => toQHand({
+      handId: x.id, handNumber: x.hand_number, tableCode: x.table_code, game: x.game, at: new Date(x.settled_at).getTime(), nightId: x.night_id,
+      mainNet: Number(x.base), totalNet: Number(x.net), folded: x.folded, hole: x.hole ?? [], community: x.community ?? [], dealer: x.dealer_cards ?? [],
+      ante: Number(x.ante), settlement: x.settlement, decisions: x.ds,
+    }));
   }
 
   async recentHands(code: string, limit: number): Promise<RecentHandRow[]> {

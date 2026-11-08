@@ -15,13 +15,13 @@ export interface NightHandPlayer {
   pairPlusNet?: number; sixCardNet?: number; anteBonusNet?: number; sixCardHand?: string | null;
 }
 export interface NightHand {
-  handId: string; handNumber: number; startedAt: number; settledAt: number; community: string[]; dealerHand: string; game?: 'uth' | 'tcp';
+  handId: string; handNumber: number; startedAt: number; settledAt: number; community: string[]; dealerHand: string; game?: 'uth' | 'tcp' | 'bj';
   players: NightHandPlayer[];
   decisions: { playerId: string; phase: string; correct: boolean }[];
 }
 
 export interface RecapMoment {
-  playerId: string; name: string; amount: number; handName: string; handId: string; handNumber: number; hole: string[]; community: string[]; game?: 'uth' | 'tcp';
+  playerId: string; name: string; amount: number; handName: string; handId: string; handNumber: number; hole: string[]; community: string[]; game?: 'uth' | 'tcp' | 'bj';
 }
 export interface RecapPlayer {
   playerId: string; name: string; net: number; hands: number; wins: number; losses: number; pushes: number; folds: number;
@@ -40,7 +40,7 @@ const money = (c: number) => `$${(Math.abs(c) / 100).toLocaleString('en-US', { m
 
 export function buildRecap(
   meta: { nightId: string; tableName: string; startedAt: number; endedAt: number | null },
-  hands: NightHand[], debts: Map<string, number>,
+  hands: NightHand[], debts: Map<string, number>, pawned: Map<string, string> = new Map(),
 ): NightRecap {
   const sorted = [...hands].sort((a, b) => a.handNumber - b.handNumber);
   const byPlayer = new Map<string, RecapPlayer & { streak: number; bestRank: number }>();
@@ -105,7 +105,7 @@ export function buildRecap(
     const sharp = top(players.filter((p) => p.decisions >= 5), (p) => p.correct / p.decisions);
     if (sharp) fun.push({ label: 'Sharpest player', text: `${sharp.name} — ${Math.round((100 * sharp.correct) / sharp.decisions)}% of decisions matched basic strategy` });
     const debtor = top(players, (p) => p.debt);
-    if (debtor && debtor.debt > 0) fun.push({ label: 'Deepest in debt', text: `${debtor.name} — ${money(debtor.debt)} in markers. Time to pawn ${pawnFor(debtor.debt).item}.` });
+    if (debtor && debtor.debt > 0) fun.push({ label: 'Deepest in debt', text: `${debtor.name} — ${money(debtor.debt)} in markers. Time to pawn ${pawned.get(debtor.playerId) ?? pawnFor(debtor.debt, debtor.playerId).item}.` });
     const grinder = top(players, (p) => p.hands);
     if (grinder && players.length > 1 && grinder.hands >= 10) fun.push({ label: 'Iron chair', text: `${grinder.name} — ${grinder.hands} hands played` });
   }

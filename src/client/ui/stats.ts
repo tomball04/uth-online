@@ -1,6 +1,7 @@
 import { api } from '../api.js';
 import { h, money, svg, toast } from '../dom.js';
 import { pawnFor } from '../../shared/debt.js';
+import { qualitySection } from './quality.js';
 
 interface Stats {
   hands: number; net: number; wins: number; losses: number; pushes: number; folds: number; biggestWin: number; biggestLoss: number;
@@ -8,22 +9,24 @@ interface Stats {
   byPhase: { phase: string; action: string; count: number; correct: number }[];
   commonMistakes: { phase: string; action: string; recommended: string; count: number; evCost: number }[];
   trips: { bets: number; wins: number; net: number }; handsWithFriends: number; reloads: number; tables: number; debt?: number;
-  side: Record<'trips' | 'pairs' | 'badBeat' | 'progressive' | 'pairPlus' | 'sixCard', Side>; baseNet: number; baseWagered: number; game?: 'uth' | 'tcp' | null;
+  side: Record<'trips' | 'pairs' | 'badBeat' | 'progressive' | 'pairPlus' | 'sixCard', Side>; baseNet: number; baseWagered: number; game?: 'uth' | 'tcp' | 'bj' | null;
   series: { at: string; cumulative: number }[];
 }
 interface Side { bets: number; wins: number; wagered: number; returned: number; net: number; biggestPayout: number; combos: { combo: string; count: number }[] }
 const SIDE_NAME = { trips: 'Trips+', pairs: 'Ultimate Pairs', badBeat: 'Bad Beat', progressive: '$5 Progressive', pairPlus: 'Pair Plus', sixCard: 'Six Card Bonus' } as const;
-type Game = 'all' | 'uth' | 'tcp';
-const GAME_LABEL: Record<Game, string> = { all: 'All games', uth: 'Ultimate Texas Hold’em', tcp: 'Three Card Poker' };
-const SIDES_FOR: Record<Game, (keyof typeof SIDE_NAME)[]> = { all: ['trips', 'pairs', 'badBeat', 'progressive', 'pairPlus', 'sixCard'], uth: ['trips', 'pairs', 'badBeat', 'progressive'], tcp: ['pairPlus', 'sixCard'] };
+type Game = 'all' | 'uth' | 'tcp' | 'bj';
+const GAME_LABEL: Record<Game, string> = { all: 'All games', uth: 'Ultimate Texas Hold’em', tcp: 'Three Card Poker', bj: 'Blackjack' };
+const SIDES_FOR: Record<Game, (keyof typeof SIDE_NAME)[]> = { all: ['trips', 'pairs', 'badBeat', 'progressive', 'pairPlus', 'sixCard'], uth: ['trips', 'pairs', 'badBeat', 'progressive'], tcp: ['pairPlus', 'sixCard'], bj: [] };
 const EDGE: Record<Game, string> = {
   all: 'House edge with perfect strategy: Ultimate Hold’em about 2.2% of the Ante per hand; Three Card Poker about 3.4% of the Ante (Ante/Play).',
   uth: 'With perfect strategy the house edge is about 2.2% of the Ante per hand, roughly 0.5% of total action.',
+  bj: 'With basic strategy, six decks with the dealer standing on soft 17 and double after split, the house edge is roughly half a percent of the bet.',
   tcp: 'With Queen-6-4 strategy the Ante/Play house edge is about 3.4% of the Ante. Pair Plus (40-30-6-3-1) 7.3% and Six Card Bonus (1000-200-100-20-15-10-7) 8.6%, both computed exactly for these pay tables.',
 };
 let currentGame: Game = 'all';
-const LABEL: Record<string, string> = { play4: 'Play 4×', play3: 'Play 3×', play2: 'Play 2×', play1: 'Play 1×', check: 'Check', fold: 'Fold' };
-const PHASE: Record<string, string> = { preflop: 'Pre-flop', flop: 'Flop', river: 'River', decide: 'Three Card Poker: Play or Fold' };
+const LABEL: Record<string, string> = { play4: 'Play 4×', play3: 'Play 3×', play2: 'Play 2×', play1: 'Play 1×', check: 'Check', fold: 'Fold',
+  hit: 'Hit', stand: 'Stand', double: 'Double', split: 'Split', surrender: 'Surrender', insure: 'Insurance', 'no-insurance': 'No insurance' };
+const PHASE: Record<string, string> = { preflop: 'Pre-flop', flop: 'Flop', river: 'River', decide: 'Three Card Poker: Play or Fold', bj: 'Blackjack decisions' };
 
 export async function mountStats(root: HTMLElement, nav: (p: string) => void) {
   root.replaceChildren(h('main', { class: 'page' }, h('p', { class: 'muted' }, 'Loading your statistics…')));
@@ -34,8 +37,8 @@ export async function mountStats(root: HTMLElement, nav: (p: string) => void) {
   const pct = (a: number, b: number) => (b ? `${Math.round((a / b) * 100)}%` : '—');
   const fig = (label: string, value: string, cls = '') => h('div', { class: 'fig' }, h('span', { class: `fig-v ${cls}` }, value), h('span', { class: 'fig-l' }, label));
 
-  const phaseList = currentGame === 'tcp' ? ['decide'] : currentGame === 'uth' ? ['preflop', 'flop', 'river'] : ['preflop', 'flop', 'river', 'decide'];
-  const phases = phaseList.filter((p) => currentGame !== 'all' || p !== 'decide' || s.byPhase.some((x) => x.phase === 'decide')).map((p) => {
+  const phaseList = currentGame === 'tcp' ? ['decide'] : currentGame === 'uth' ? ['preflop', 'flop', 'river'] : currentGame === 'bj' ? ['bj'] : ['preflop', 'flop', 'river', 'decide', 'bj'];
+  const phases = phaseList.filter((p) => currentGame !== 'all' || (p !== 'decide' && p !== 'bj') || s.byPhase.some((x) => x.phase === p)).map((p) => {
     const rows = s.byPhase.filter((x) => x.phase === p);
     const total = rows.reduce((a, r) => a + r.count, 0);
     const ok = rows.reduce((a, r) => a + r.correct, 0);
@@ -46,7 +49,7 @@ export async function mountStats(root: HTMLElement, nav: (p: string) => void) {
 
   root.replaceChildren(h('main', { class: 'page stats' },
     h('div', { class: 'page-head' }, h('button', { class: 'ghost', onclick: () => nav('/') }, '← Lobby'), h('h1', {}, 'Your statistics')),
-    h('div', { class: 'tabs game-tabs', role: 'tablist' }, ...(['all', 'uth', 'tcp'] as Game[]).map((g) => h('button', {
+    h('div', { class: 'tabs game-tabs', role: 'tablist' }, ...(['all', 'uth', 'tcp', 'bj'] as Game[]).map((g) => h('button', {
       class: `tab ${g === currentGame ? 'on' : ''}`, role: 'tab', 'aria-selected': String(g === currentGame),
       onclick: () => { currentGame = g; mountStats(root, nav); } }, GAME_LABEL[g]))),
     s.hands === 0 ? h('p', { class: 'empty' }, 'Play a hand and your results, decisions and bankroll history will appear here.') : null,
@@ -69,6 +72,7 @@ export async function mountStats(root: HTMLElement, nav: (p: string) => void) {
       h('h3', {}, 'Most common mistakes'),
       s.commonMistakes.length ? h('ol', { class: 'mistakes' }, ...s.commonMistakes.map((m) => h('li', {},
         `${PHASE[m.phase]}: ${LABEL[m.action]} instead of ${LABEL[m.recommended]}`, h('span', { class: 'muted' }, ` — ${m.count}× · ${m.evCost.toFixed(2)} antes`)))) : h('p', { class: 'muted' }, 'None yet.')),
+    qualitySection(currentGame),
     sideSection(s)));
 }
 
