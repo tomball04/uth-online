@@ -12,12 +12,13 @@ import type { AvatarData, PublicLook } from '../shared/cosmetics.js';
 import {
   InsufficientFunds, type HandStart, type SettlementBuilder, type PlayerRow, type PlayerSettlementRow, type PlayerStats,
   type DebtEvent, type NightRow, type CosmeticState, type PurchaseResult, type RewardFacts, type StyleTx, type RecentHandRow, type ReplayData, type StackRow, type Store, type TableRow,
-  toQHand,
+  toQHand, JACKPOT_ID, type MeterRow, type MeterSpec, type ProgHitRow, type ProgTx,
 } from './store.js';
 
 interface HP {
   playerId: string; seat: number; name: string; hole: string[]; ante: number; blind: number; trips: number; play: number;
   pairs: number; badBeat: number; progressive: number; pairPlus: number; sixCard: number; row: PlayerSettlementRow | null;
+  progMeter?: string | null; progContribution?: number; sides?: Record<string, number>; sideResults?: unknown[] | null;
   folded: boolean; outcome: string | null; handName: string | null; handRank: number | null; net: number | null;
   tripsNet: number | null; settlement: unknown; settled: boolean;
 }
@@ -25,7 +26,7 @@ interface H {
   id: string; tableCode: string; handNumber: number; status: 'active' | 'settled' | 'voided'; deckCommitment: string;
   dealer: string[]; community: string[]; participants: number; dealerHand: string | null; dealerQualifies: boolean | null;
   startedAt: Date; settledAt: Date | null; players: HP[]; pairsVariant: string; badBeatVariant: string;
-  nightId: string; rulesVersion: string; game: GameId;
+  nightId: string; rulesVersion: string; game: GameId; rulesProfile?: Record<string, unknown> | null;
 }
 interface L { key: string; playerId: string; code: string; handId?: string; kind: string; amount: number; after: number }
 
@@ -38,8 +39,15 @@ export class MemoryStore implements Store {
   decisions: (DecisionRecord & { handId: string; playerId: string; at: Date })[] = [];
   ledger: L[] = [];
   keys = new Set<string>();
-  jackpot = PROGRESSIVE.seed;
-  jackpotHits: { handId: string; playerId: string; hand: string; amount: number; meterBefore: number }[] = [];
+  /** §37 every meter by id; 'five-card-5' is the original UTH meter. */
+  meters = new Map<string, MeterRow>([[JACKPOT_ID, { id: JACKPOT_ID, amount: PROGRESSIVE.seed, seed: PROGRESSIVE.seed, game: 'uth', variant: 'five-card-5', profile: 'casino', hits: 0 }]]);
+  get jackpot() { return this.meters.get(JACKPOT_ID)!.amount; }
+  set jackpot(v: number) { this.meters.get(JACKPOT_ID)!.amount = v; }
+  jackpotHits: (ProgHitRow & { handId: string })[] = [];
+  progTxs: (ProgTx & { handId: string; at: number })[] = [];
+  private ensureMeters(specs: MeterSpec[] | undefined) {
+    for (const m of specs ?? []) if (!this.meters.has(m.id)) this.meters.set(m.id, { ...m, amount: m.seed, hits: 0 });
+  }
 
   async init() {}
   async close() {}
@@ -131,7 +139,9 @@ export class MemoryStore implements Store {
   }
 
   async startHand(h: HandStart) {
-    const total = (p: HandStart['players'][0]) => p.ante + p.blind + p.trips + p.pairs + p.badBeat + p.progressive + (p.pairPlus ?? 0) + (p.sixCard ?? 0);
+    const total = (p: HandStart['players'][0]) => p.ante + p.blind + p.trips + p.pairs + p.badBeat + p.progressive + (p.pairPlus ?? 0) + (p.sixCard ?? 0)
+      + Object.values(p.sides ?? {}).reduce((t, x) => t + x, 0);
+    this.ensureMeters(h.meters);
     for (const p of h.players) {
       const s = this.stacks.get(this.sk(p.playerId, h.tableCode));
       if (!s || s.balance < total(p)) throw new InsufficientFunds('Insufficient balance');
@@ -139,7 +149,7 @@ export class MemoryStore implements Store {
     this.hands.set(h.id, {
       id: h.id, tableCode: h.tableCode, handNumber: h.handNumber, status: 'active', deckCommitment: h.deckCommitment,
       dealer: h.dealerCards, community: h.community, participants: h.players.length, dealerHand: null, dealerQualifies: null,
-      nightId: h.nightId, rulesVersion: h.rulesVersion, game: h.game ?? 'uth',
+      nightId: h.nightId, rulesVersion: h.rulesVersion, game: h.game ?? 'uth', rulesProfile: h.rulesProfile ?? null,
       startedAt: new Date(), settledAt: null, pairsVariant: h.pairsVariant, badBeatVariant: h.badBeatVariant,
       players: h.players.map((p) => ({ ...p, pairPlus: p.pairPlus ?? 0, sixCard: p.sixCard ?? 0, play: 0, folded: false, row: null, outcome: null, handName: null, handRank: null, net: null, tripsNet: null, settlement: null, settled: false })),
     });
@@ -147,11 +157,34 @@ export class MemoryStore implements Store {
     if (t) t.handCounter = h.handNumber;
     const out = new Map<string, number>();
     for (const p of h.players) out.set(p.playerId, this.debit(p.playerId, h.tableCode, h.id, total(p), `${h.id}:${p.playerId}:initial`)!);
-    this.jackpot += h.players.filter((p) => p.progressive > 0).length * PROGRESSIVE.contribution;
-    return { balances: out, jackpot: this.jackpot };
+    const meters = new Map<string, number>();
+    for (const p of h.players) if (p.progressive > 0) {
+      const m = this.meters.get(p.progMeter ?? JACKPOT_ID)!;
+      m.amount += p.progContribution ?? PROGRESSIVE.contribution;
+      meters.set(m.id, m.amount);
+    }
+    return { balances: out, jackpot: this.jackpot, meters };
   }
 
   async getJackpot() { return this.jackpot; }
+  async getMeters() { return [...this.meters.values()].map((m) => ({ ...m })).sort((a, b) => a.id.localeCompare(b.id)); }
+  async bonusRows(playerId: string) {
+    const out: import('../shared/bjsides.js').BonusRow[] = [];
+    for (const h of [...this.hands.values()].sort((a, b) => (a.settledAt?.getTime() ?? 0) - (b.settledAt?.getTime() ?? 0))) {
+      if (h.status !== 'settled' || h.game !== 'bj') continue;
+      const hp = h.players.find((x) => x.playerId === playerId);
+      if (!hp || (!hp.sideResults?.length && !hp.progressive)) continue;
+      const p = (hp.settlement as { progressive?: { amount: number; combo: string | null; fromMeter?: boolean } } | null)?.progressive;
+      out.push({ handId: h.id, handNumber: h.handNumber, at: h.settledAt!.getTime(), tableCode: h.tableCode, mainNet: hp.row?.baseNet ?? 0,
+        results: (hp.sideResults ?? []) as never,
+        prog: hp.progressive ? { stake: hp.progressive, amount: p?.amount ?? 0, combo: p?.combo ?? null, contrib: hp.progContribution ?? 0, meterId: hp.progMeter ?? null, fromMeter: !!p?.fromMeter } : null });
+    }
+    return out;
+  }
+
+  async progressiveTx(f: { playerId?: string; meterId?: string }, limit: number) {
+    return this.progTxs.filter((t) => (!f.playerId || t.playerId === f.playerId) && (!f.meterId || t.meterId === f.meterId)).slice(-limit).reverse();
+  }
 
   async wager(handId: string, p: string, c: string, amount: number, key: string) {
     const h = this.hands.get(handId);
@@ -178,17 +211,26 @@ export class MemoryStore implements Store {
     if (d) { d.evCost = evCost; d.evExact = exact; if (cents !== undefined) d.evCostCents = cents; }
   }
 
-  async settleHand(handId: string, code: string, dealer: { hand: string; qualifies: boolean }, build: SettlementBuilder) {
+  async settleHand(handId: string, code: string, dealer: { hand: string; qualifies: boolean }, build: SettlementBuilder, meterIds: string[] = []) {
     const balances = new Map<string, number>();
     const h = this.hands.get(handId);
-    if (!h || h.status !== 'active') return { applied: false, balances, jackpot: this.jackpot };
-    const { rows, jackpotAfter, hits } = build(this.jackpot);
-    this.jackpot = jackpotAfter;
+    const locked = new Map<string, number>();
+    for (const id of [...new Set([JACKPOT_ID, ...meterIds])].sort()) { const m = this.meters.get(id); if (m) locked.set(id, m.amount); }
+    if (!h || h.status !== 'active') return { applied: false, balances, jackpot: this.jackpot, meters: locked };
+    const { rows, meters: after = new Map(), hits = [], progTx = [] } = build(new Map(locked));
+    for (const [id, amount] of after) {
+      if (!locked.has(id)) throw new Error(`Meter ${id} was not locked for this settlement`);
+      if (amount < 0) throw new Error(`Meter ${id} would go negative`);
+      const m = this.meters.get(id)!;
+      m.amount = amount; m.hits += hits.filter((x) => x.meterId === id).length;
+      locked.set(id, amount);
+    }
     this.jackpotHits.push(...hits.map((x) => ({ ...x, handId })));
+    this.progTxs.push(...progTx.map((t) => ({ ...t, handId, at: Date.now() })));
     for (const r of rows) {
       const hp = h.players.find((x) => x.playerId === r.playerId)!;
       Object.assign(hp, { outcome: r.outcome, handName: r.handName, handRank: r.handRank, net: r.net, tripsNet: r.tripsNet,
-        settlement: r.settlement, play: r.play, folded: r.folded, settled: true, row: r });
+        settlement: r.settlement, play: r.play, folded: r.folded, settled: true, row: r, sideResults: r.sideResults ?? null });
       const s = this.stacks.get(this.sk(r.playerId, code))!;
       if (r.credit > 0) {
         s.balance += r.credit;
@@ -197,7 +239,7 @@ export class MemoryStore implements Store {
       balances.set(r.playerId, s.balance);
     }
     Object.assign(h, { status: 'settled', settledAt: new Date(), dealerHand: dealer.hand, dealerQualifies: dealer.qualifies });
-    return { applied: true, balances, jackpot: this.jackpot };
+    return { applied: true, balances, jackpot: this.jackpot, meters: locked };
   }
 
   async voidActiveHands() {
@@ -213,8 +255,10 @@ export class MemoryStore implements Store {
         this.post({ key: `${h.id}:${p}:refund`, playerId: p, code: h.tableCode, handId: h.id, kind: 'refund', amount: amt, after: s.balance });
         refunds++;
       }
-      const prog = h.players.filter((p) => p.progressive > 0).length;
-      if (prog) this.jackpot = Math.max(PROGRESSIVE.seed, this.jackpot - prog * PROGRESSIVE.contribution);
+      for (const p of h.players) if (p.progressive > 0) {
+        const m = this.meters.get(p.progMeter ?? JACKPOT_ID)!;
+        m.amount = Math.max(m.seed, m.amount - (p.progContribution ?? PROGRESSIVE.contribution));
+      }
       h.status = 'voided';
     }
     return { hands, refunds };

@@ -17,7 +17,7 @@ import { type QDecision, type QHand, classify, currentSession, matches, summariz
 import { type NightHand, type NightHandPlayer, buildRecap } from '../../src/shared/recap';
 import { LINE, LINES, ROAST_DEALERS, contentReport, linesFor } from '../../src/shared/roast/library';
 import { CONTENT } from '../../src/shared/roast/lines';
-import { CATEGORIES, EXTRA, FACTS, PRIMARY, type RoastPayload } from '../../src/shared/roast/meta';
+import { BONUS, CATEGORIES, EXTRA, FACTS, PRIMARY, type RoastPayload } from '../../src/shared/roast/meta';
 import { cleanText, fill, profanityOf } from '../../src/shared/roast/render';
 import { viewRoast } from '../../src/shared/roast/view';
 import { RoastDirector, type RoundFacts, type RoundPlayer, grudgePhrase } from '../../src/server/roast';
@@ -952,13 +952,14 @@ describe('roast', () => {
       console.log(`[roast library] ${r.total} lines · complete: ${r.complete.join(', ')} · not yet written: ${r.incomplete.join(', ')}`);
       expect(PRIMARY.length).toBe(25);
     });
-    it('§32.13 library is complete: 25 primary situations × 12 dealers × 15 = 4,500 lines, plus 10 additional pools (1,800)', () => {
+    it('§32.13 library is complete: 25 primary situations × 12 dealers × 15 = 4,500 lines, plus 10 additional pools (1,800) and 5 Blackjack bonus situations (900)', () => {
       const r = contentReport();
       expect(r.incomplete).toEqual([]);
       expect(LINES.filter((l) => (PRIMARY as readonly string[]).includes(l.cat)).length).toBe(4500);
       expect(LINES.filter((l) => (EXTRA as readonly string[]).includes(l.cat)).length).toBe(1800);
-      expect(r.total).toBe(6300);
-      expect(new Set(LINES.map((l) => l.id)).size).toBe(6300);
+      expect(LINES.filter((l) => (BONUS as readonly string[]).includes(l.cat)).length).toBe(900);    // §34.11 Blackjack bonus outcomes
+      expect(r.total).toBe(7200);
+      expect(new Set(LINES.map((l) => l.id)).size).toBe(7200);
     });
   });
 
@@ -1414,6 +1415,350 @@ describe('tcp', () => {
       expect(tcpDescribe(E('Kc Kd 4s'))).toBe('Pair of Kings');
       expect(tcpDescribe(E('7c 7d 7s'))).toBe('Three Sevens');
       expect(tcpDescribe(E('9h Th Jh'))).toBe('Straight Flush');
+    });
+  });
+});
+
+// ==================================================================== §33–§39 payout audit (pay tables, rankings, progressives, BJ side bets)
+import * as T3 from '../../src/shared/tcp';
+import * as RU from '../../src/shared/rules';
+import * as SB from '../../src/shared/sidebets';
+import * as PG from '../../src/shared/progressive';
+import * as BS from '../../src/shared/bjsides';
+import * as EV from '../../src/shared/evaluator';
+import { cardToInt as c2i } from '../../src/shared/cards';
+// @ts-expect-error — plain ESM script, no type declarations (kept that way so the file budget stays small)
+import { countFiles, FILE_CAP } from '../../scripts/count-files.mjs';
+
+const C3 = (s: string) => s.split(' ').map(c2i);
+describe('payouts', () => {
+  describe('§35 Three Card Poker ranking defect', () => {
+    it('exact reproduction: 8♠ 8♥ 8♦ beats A♣ J♣ 6♣ — Ante 1:1, Play 1:1, Ante Bonus 4:1, Pair Plus on the selected table, Progressive independent', () => {
+      const player = C3('8s 8h 8d'), dealer = C3('Ac Jc 6c');
+      expect(T3.tcpHandName(T3.evaluate3(player))).toBe('Three of a Kind');
+      expect(T3.tcpHandName(T3.evaluate3(dealer))).toBe('Flush');
+      for (const pp of Object.keys(T3.PAIR_PLUS_VARIANTS)) {
+        const st = T3.settleTcp({ ante: 500, play: 500, pairPlus: 500, sixCard: 0, folded: false, player, dealer, pairPlusVariant: pp,
+          progressive: 500, progressiveAward: { amount: 50_000, combo: 'Three of a Kind', label: 'Three of a Kind pays $500 for $5' } });
+        expect(st.outcome).toBe('win');
+        expect(st.dealerQualifies).toBe(true);
+        expect(st.ante).toMatchObject({ result: 'win', net: 500, credit: 1000 });
+        expect(st.play).toMatchObject({ result: 'win', net: 500, credit: 1000 });
+        expect(st.anteBonus).toMatchObject({ result: 'win', net: 2000, multiplier: 4 });
+        const m = T3.PAIR_PLUS_VARIANTS[pp].table['Three of a Kind']!;
+        expect(st.pairPlus).toMatchObject({ result: 'win', net: 500 * m, credit: 500 + 500 * m });
+        expect(st.progressive).toMatchObject({ result: 'win', credit: 50_000, net: 49_500 });   // for 1: the $5 is not returned
+        expect(st.net).toBe(st.totalCredit - st.totalStake);
+      }
+      // PT7 at the High Roller ($5) profile: Three of a Kind is 100 for 1 → 500 chips total, nothing else returned.
+      const p = PG.progSetup('tcp-pt7', 'high-roller');
+      expect(p.variant.evaluate({ hole: player, suit: 0 })).toBe('Three of a Kind');
+      const r = PG.resolveMeter(p, [{ playerId: 'a', seat: 0, combo: 'Three of a Kind' }], p.seed);
+      expect(r.awards.get('a')!.amount).toBe(50_000);
+      expect(r.meterAfter).toBe(p.seed);
+    });
+    it('reversed: the dealer’s Three of a Kind beats the player’s Flush; Pair Plus and the Progressive still pay on the player’s Flush/none', () => {
+      const st = T3.settleTcp({ ante: 500, play: 500, pairPlus: 500, sixCard: 0, folded: false, player: C3('Ac Jc 6c'), dealer: C3('8s 8h 8d'), pairPlusVariant: 'pp-8', progressive: 500, progressiveAward: null });
+      expect(st.outcome).toBe('lose');
+      expect(st.ante.net + st.play.net).toBe(-1000);
+      expect(st.anteBonus.result).toBe('none');                      // Ante Bonus is Straight or better
+      expect(st.pairPlus).toMatchObject({ result: 'win', multiplier: 3 });   // Flush 3:1 on pp-8
+      expect(st.progressive).toMatchObject({ result: 'lose', net: -500 });
+      expect(PG.progSetup('tcp-pt7', 'casino').variant.evaluate({ hole: C3('Ac Jc 6c'), suit: 0 })).toBeNull();
+    });
+    it('all six categories against each other, in Three Card order', () => {
+      const H: [string, string][] = [['High Card', 'Ks 9d 4c'], ['Pair', '5s 5d 2c'], ['Flush', '2h 7h Jh'], ['Straight', '4s 5d 6c'], ['Three of a Kind', '3s 3d 3c'], ['Straight Flush', '9c Tc Jc']];
+      for (let i = 0; i < H.length; i++) for (let j = 0; j < H.length; j++) {
+        const a = T3.evaluate3(C3(H[i][1])), b = T3.evaluate3(C3(H[j][1]));
+        expect(T3.tcpHandName(a)).toBe(H[i][0]);
+        expect(Math.sign(a - b), `${H[i][0]} vs ${H[j][0]}`).toBe(Math.sign(i - j));
+      }
+    });
+    it('kickers, A-K-Q and A-2-3 straights, ties, qualification', () => {
+      const s = (x: string) => T3.evaluate3(C3(x));
+      expect(s('Ks Qd 4c')).toBeGreaterThan(s('Ks Jd 9c'));
+      expect(s('As Ad 3c')).toBeGreaterThan(s('Ks Kd Qc'));
+      expect(s('9s 9d Ac')).toBeGreaterThan(s('9h 9c Kd'));
+      expect(s('2h 7h Kh')).toBeGreaterThan(s('2c 8c Qc'));
+      expect(T3.tcpHandName(s('As Kd Qc'))).toBe('Straight');
+      expect(T3.tcpHandName(s('As 2d 3c'))).toBe('Straight');
+      expect(s('As Kd Qc')).toBeGreaterThan(s('Ks Qd Jc'));
+      expect(s('As 2d 3c')).toBeLessThan(s('2s 3d 4c'));            // A-2-3 is the lowest straight
+      expect(T3.tcpHandName(s('Ks As 2s'))).toBe('Flush');           // no wrap-around
+      expect(s('Kh Qd 4c')).toBe(s('Ks Qc 4d'));                     // tie
+      const tie = T3.settleTcp({ ante: 500, play: 500, pairPlus: 0, sixCard: 0, folded: false, player: C3('Kh Qd 4c'), dealer: C3('Ks Qc 4d') });
+      expect(tie).toMatchObject({ outcome: 'push', ante: { result: 'push' }, play: { result: 'push' } });
+      expect(T3.tcpQualifies(s('Qs 6d 4c'))).toBe(true);
+      expect(T3.tcpQualifies(s('Js Td 8c'))).toBe(false);
+      const nq = T3.settleTcp({ ante: 500, play: 500, pairPlus: 0, sixCard: 0, folded: false, player: C3('2s 5d 9c'), dealer: C3('Js Td 8c') });
+      expect(nq).toMatchObject({ outcome: 'win', ante: { net: 500 }, play: { result: 'push', net: 0 } });
+    });
+    it('the stored history rank keeps Three Card order (the old five-card map put Flush above Three of a Kind)', () => {
+      const r = T3.TCP_STORED_RANK;
+      expect(r['Straight Flush']).toBeGreaterThan(r['Three of a Kind']);
+      expect(r['Three of a Kind']).toBeGreaterThan(r.Straight);
+      expect(r.Straight).toBeGreaterThan(r.Flush);
+      expect(r.Flush).toBeGreaterThan(r.Pair);
+    });
+    it('A-K-Q suited is a Mini Royal only for Mini Royal Pair Plus tables and progressives — never a five-card Royal Flush', () => {
+      const akq = C3('As Ks Qs');
+      expect(T3.tcpHandName(T3.evaluate3(akq))).toBe('Straight Flush');
+      expect(T3.isMiniRoyal(akq)).toBe(true);
+      expect(T3.pairPlusPay('pp-1', akq)).toEqual({ combo: 'Straight Flush', mult: 40 });
+      expect(T3.pairPlusPay('pp-mr4', akq)).toEqual({ combo: 'Mini Royal', mult: 200 });
+      expect(PG.PROG_VARIANTS['tcp-pt7'].evaluate({ hole: akq, suit: 0 })).toBe('A-K-Q (jackpot suit)');
+      expect(PG.PROG_VARIANTS['tcp-pt7'].evaluate({ hole: C3('Ah Kh Qh'), suit: 0 })).toBe('A-K-Q suited');
+    });
+    it('every Pair Plus table: each payable category pays its row, nothing else pays', () => {
+      const hands: Record<string, string> = { 'Straight Flush': '9c Tc Jc', 'Three of a Kind': '3s 3d 3c', Straight: '4s 5d 6c', Flush: '2h 7h Jh', Pair: '5s 5d 2c' };
+      for (const v of Object.values(T3.PAIR_PLUS_VARIANTS)) {
+        for (const [cat, cards] of Object.entries(hands)) expect(T3.pairPlusPay(v.id, C3(cards)), `${v.id} ${cat}`).toEqual({ combo: cat, mult: v.table[cat as 'Pair'] });
+        expect(T3.pairPlusPay(v.id, C3('Ks 9d 4c'))).toBeNull();
+      }
+    });
+    it('Six Card Bonus: every paying combination uses standard five-card ranks (best five of six)', () => {
+      const six = (p: string, d: string) => T3.settleTcp({ ante: 100, play: 0, pairPlus: 0, sixCard: 100, folded: true, player: C3(p), dealer: C3(d) }).sixCard;
+      expect(six('As Ks Qs', 'Js Ts 2d')).toMatchObject({ combo: 'Royal Flush', multiplier: 1000 });
+      expect(six('9s 8s 7s', '6s 5s 2d')).toMatchObject({ combo: 'Straight Flush', multiplier: 200 });
+      expect(six('9s 9h 9d', '9c 5s 2d')).toMatchObject({ combo: 'Four of a Kind', multiplier: 100 });
+      expect(six('9s 9h 9d', '5c 5s 2d')).toMatchObject({ combo: 'Full House', multiplier: 20 });
+      expect(six('2h 7h Jh', '4h 9h Kc')).toMatchObject({ combo: 'Flush', multiplier: 15 });
+      expect(six('4s 5d 6c', '7h 8c Kd')).toMatchObject({ combo: 'Straight', multiplier: 10 });
+      expect(six('3s 3d 3c', 'Kh 8c 2d')).toMatchObject({ combo: 'Three of a Kind', multiplier: 7 });
+      expect(six('3s 3d 9c', 'Kh 8c 2d')).toMatchObject({ result: 'lose' });
+    });
+  });
+
+  describe('§36 Ultimate Texas Hold’em pay tables', () => {
+    const rank = (cards: string) => EV.evaluate(cards.split(' ').map(c2i));
+    const sevens: Record<string, string> = {
+      'Royal Flush': 'As Ks Qs Js Ts 2d 3c', 'Straight Flush': '9s 8s 7s 6s 5s 2d 3c', 'Four of a Kind': '9s 9h 9d 9c 5s 2d 3c', 'Full House': '9s 9h 9d 5c 5s 2d 3h',
+      Flush: '2h 7h Jh 4h 9h Kc 3d', Straight: '4s 5d 6c 7h 8c Kd 2s', 'Three of a Kind': '3s 3d 3c Kh 8c 2d 9s',
+    };
+    it('all five Trips configurations (UTH-01 … UTH-05): every row, and Two Pair loses', () => {
+      const exp: Record<string, number[]> = { 'Royal Flush': [50, 50, 50, 50, 50], 'Straight Flush': [40, 40, 40, 40, 40], 'Four of a Kind': [30, 30, 30, 20, 30],
+        'Full House': [9, 8, 8, 7, 7], Flush: [7, 6, 7, 6, 6], Straight: [4, 5, 4, 5, 5], 'Three of a Kind': [3, 3, 3, 3, 3] };
+      (['uth-01', 'uth-02', 'uth-03', 'uth-04', 'uth-05'] as const).forEach((v, i) => {
+        for (const [hand, cards] of Object.entries(sevens)) expect(RU.settleTrips(100, rank(cards), v), `${v} ${hand}`).toMatchObject({ result: 'win', net: 100 * exp[hand][i] });
+        expect(RU.settleTrips(100, rank('9s 9h 5d 5c Ks 2d 3h'), v).result).toBe('lose');
+      });
+      expect(RU.DEFAULT_TRIPS_VARIANT).toBe('uth-02');
+    });
+    it('Blind: 500 / 50 / 10 / 3 / 3:2 / 1 on a winning hand; a win below a Straight pushes', () => {
+      expect(RU.BLIND_PAYTABLE).toEqual({ 'Royal Flush': [500, 1], 'Straight Flush': [50, 1], 'Four of a Kind': [10, 1], 'Full House': [3, 1], Flush: [3, 2], Straight: [1, 1] });
+    });
+    const P = (s: string) => s.split(' ').map(c2i);
+    it('all six Ultimate Pairs schedules: first matching row only, A♥A♦ specials, both-aces only on UP-02, and losses', () => {
+      const pay = (v: SB.PairsVariant['id'], hole: string, dealer = '2c 7d') => { const r = SB.evaluatePairs(SB.PAIRS_VARIANTS[v], P(hole), P(dealer)); return r.won ? r.payout : 0; };
+      // UP-01 / UP-02
+      for (const v of ['up-01', 'up-bonus2'] as const) {
+        expect(pay(v, 'Ah Ad')).toBe(30); expect(pay(v, 'As Ks')).toBe(25); expect(pay(v, 'As Qs')).toBe(20); expect(pay(v, 'As Jh'.replace('h', 's'))).toBe(20);
+        expect(pay(v, 'As Kd')).toBe(15); expect(pay(v, 'Ks Kd')).toBe(10); expect(pay(v, 'Js Jd')).toBe(10); expect(pay(v, 'As Qd')).toBe(5); expect(pay(v, 'Ts Td')).toBe(3);
+        expect(pay(v, '2s 2d')).toBe(3); expect(pay(v, 'As Td')).toBe(0); expect(pay(v, 'Ks Qs')).toBe(0);
+      }
+      expect(pay('up-bonus2', 'As Ad', 'Ac Ah')).toBe(1000);
+      expect(pay('up-01', 'As Ad', 'Ac Ah')).toBe(30);
+      expect(SB.evaluatePairs(SB.PAIRS_VARIANTS['up-bonus2'], P('As Ad'), null).payout).toBe(30);   // never confirmed before the dealer's cards are known
+      // UP-03 … UP-06
+      const t: Record<string, [number, number, number, number]> = { 'up-03': [30, 30, 5, 30], 'up-bonus4': [100, 30, 4, 30], 'up-05': [50, 25, 5, 25], 'up-06': [25, 25, 5, 25] };
+      for (const [v, [ahad, aa, pair, aceSpadeClub]] of Object.entries(t) as [SB.PairsVariant['id'], number[]][]) {
+        expect(pay(v, 'Ah Ad'), `${v} A♥A♦`).toBe(ahad);
+        expect(pay(v, 'As Ac'), `${v} other aces`).toBe(aceSpadeClub ?? aa);
+        expect(pay(v, 'As Ks')).toBe(20); expect(pay(v, 'As Jd')).toBe(10); expect(pay(v, 'Ks Kd')).toBe(pair); expect(pay(v, '2s 2d')).toBe(pair);
+        expect(pay(v, 'As 9s')).toBe(0);
+      }
+    });
+    it('all three Bad Beat schedules pay on the losing hand (kickers count, ties never qualify, below Three of a Kind loses)', () => {
+      const col: Record<string, [number, number, number]> = { 'Straight Flush': [10000, 7500, 2500], 'Four of a Kind': [500, 500, 500], 'Full House': [40, 50, 50],
+        Flush: [25, 30, 30], Straight: [20, 20, 20], 'Three of a Kind': [9, 9, 9] };
+      const losing: Record<string, string> = { 'Straight Flush': '9s 8s 7s 6s 5s 2d 3c', 'Four of a Kind': '9s 9h 9d 9c 5s 2d 3c', 'Full House': '9s 9h 9d 5c 5s 2d 3h',
+        Flush: '2h 7h Jh 4h 9h Kc 3d', Straight: '4s 5d 6c 7h 8c Kd 2s', 'Three of a Kind': '3s 3d 3c Kh 8c 2d 9s' };
+      (['bb-01', 'bb-02', 'bb-03'] as const).forEach((v, i) => {
+        for (const [hand, cards] of Object.entries(losing)) {
+          const r = SB.evaluateBadBeat(SB.BAD_BEAT_VARIANTS[v], rank(cards), rank('As Ks Qs Js Ts 2d 3c'));
+          expect(r, `${v} ${hand}`).toMatchObject({ won: true, payout: col[hand][i], loser: 'player' });
+          const d = SB.evaluateBadBeat(SB.BAD_BEAT_VARIANTS[v], rank('As Ks Qs Js Ts 2d 3c'), rank(cards));
+          expect(d).toMatchObject({ won: true, payout: col[hand][i], loser: 'dealer' });
+        }
+        expect(SB.evaluateBadBeat(SB.BAD_BEAT_VARIANTS[v], rank('9s 9h 9d 5c 5s 2d 3h'), rank('9s 9h 9d 5c 5s 2d 3h')).won).toBe(false);
+        expect(SB.evaluateBadBeat(SB.BAD_BEAT_VARIANTS[v], rank('9s 9h 5d 5c Ks 2d 3h'), rank('As Ks Qs Js Ts 2d 3c')).won).toBe(false);
+      });
+      // kicker decides who lost: same trips, different kicker
+      const r = SB.evaluateBadBeat(SB.BAD_BEAT_VARIANTS['bb-01'], rank('3s 3d 3c Kh 8c 2d 9s'), rank('3s 3d 3c Ah 8c 2d 9s'));
+      expect(r).toMatchObject({ won: true, loser: 'player', payout: 9 });
+    });
+    it('UTH Progressive V2: hidden Royal takes the meter (+ Envy to others), board Royal is a fixed 1,000 for 1, SF 250, Quads 75, Full House 10; highest only', () => {
+      const v = PG.PROG_VARIANTS['uth-v2'];
+      expect(v.evaluate({ hole: P('As Ks'), board: P('Qs Js Ts 2d 3c') })).toBe('Royal Flush (hidden)');
+      expect(v.evaluate({ hole: P('2h 3h'), board: P('As Ks Qs Js Ts') })).toBe('Royal Flush (board)');
+      expect(v.evaluate({ hole: P('9s 8s'), board: P('7s 6s 5s 2d 3c') })).toBe('Straight Flush');
+      expect(v.evaluate({ hole: P('9s 9h'), board: P('9d 9c 5s 2d 3c') })).toBe('Four of a Kind');
+      expect(v.evaluate({ hole: P('9s 9h'), board: P('9d 5c 5s 2d 3h') })).toBe('Full House');
+      expect(v.evaluate({ hole: P('2h 7h'), board: P('Jh 4h 9h Kc 3d') })).toBeNull();      // Flush pays nothing on V2
+      const p = PG.progSetup('uth-v2', 'casino');
+      const r = PG.resolveMeter(p, [
+        { playerId: 'a', seat: 0, combo: 'Royal Flush (hidden)' }, { playerId: 'b', seat: 1, combo: 'Royal Flush (board)' },
+        { playerId: 'c', seat: 2, combo: 'Straight Flush' }, { playerId: 'd', seat: 3, combo: null }], 5_000_000);
+      expect(r.awards.get('a')).toMatchObject({ base: 5_000_000, envy: 0, fromMeter: true });
+      expect(r.awards.get('b')).toMatchObject({ base: 100_000, envy: 10_000, amount: 110_000 });       // the board royal never drains the meter
+      expect(r.awards.get('c')).toMatchObject({ base: 25_000, envy: 10_000 });
+      expect(r.awards.get('d')).toMatchObject({ base: 0, envy: 10_000, amount: 10_000 });
+      expect(r.meterAfter).toBe(p.seed);
+      expect(r.hits).toHaveLength(1);
+    });
+    it('Five Card Progressive (original) is unchanged at its published $5 profile', () => {
+      const p = PG.progSetup('five-card-5', 'casino');
+      expect([p.wager, p.seed, p.contribution, p.meterId]).toEqual([500, 1_000_000, 350, 'five-card-5']);
+    });
+  });
+
+  describe('§37 progressive service', () => {
+    const P = (s: string) => s.split(' ').map(c2i);
+    it('separate meter ids per game, variant and profile; High Roller is $5 with a $25,000 start and scaled fixed awards', () => {
+      const ids = PG.ALL_SETUPS.map((s) => s.meterId);
+      expect(new Set(ids).size).toBe(ids.length);
+      const hr = PG.progSetup('bj-213-16', 'high-roller'), pub = PG.progSetup('bj-213-16', 'casino');
+      expect([hr.wager, hr.seed, hr.custom, pub.wager, pub.seed, pub.custom]).toEqual([500, 2_500_000, true, 100, 200_000, false]);
+      const a = PG.resolveMeter(hr, [{ playerId: 'x', seat: 0, combo: 'Straight Flush' }], hr.seed).awards.get('x')!;
+      const b = PG.resolveMeter(pub, [{ playerId: 'x', seat: 0, combo: 'Straight Flush' }], pub.seed).awards.get('x')!;
+      expect(a.amount).toBe(b.amount * 5);
+      expect(PG.PROG_DEFAULT).toEqual({ uth: 'uth-v2', tcp: 'tcp-pt7', bj: 'bj-213-16' });
+    });
+    it('percentage awards, multiple winners in seat order, never negative and never below the seed', () => {
+      const p = PG.progSetup('five-card-5', 'casino');
+      const r = PG.resolveMeter(p, [{ playerId: 'b', seat: 3, combo: 'Straight Flush' }, { playerId: 'a', seat: 1, combo: 'Royal Flush' }], 2_000_050);
+      expect(r.hits.map((h) => h.playerId)).toEqual(['a', 'b']);       // seat order: the royal takes it all first
+      expect(r.awards.get('a')!.base).toBe(2_000_000);                 // whole dollars, rounded down
+      expect(r.hits[1].meterBefore).toBe(p.seed + 50);
+      expect(r.awards.get('b')!.base).toBe(Math.floor((p.seed + 50) * 0.1 / 100) * 100);
+      expect(r.meterAfter).toBeGreaterThanOrEqual(p.seed);
+      expect(r.awards.get('a')!.envy).toBe(150_000);                   // b's Straight Flush pays Envy to a
+    });
+    it('21+3 Progressive (PT-PRG-213-16): Mini Royal in the jackpot suit, other Mini Royal, SF, trips (suited trips too), straight; flush loses', () => {
+      const v = PG.PROG_VARIANTS['bj-213-16'];
+      const e = (p: string, up: string, suit = 0) => v.evaluate({ hole: P(p), upcard: c2i(up), suit });
+      expect(e('As Ks', 'Qs')).toBe('Mini Royal (jackpot suit)');
+      expect(e('As Ks', 'Qs', 1)).toBe('Mini Royal');
+      expect(e('9h Th', 'Jh')).toBe('Straight Flush');
+      expect(e('7d 7d', '7d')).toBe('Three of a Kind');
+      expect(e('7d 7s', '7c')).toBe('Three of a Kind');
+      expect(e('4s 5d', '6c')).toBe('Straight');
+      expect(e('2h 7h', 'Jh')).toBeNull();
+      expect(v.rows.map((r) => r.amount ?? r.pct)).toEqual([100, 50_000, 7_500, 3_000, 500]);
+    });
+  });
+
+  describe('§34 Blackjack side bets', () => {
+    const ctx = (player: string, dealer: string, final = true, natural = false): BS.BjSideContext => ({ player: player.split(' '), dealer: dealer.split(' '), dealerFinal: final, playerNatural: natural });
+    const pay = (id: string, c: BS.BjSideContext, v?: string) => BS.settleBjSide(id, v ?? BS.BJ_SIDE[id].variants[0].id, 500, c);
+    it('catalog: six All Bets wagers + Lucky Ladies + Match the Dealer playable; unverified ones are unavailable with a reason', () => {
+      expect(BS.PLAYABLE_BJ_SIDES.map((d) => d.id)).toEqual(['perfect-player', 'perfect-dealer', 'twentyone3', 'top3', 'buster', 'lucky-lucky', 'lucky-ladies', 'match-dealer']);
+      for (const d of BS.BJ_SIDES.filter((x) => x.status === 'unavailable')) { expect(d.unavailable).toBeTruthy(); expect(d.variants).toEqual([]); }
+      for (const d of BS.PLAYABLE_BJ_SIDES) { expect(d.sources.length).toBeGreaterThan(0); expect(d.variants.length).toBeGreaterThan(0); }
+      expect(BS.BJ_SIDES.find((d) => d.id === 'lucky-ladies')!.variants.map((v) => v.id)).not.toContain('pt-fltll-04');
+    });
+    it('Perfect Player / Dealer Pairs: perfect (identical cards across decks), coloured, mixed, none', () => {
+      expect(pay('perfect-player', ctx('8h 8h', '2c 3d'))).toMatchObject({ result: 'win', pays: 25, credit: 500 * 26 });
+      expect(pay('perfect-player', ctx('8h 8d', '2c 3d'))).toMatchObject({ pays: 12 });
+      expect(pay('perfect-player', ctx('8h 8s', '2c 3d'))).toMatchObject({ pays: 6 });
+      expect(pay('perfect-player', ctx('8h 9h', '2c 3d'))).toMatchObject({ result: 'lose', net: -500 });
+      expect(pay('perfect-player', ctx('Kh Kh', '2c 3d'), 'pa-b')).toMatchObject({ pays: 30 });
+      expect(pay('perfect-dealer', ctx('2c 3d', 'Qs Qs'))).toMatchObject({ pays: 25 });
+      expect(pay('perfect-dealer', ctx('2c 3d', 'Qs Qc'))).toMatchObject({ pays: 12 });
+      expect(pay('perfect-dealer', ctx('2c 3d', 'Qs Qd'))).toMatchObject({ pays: 6 });
+      expect(BS.resolvableNow('dealer-hole', false, false)).toBe(false);      // never resolved before the hole card is shown
+    });
+    it('21+3 and Top 3: every row, highest only, and both win on the same cards', () => {
+      const t = (p: string, up: string) => ctx(p, `${up} 2c`);
+      expect(pay('twentyone3', t('7d 7d', '7d'))).toMatchObject({ pays: 100, combo: 'suited-trips' });
+      expect(pay('twentyone3', t('9h Th', 'Jh'))).toMatchObject({ pays: 40 });
+      expect(pay('twentyone3', t('7d 7s', '7c'))).toMatchObject({ pays: 30 });
+      expect(pay('twentyone3', t('4s 5d', '6c'))).toMatchObject({ pays: 10 });
+      expect(pay('twentyone3', t('Qs Kd', 'Ac'))).toMatchObject({ pays: 10 });
+      expect(pay('twentyone3', t('As 2d', '3c'))).toMatchObject({ pays: 10 });
+      expect(pay('twentyone3', t('2h 7h', 'Jh'))).toMatchObject({ pays: 5 });
+      expect(pay('twentyone3', t('2h 7d', 'Jh'))).toMatchObject({ result: 'lose' });
+      expect(pay('top3', t('7d 7d', '7d'))).toMatchObject({ pays: 270 });
+      expect(pay('top3', t('9h Th', 'Jh'))).toMatchObject({ pays: 180 });
+      expect(pay('top3', t('7d 7s', '7c'))).toMatchObject({ pays: 90 });
+      expect(pay('top3', t('4s 5d', '6c'))).toMatchObject({ result: 'lose' });
+      expect(pay('top3', t('7d 7d', '7d'), 'pa-b')).toMatchObject({ pays: 1000 });
+      const both = t('Qh Qh', 'Qh');
+      expect([pay('twentyone3', both).credit, pay('top3', both).credit]).toEqual([500 * 101, 500 * 271]);
+    });
+    it('Buster Blackjack counts the dealer’s busted cards, pays the Blackjack tiers, and loses when the dealer does not bust or is not finished', () => {
+      expect(pay('buster', ctx('Ts 7d', 'Ts 6d 6c'))).toMatchObject({ pays: 2, combo: '3-4' });
+      expect(pay('buster', ctx('Ts 7d', '2s 3d 4c 3h Tc'))).toMatchObject({ pays: 4 });
+      expect(pay('buster', ctx('Ts 7d', '2s 2d 2c 3h 4c Tc'))).toMatchObject({ pays: 18 });
+      expect(pay('buster', ctx('Ts 7d', 'As 2d 2c 2h 3c 4c Tc'))).toMatchObject({ pays: 50 });
+      expect(pay('buster', ctx('As Kd', 'As 2d 2c 2h 3c 4c Tc', true, true))).toMatchObject({ pays: 800 });
+      expect(pay('buster', ctx('Ts 7d', 'As Ad 2c 2h 2d 3c 4c Td'))).toMatchObject({ pays: 250 });
+      expect(pay('buster', ctx('As Kd', 'As Ad 2c 2h 2d 3c 4c Td', true, true))).toMatchObject({ pays: 2000 });
+      expect(pay('buster', ctx('Ts 7d', 'Ts 7d'))).toMatchObject({ result: 'lose' });          // dealer stood without drawing
+      expect(pay('buster', ctx('Ts 7d', 'Ts 6d 6c', false))).toMatchObject({ result: 'lose' }); // never paid before the hand is complete
+    });
+    it('Lucky Lucky: special 7-7-7 / 6-7-8 combinations, then totals with Blackjack ace counting; not poker', () => {
+      const L = (p: string, up: string) => pay('lucky-lucky', ctx(p, `${up} 2c`));
+      expect(L('7h 7h', '7h')).toMatchObject({ pays: 200 });
+      expect(L('6s 7s', '8s')).toMatchObject({ pays: 100 });
+      expect(L('7h 7d', '7c')).toMatchObject({ pays: 50 });
+      expect(L('8h 6d', '7c')).toMatchObject({ pays: 25 });
+      expect(L('9s Qs', '2s')).toMatchObject({ pays: 15 });
+      expect(L('As As', '9s')).toMatchObject({ pays: 15 });                // A+A+9 = 21 (11+1+9), suited
+      expect(L('9s Qd', '2s')).toMatchObject({ pays: 3 });
+      expect(L('Ks Qd', 'Ah')).toMatchObject({ pays: 3 });                 // 10+10+A(1) = 21
+      expect(L('Ks 8d', '2h')).toMatchObject({ pays: 2, combo: '20' });
+      expect(L('Ks 7d', '2h')).toMatchObject({ pays: 2, combo: '19' });
+      expect(L('4s 5d', '6c')).toMatchObject({ result: 'lose' });          // a straight is not a Lucky Lucky win
+    });
+    it('Lucky Ladies (PT-FLTLL-01/02/03): Q♥ pair with dealer Blackjack, Q♥ pair, matched, suited, any 20', () => {
+      const exp = { 'pt-fltll-01': [1000, 200, 20, 20, 4], 'pt-fltll-02': [1000, 150, 25, 10, 4], 'pt-fltll-03': [1000, 125, 20, 9, 4] };
+      for (const [v, [dbj, qh, m, s, a]] of Object.entries(exp)) {
+        expect(pay('lucky-ladies', ctx('Qh Qh', 'As Kd'), v)).toMatchObject({ pays: dbj });
+        expect(pay('lucky-ladies', ctx('Qh Qh', '9s Kd'), v)).toMatchObject({ pays: qh });
+        expect(pay('lucky-ladies', ctx('Ks Ks', '9s Kd'), v)).toMatchObject({ pays: m });
+        expect(pay('lucky-ladies', ctx('Ks Qs', '9s Kd'), v)).toMatchObject({ pays: s });
+        expect(pay('lucky-ladies', ctx('Ks Qd', '9s Kd'), v)).toMatchObject({ pays: a });
+        expect(pay('lucky-ladies', ctx('As 9d', '9s Kd'), v)).toMatchObject({ pays: a });   // soft 20 is a 20
+        expect(pay('lucky-ladies', ctx('Ks 9d', '9s Kd'), v)).toMatchObject({ result: 'lose' });
+      }
+    });
+    it('Match the Dealer (six-deck table): suited and unsuited matches combine into one payout', () => {
+      const M = (p: string, up: string) => pay('match-dealer', ctx(p, `${up} 2c`));
+      expect(M('7h 7h', '7h')).toMatchObject({ pays: 22 });
+      expect(M('7h 7d', '7h')).toMatchObject({ pays: 15 });
+      expect(M('7h 2d', '7h')).toMatchObject({ pays: 11 });
+      expect(M('7s 7d', '7h')).toMatchObject({ pays: 8 });
+      expect(M('7s 2d', '7h')).toMatchObject({ pays: 4 });
+      expect(M('8s 2d', '7h')).toMatchObject({ result: 'lose' });
+    });
+    it('host configuration: presets, custom validation, and bet validation (closed wager, limits, whole dollars, bankroll)', () => {
+      const all = BS.bjSidesPreset('allbets');
+      expect(BS.enabledBjSides(all).map((d) => d.id)).toEqual([...BS.ALL_BETS_SIX]);
+      expect(BS.enabledBjSides(BS.bjSidesPreset('classic'))).toEqual([]);
+      expect(BS.parseBjSidesConfig({ preset: 'custom', bets: { 'super-sevens': { on: true } } })).toMatch(/not available/);
+      expect(BS.parseBjSidesConfig({ preset: 'custom', bets: { top3: { variant: 'made-up' } } })).toMatch(/Unknown pay table/);
+      expect(BS.parseBjSidesConfig({ preset: 'custom', bets: { top3: { on: true, min: 500, max: 100 } } })).toMatch(/at least the minimum/);
+      const custom = BS.parseBjSidesConfig({ preset: 'custom', bets: { 'lucky-ladies': { on: true, variant: 'pt-fltll-02', min: 500, max: 5000 } } }) as BS.BjSidesConfig;
+      expect(custom.bets['lucky-ladies']).toEqual({ on: true, variant: 'pt-fltll-02', min: 500, max: 5000 });
+      expect(BS.validateBjSides({ 'lucky-ladies': 100 }, custom)).toMatch(/Minimum/);
+      expect(BS.validateBjSides({ 'lucky-ladies': 550 }, custom)).toMatch(/whole dollars/);
+      expect(BS.validateBjSides({ top3: 500 }, custom)).toMatch(/not open/);
+      expect(BS.validateBjSides({ 'hot-3': 500 }, custom)).toMatch(/not offered/);
+      const lim = { minAnte: 500, maxAnte: 10_000, bjSides: all, progressiveWager: 500 };
+      const bet = { ...RU.NO_BETS, ante: 2500, progressive: 500, bjSides: { 'perfect-player': 500, 'perfect-dealer': 500, twentyone3: 500, top3: 500, buster: 500, 'lucky-lucky': 500 } };
+      expect(RU.validateBjBet(bet, 6000, lim)).toBeNull();                   // $25 + 6×$5 + $5 = $60
+      expect(RU.validateBjBet(bet, 5900, lim)).toMatch(/Not enough chips/);  // insufficient bankroll
+      expect(RU.validateBjBet({ ...bet, progressive: 100 }, 6000, lim)).toMatch(/fixed \$5/);
+    });
+  });
+
+  describe('§33 file budget', () => {
+    it(`the project has no more than ${FILE_CAP} tracked files`, () => {
+      const r = countFiles();
+      console.log(`[file count] ${r.total} tracked files (cap ${r.cap}) · ${r.areas.map((a: { name: string; count: number }) => `${a.name} ${a.count}`).join(' · ')}`);
+      expect(r.total).toBeLessThanOrEqual(99);
+      expect(r.files.some((f: string) => f.startsWith('node_modules/') || f.startsWith('dist/'))).toBe(false);
     });
   });
 });

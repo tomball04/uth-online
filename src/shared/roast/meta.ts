@@ -29,8 +29,10 @@ export const PRIMARY = [
 ] as const;
 /** Additional pools (§32.13 "Additional dialogue requirements"). */
 export const EXTRA = ['intro', 'farewell', 'greet', 'comeback', 'meltdown', 'natural', 'comebackWin', 'rivalry', 'sideWin', 'improbable'] as const;
-export type RoastCategory = (typeof PRIMARY)[number] | (typeof EXTRA)[number];
-export const CATEGORIES: RoastCategory[] = [...PRIMARY, ...EXTRA];
+/** §34.11 Blackjack bonus outcomes (major Progressive hits reuse 'progressive'). */
+export const BONUS = ['bonusWin', 'doubleThree', 'sideSweep', 'smallMainBig', 'multiBonus'] as const;
+export type RoastCategory = (typeof PRIMARY)[number] | (typeof EXTRA)[number] | (typeof BONUS)[number];
+export const CATEGORIES: RoastCategory[] = [...PRIMARY, ...EXTRA, ...BONUS];
 
 export interface CategoryRule {
   title: string;
@@ -81,10 +83,15 @@ export const RULES: Record<RoastCategory, CategoryRule> = {
   rivalry: { title: 'Rivalry callback', priority: 15, cooldown: 12, target: 'personal' },
   sideWin: { title: 'Large side-bet win', priority: 40, cooldown: 2, target: 'personal' },
   improbable: { title: 'Spectacularly improbable', priority: 65, cooldown: 0, target: 'personal', major: true },
+  bonusWin: { title: 'Blackjack bonus win (Perfect Pairs, Lucky Ladies, Buster, triple sevens…)', priority: 47, cooldown: 1, target: 'personal' },
+  doubleThree: { title: 'Won both 21+3 and Top 3', priority: 72, cooldown: 0, target: 'personal', major: true },
+  sideSweep: { title: 'Lost several side bets at once', priority: 26, cooldown: 4, target: 'personal' },
+  smallMainBig: { title: 'Small main result, huge side-bet payout', priority: 62, cooldown: 2, target: 'personal' },
+  multiBonus: { title: 'Several players win different bonuses', priority: 57, cooldown: 3, target: 'group' },
 };
 
 /** Facts a line may use. A line is eligible only when every fact it names is known and verified. */
-export const FACTS = ['name', 'game', 'hand', 'dealerHand', 'amount', 'total', 'streak', 'wcw', 'acc', 'mistakes', 'count', 'witnessed', 'grudge', 'winner', 'rounds', 'dealer', 'prev'] as const;
+export const FACTS = ['name', 'game', 'hand', 'dealerHand', 'amount', 'total', 'streak', 'wcw', 'acc', 'mistakes', 'count', 'witnessed', 'grudge', 'winner', 'rounds', 'dealer', 'prev', 'bet', 'combo'] as const;
 export type Fact = (typeof FACTS)[number];
 export type RoastVars = Partial<Record<Fact, string>>;
 

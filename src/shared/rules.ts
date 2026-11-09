@@ -19,6 +19,7 @@ import {
   type BadBeatVariant, type PairsVariant,
 } from './sidebets.js';
 import { PROGRESSIVE, type ProgressiveAward } from './progressive.js';
+import { DEFAULT_BJ_SIDES, sumSides, validateBjSides, type BjSidesConfig } from './bjsides.js';
 
 export const CHIP_DENOMINATIONS = [100, 500, 2500, 10000, 50000] as const; // $1 $5 $25 $100 $500
 
@@ -40,16 +41,30 @@ export const BLIND_PAYTABLE: Partial<Record<HandName, [number, number]>> = {
   'Straight': [1, 1],
 };
 
-/** Trips+ pays on the player's own 7-card hand regardless of the dealer or a fold. */
-export const TRIPS_PAYTABLE: Partial<Record<HandName, number>> = {
-  'Royal Flush': 50,
-  'Straight Flush': 40,
-  'Four of a Kind': 30,
-  'Full House': 8,
-  'Flush': 6,
-  'Straight': 5,
-  'Three of a Kind': 3,
+/**
+ * Trips pays on the player's own best five of seven cards regardless of the dealer or a fold (X to 1).
+ * The five configurations are the Stadium Ultimate Texas Hold'em "Trips Bonus" columns UTH-01 … UTH-05
+ * (Washington State Gambling Commission, Stadium Ultimate Texas Hold'em rules of play and paytables).
+ * UTH-02 is the default base-game profile (it is also the classic Wizard of Odds table this game always used).
+ */
+export type TripsVariantId = 'uth-01' | 'uth-02' | 'uth-03' | 'uth-04' | 'uth-05';
+const TRIPS_ROWS: HandName[] = ['Royal Flush', 'Straight Flush', 'Four of a Kind', 'Full House', 'Flush', 'Straight', 'Three of a Kind'];
+const tripsCol = (...v: number[]) => Object.fromEntries(TRIPS_ROWS.map((n, i) => [n, v[i]])) as Partial<Record<HandName, number>>;
+export const TRIPS_VARIANTS: Record<TripsVariantId, { id: TripsVariantId; name: string; table: Partial<Record<HandName, number>> }> = {
+  'uth-01': { id: 'uth-01', name: 'UTH-01', table: tripsCol(50, 40, 30, 9, 7, 4, 3) },
+  'uth-02': { id: 'uth-02', name: 'UTH-02', table: tripsCol(50, 40, 30, 8, 6, 5, 3) },
+  'uth-03': { id: 'uth-03', name: 'UTH-03', table: tripsCol(50, 40, 30, 8, 7, 4, 3) },
+  'uth-04': { id: 'uth-04', name: 'UTH-04', table: tripsCol(50, 40, 20, 7, 6, 5, 3) },
+  'uth-05': { id: 'uth-05', name: 'UTH-05', table: tripsCol(50, 40, 30, 7, 6, 5, 3) },
 };
+export const DEFAULT_TRIPS_VARIANT: TripsVariantId = 'uth-02';
+export const isTripsVariant = (x: unknown): x is TripsVariantId => typeof x === 'string' && x in TRIPS_VARIANTS;
+export const STADIUM_UTH_SOURCE = {
+  title: 'Washington State Gambling Commission — Stadium Ultimate Texas Hold’em, rules of play and paytables',
+  url: "https://wsgc.wa.gov/sites/default/files/2024-08/3160_Approval&ROP_StadiumUltimateTexasHold'Em.pdf",
+};
+/** The default (UTH-02) table, kept under its old name for callers that only show the default. */
+export const TRIPS_PAYTABLE = TRIPS_VARIANTS[DEFAULT_TRIPS_VARIANT].table;
 
 export type WagerResult = 'win' | 'lose' | 'push' | 'none';
 
@@ -75,6 +90,7 @@ export interface SettleInput {
   progressiveAward?: ProgressiveAward | null; // resolved against the live meter at settlement
   pairsVariant?: PairsVariant['id'];
   badBeatVariant?: BadBeatVariant['id'];
+  tripsVariant?: TripsVariantId;
   playerHole?: number[]; // required when pairs > 0
   dealerHole?: number[]; // required when pairs > 0 (some variants pay on the dealer's cards)
   folded: boolean;
@@ -115,11 +131,11 @@ export function dealerQualifies(dealerScore: number): boolean {
   return categoryOf(dealerScore) >= Cat.Pair;
 }
 
-export function settleTrips(trips: number, playerScore: number): WagerOutcome {
+export function settleTrips(trips: number, playerScore: number, variant: TripsVariantId = DEFAULT_TRIPS_VARIANT): WagerOutcome {
   if (trips <= 0) return none();
   const name = handName(playerScore);
-  const mult = TRIPS_PAYTABLE[name];
-  return mult ? { ...win(trips, trips * mult, `${name} pays ${mult}:1`), multiplier: mult, combo: name } : lose(trips, name);
+  const mult = TRIPS_VARIANTS[variant].table[name];
+  return mult ? { ...win(trips, trips * mult, `${name} pays ${mult}:1`), multiplier: mult, combo: name, variant } : { ...lose(trips, name), variant };
 }
 
 export function settlePairs(stake: number, variantId: PairsVariant['id'], hole: number[] | undefined, dealerHole: number[] | undefined): WagerOutcome {
@@ -153,7 +169,7 @@ export function settle(i: SettleInput): Settlement {
   const playerHand = handName(i.playerScore);
   const dealerHand = handName(i.dealerScore);
   const qualifies = dealerQualifies(i.dealerScore);
-  const trips = settleTrips(i.trips, i.playerScore);
+  const trips = settleTrips(i.trips, i.playerScore, i.tripsVariant);
 
   let ante: WagerOutcome, blind: WagerOutcome, play: WagerOutcome, outcome: Settlement['outcome'];
 
@@ -235,10 +251,16 @@ export interface TableLimits {
   minAnte: number; maxAnte: number; maxTrips: number; maxPairs: number; maxBadBeat: number;
   badBeatVariant?: BadBeatVariant['id']; pairsVariant?: PairsVariant['id'];
   progressiveEnabled?: boolean;
+  /** Wager for the table's progressive profile (default: the $5 Five Card bet). */
+  progressiveWager?: number;
 }
 
 /** Opening bets. UTH uses ante/trips/pairs/badBeat/progressive; Three Card Poker uses ante/pairPlus/sixCard. */
-export interface InitialBets { ante: number; trips: number; pairs: number; badBeat: number; progressive: number; pairPlus: number; sixCard: number }
+export interface InitialBets {
+  ante: number; trips: number; pairs: number; badBeat: number; progressive: number; pairPlus: number; sixCard: number;
+  /** §34 Blackjack side bets {sideId: cents}; absent or {} when none. */
+  bjSides?: Record<string, number>;
+}
 export const NO_BETS: InitialBets = { ante: 0, trips: 0, pairs: 0, badBeat: 0, progressive: 0, pairPlus: 0, sixCard: 0 };
 export const sideTotal = (b: { trips: number; pairs?: number; badBeat?: number; progressive?: number; pairPlus?: number; sixCard?: number }) =>
   b.trips + (b.pairs ?? 0) + (b.badBeat ?? 0) + (b.progressive ?? 0) + (b.pairPlus ?? 0) + (b.sixCard ?? 0);
@@ -246,16 +268,27 @@ export type GameId = 'uth' | 'tcp' | 'bj';
 export const GAME_NAME: Record<GameId, string> = { uth: 'Ultimate Texas Hold’em', tcp: 'Three Card Poker', bj: 'Blackjack' };
 export const GAMES: GameId[] = ['uth', 'tcp', 'bj'];
 export const isGame = (x: unknown): x is GameId => x === 'uth' || x === 'tcp' || x === 'bj';
-/** Blackjack: one main wager per player, no side bets. Whole dollars keep 3:2 and half-bet insurance exact. */
-export function validateBjBet(b: InitialBets, balance: number, limits: { minAnte: number; maxAnte: number }): string | null {
+/**
+ * Blackjack opening bets: the main wager, any open side bets (§34) and the 21+3 Progressive if offered.
+ * Whole dollars keep 3:2 and half-bet insurance exact. Doubles and splits are offered later only if affordable.
+ */
+export function validateBjBet(b: InitialBets, balance: number, limits: { minAnte: number; maxAnte: number; bjSides?: BjSidesConfig; progressiveWager?: number | null }): string | null {
   const vals = [b.ante, b.trips, b.pairs, b.badBeat, b.progressive, b.pairPlus, b.sixCard];
   if (!vals.every((x) => typeof x === 'number' && Number.isSafeInteger(x))) return 'Bets must be whole amounts.';
   if (vals.some((x) => x < 0)) return 'Bets cannot be negative.';
-  if (vals.slice(1).some((x) => x > 0)) return 'Blackjack has a single wager — no side bets at this table.';
+  if (b.trips || b.pairs || b.badBeat || b.pairPlus || b.sixCard) return 'Those are poker bets — open the Bonus Bets panel for Blackjack side bets.';
   if (b.ante < limits.minAnte) return `Minimum bet is $${limits.minAnte / 100}.`;
   if (b.ante > limits.maxAnte) return `Maximum bet is $${limits.maxAnte / 100}.`;
   if (b.ante % 100) return 'Blackjack bets are whole dollars.';
-  if (b.ante > balance) return 'Not enough chips for that bet.';
+  if (b.bjSides && (typeof b.bjSides !== 'object' || Array.isArray(b.bjSides))) return 'Invalid side bets.';
+  const sideErr = validateBjSides(b.bjSides, limits.bjSides ?? DEFAULT_BJ_SIDES);
+  if (sideErr) return sideErr;
+  if (b.progressive) {
+    if (!limits.progressiveWager) return 'The 21+3 Progressive is not open at this table.';
+    if (b.progressive !== limits.progressiveWager) return `The 21+3 Progressive is a fixed $${limits.progressiveWager / 100} bet.`;
+  }
+  const need = b.ante + sumSides(b.bjSides) + b.progressive;
+  if (need > balance) return `Not enough chips: that needs $${need / 100} (main bet + bonus bets).`;
   return null;
 }
 
@@ -267,6 +300,7 @@ export function requiredToStart(ante: number, sideBets = 0): number {
 export function validateInitialBet(input: Omit<InitialBets, 'progressive' | 'pairPlus' | 'sixCard'> & { progressive?: number; pairPlus?: number; sixCard?: number }, balance: number, limits: TableLimits): string | null {
   const b: InitialBets = { ...input, progressive: input.progressive ?? 0, pairPlus: input.pairPlus ?? 0, sixCard: input.sixCard ?? 0 };
   if (b.pairPlus || b.sixCard) return 'Pair Plus and Six Card Bonus are Three Card Poker bets.';
+  if (b.bjSides && sumSides(b.bjSides)) return 'Those are Blackjack bonus bets.';
   const vals = [b.ante, b.trips, b.pairs, b.badBeat, b.progressive];
   if (!vals.every((x) => typeof x === 'number' && Number.isSafeInteger(x))) return 'Bets must be whole amounts.';
   if (vals.some((x) => x < 0)) return 'Bets cannot be negative.';
@@ -276,7 +310,8 @@ export function validateInitialBet(input: Omit<InitialBets, 'progressive' | 'pai
   if (b.trips > limits.maxTrips) return `Maximum Trips+ is $${limits.maxTrips / 100}.`;
   if (b.pairs > limits.maxPairs) return `Maximum Ultimate Pairs bet is $${limits.maxPairs / 100}.`;
   if (b.badBeat > limits.maxBadBeat) return `Maximum Bad Beat bet is $${limits.maxBadBeat / 100}.`;
-  if (b.progressive !== 0 && b.progressive !== PROGRESSIVE.wager) return `The progressive is a fixed $${PROGRESSIVE.wager / 100} bet.`;
+  const pw = limits.progressiveWager ?? PROGRESSIVE.wager;
+  if (b.progressive !== 0 && b.progressive !== pw) return `The progressive is a fixed $${pw / 100} bet.`;
   if (b.progressive && limits.progressiveEnabled === false) return 'The progressive is turned off at this table.';
   const bbRequires = BAD_BEAT_VARIANTS[limits.badBeatVariant ?? DEFAULT_BAD_BEAT_VARIANT].requires;
   if (b.badBeat > 0 && bbRequires.includes('trips') && b.trips <= 0) return 'Bad Beat needs a Trips+ bet at this table.';
@@ -301,17 +336,22 @@ export const PLAY_MULTIPLIER: Partial<Record<Decision, number>> = { play4: 4, pl
 export const TIMEOUT_DEFAULT: Record<DecisionPhase, Decision> = { preflop: 'check', flop: 'check', river: 'fold', decide: 'fold' };
 
 /** Three Card Poker opening bets: Ante (required), Pair Plus and Six Card Bonus (optional), plus a 1x Play reserve. */
-export function validateTcpBet(b: InitialBets, balance: number, limits: { minAnte: number; maxAnte: number; maxPairPlus: number; maxSixCard: number }): string | null {
-  const vals = [b.ante, b.pairPlus, b.sixCard];
+export function validateTcpBet(b: InitialBets, balance: number, limits: { minAnte: number; maxAnte: number; maxPairPlus: number; maxSixCard: number; progressiveWager?: number | null }): string | null {
+  const vals = [b.ante, b.pairPlus, b.sixCard, b.progressive];
   if (!vals.every((x) => typeof x === 'number' && Number.isSafeInteger(x))) return 'Bets must be whole amounts.';
   if (vals.some((x) => x < 0)) return 'Bets cannot be negative.';
   if (vals.some((x) => x % 100 !== 0)) return 'Bets must be in whole dollars.';
-  if (b.trips || b.pairs || b.badBeat || b.progressive) return 'Trips+, Ultimate Pairs, Bad Beat and the Progressive are Ultimate Texas Hold’em bets.';
+  if (b.trips || b.pairs || b.badBeat) return 'Trips+, Ultimate Pairs and Bad Beat are Ultimate Texas Hold’em bets.';
+  if (b.bjSides && sumSides(b.bjSides)) return 'Those are Blackjack bonus bets.';
+  if (b.progressive) {
+    if (!limits.progressiveWager) return 'The Three Card Progressive is not open at this table.';
+    if (b.progressive !== limits.progressiveWager) return `The Three Card Progressive is a fixed $${limits.progressiveWager / 100} bet.`;
+  }
   if (b.ante < limits.minAnte) return `Minimum Ante is $${limits.minAnte / 100}.`;
   if (b.ante > limits.maxAnte) return `Maximum Ante is $${limits.maxAnte / 100}.`;
   if (b.pairPlus > limits.maxPairPlus) return `Maximum Pair Plus is $${limits.maxPairPlus / 100}.`;
   if (b.sixCard > limits.maxSixCard) return `Maximum Six Card Bonus is $${limits.maxSixCard / 100}.`;
-  const need = b.ante * 2 + b.pairPlus + b.sixCard;
+  const need = b.ante * 2 + b.pairPlus + b.sixCard + b.progressive;
   if (need > balance) return `You need $${need / 100} available (Ante + side bets + a 1x Play reserve).`;
   return null;
 }

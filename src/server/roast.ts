@@ -21,6 +21,8 @@ export interface RoundPlayer {
   checkedThrough?: boolean;
   progressiveWin?: number; badBeatWin?: number; royal?: boolean; improbable?: string; natural?: boolean;
   bj?: { hit20: boolean; split10: boolean; busted: boolean; total?: string };
+  /** §34.11 Blackjack side-bet results as recorded at settlement (never inferred). */
+  bjSides?: { id: string; bet: string; combo: string | null; result: 'win' | 'lose'; net: number }[];
 }
 export interface RoundFacts { handId: string; nightId: string | null; game: 'uth' | 'tcp' | 'bj'; dealerHand?: string; players: RoundPlayer[] }
 
@@ -47,7 +49,8 @@ const PRO: Partial<Record<RoastCategory, string>> = {
   bigWinOut: 'What a hand. A new dealer takes over now.', grudge: 'Good to see you again, {name}.', intro: 'Good evening, everyone.',
   farewell: 'Thank you, everyone. Good luck.', greet: 'Welcome, {name}.', comeback: 'Noted, {name}.', meltdown: 'Quite a round, everyone.',
   natural: 'Blackjack, {name}!', comebackWin: 'There it is, {name}.', rivalry: 'Good to see you, {name}.', sideWin: 'Nice side bet, {name}.',
-  improbable: 'Remarkable hand, {name}.',
+  improbable: 'Remarkable hand, {name}.', bonusWin: '{bet} pays, {name}.', doubleThree: '21+3 and Top 3 both pay, {name}.',
+  sideSweep: 'No luck on the side bets, {name}.', smallMainBig: 'The side bets came through, {name}.', multiBonus: 'Bonus winners around the table.',
 };
 
 const BRAG = /\b(ez|easy money|too easy|can'?t lose|cant lose|i got this|watch (this|me)|mortal lock|lock it in|i'?m (a )?(genius|god|goat|him|the goat)|built different|i'?m cooking|let'?s go+|printing( money)?|owned|free money|light work|scared money|never lose|unstoppable)\b/i;
@@ -294,7 +297,16 @@ export class RoastDirector {
           const r = await this.c.store.rivalries(this.c.dealer().id, [p.pid]).then((m) => m.get(p.pid)).catch(() => undefined);
           if (r && r.witnessed >= RIVALRY_MIN) add('rivalry', { witnessed: String(r.witnessed) });
         }
-        if (p.sideNet >= Math.max(25_000, 10 * p.opening) && !p.progressiveWin) add('sideWin', { amount: formatMoney(p.sideNet) });
+        // §34.11 Blackjack bonus outcomes, from the recorded side-bet results only.
+        const sw = (p.bjSides ?? []).filter((x) => x.result === 'win');
+        const sl = (p.bjSides ?? []).filter((x) => x.result === 'lose');
+        const t213 = sw.find((x) => x.id === 'twentyone3'), top3 = sw.find((x) => x.id === 'top3');
+        if (t213 && top3) add('doubleThree', { amount: formatMoney(t213.net + top3.net) });
+        const best = [...sw].sort((a, b) => b.net - a.net)[0];
+        if (best && best.combo && !(t213 && top3 && (best === t213 || best === top3))) add('bonusWin', { bet: best.bet, combo: best.combo, amount: formatMoney(best.net) });
+        if (sl.length >= 3 && !sw.length) add('sideSweep', { count: String(sl.length) });
+        if (p.bjSides && sw.length && Math.abs(p.mainNet) <= p.opening && p.sideNet >= 10 * p.opening) add('smallMainBig', { amount: formatMoney(p.sideNet) });
+        if (p.sideNet >= Math.max(25_000, 10 * p.opening) && !p.progressiveWin && !p.bjSides?.length) add('sideWin', { amount: formatMoney(p.sideNet) });
         // Session-level patterns (verified counts only).
         const repeated = bad.some((b) => (s.kinds.get(`${b.phase}:${b.action}>${b.recommended}`) ?? 0) >= 3);
         if (bad.length && ((s.graded >= 10 && s.correct / s.graded < 0.55) || repeated)) add('ignoresStrategy', { acc: s.graded >= 8 ? `${Math.round((s.correct / s.graded) * 100)}%` : undefined, mistakes: String(s.mistakes) });
@@ -314,6 +326,10 @@ export class RoastDirector {
       const n = f.players.length;
       if (n >= 3 && f.players.every((p) => p.mainNet < 0)) cands.push({ cat: 'tableLoses', vars: { count: String(n), game: GAME[f.game] }, pri: RULES.tableLoses.priority });
       if (mistakers.length >= 2) cands.push({ cat: 'groupMistakes', vars: { count: String(mistakers.length), game: GAME[f.game] }, pri: RULES.groupMistakes.priority });
+      // Several players winning DIFFERENT bonus bets in the same round.
+      const bonusWinners = f.players.map((p) => new Set((p.bjSides ?? []).filter((x) => x.result === 'win').map((x) => x.id))).filter((x) => x.size);
+      if (bonusWinners.length >= 2 && new Set(bonusWinners.flatMap((x) => [...x])).size >= 2)
+        cands.push({ cat: 'multiBonus', vars: { count: String(bonusWinners.length) }, pri: RULES.multiBonus.priority });
       if (L < 1) return 0;
 
       // Meltdown: rare, only at Complete Fucking Menace and No Mercy, never more than once per 30 rounds.

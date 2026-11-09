@@ -170,8 +170,8 @@ test('side bets: bonus panel on a phone, Trips+ requirement, locking, and settle
 
   // Pay tables are visible before betting
   await host.page.getByRole('button', { name: 'Pay tables' }).click();
-  await expect(host.page.getByRole('dialog')).toContainText('Ultimate Pairs Bonus 4');
-  await expect(host.page.getByRole('dialog')).toContainText('Bad Beat Bonus 01');
+  await expect(host.page.getByRole('dialog')).toContainText('Ultimate Pairs UP-04');
+  await expect(host.page.getByRole('dialog')).toContainText('Bad Beat BB-01');
   await host.page.keyboard.press('Escape');
 
   // Desktop: Bad Beat without Trips+ is refused; then all three bonus bets
@@ -737,4 +737,107 @@ test('§32: dealer roasts — opt-in consent, each viewer\'s own limits, profani
   const dealerCards = await vic.page.locator('.dealer-zone .cards-row').boundingBox();
   if (capBox && dealerCards) expect(capBox.y + capBox.height).toBeLessThanOrEqual(dealerCards.y + 1);
   for (const p of [tom, vic]) expect(p.errors, p.name).toEqual([]);
+});
+
+// §34.12: six players at one Blackjack table, each choosing a different mix of bonus bets through the Bonus Bets
+// panel; the server's recorded result for every wager is re-derived here from the hand's actual cards.
+import { BJ_SIDE, settleBjSide } from '../../src/shared/bjsides';
+import { isNatural } from '../../src/shared/blackjack';
+test('§34: six players, six different bonus-bet mixes, every wager resolved independently and reconciled', async ({ browser }) => {
+  test.setTimeout(300_000);
+  const names = ['Uma', 'Vic', 'Wes', 'Xan', 'Yul', 'Zed'];
+  const kinds: ('desktop' | 'iphone')[] = ['iphone', 'desktop', 'desktop', 'iphone', 'desktop', 'desktop'];
+  const mixes: string[][] = [
+    ['perfect-player', 'twentyone3', 'top3'], ['buster', 'lucky-lucky'], ['perfect-dealer', 'lucky-ladies'],
+    ['match-dealer', 'progressive'], ['perfect-player', 'perfect-dealer', 'twentyone3', 'top3', 'buster', 'lucky-lucky', 'lucky-ladies', 'match-dealer', 'progressive'], ['twentyone3', 'buster'],
+  ];
+  const ps = await Promise.all(names.map((n, i) => newPlayer(browser, n, kinds[i])));
+  const host = ps[0].page;
+  await signIn(host, names[0]);
+  await host.getByRole('button', { name: 'Create a private table' }).click();
+  await host.getByRole('button', { name: 'Create table' }).click();
+  await host.waitForURL(/\/table\/[A-Z0-9]{8}$/);
+  const path = new URL(host.url()).pathname;
+  for (let i = 1; i < 6; i++) await signIn(ps[i].page, names[i], path);
+  for (const p of ps) await expect(p.page.locator('.seat:not(.empty-seat) .pname')).toHaveCount(6, { timeout: 15000 });
+  // Host: switch to Blackjack, then Blackjack → Side Bets → Custom Casino with every available wager.
+  await host.getByRole('button', { name: 'Table menu' }).click();
+  await host.getByRole('button', { name: /Host controls/ }).click();
+  await host.locator('.game-option', { hasText: 'Blackjack' }).click();
+  await host.getByRole('button', { name: 'Switch to Blackjack' }).click();
+  for (const { page } of ps) await expect(page.locator('.table-screen')).toHaveAttribute('data-game', 'bj', { timeout: 10000 });
+  await host.getByRole('button', { name: 'Table menu' }).click();
+  await host.getByRole('button', { name: /Host controls/ }).click();
+  const form = host.locator('.bj-sides-host form');
+  await form.locator('input[value="custom"]').check();
+  for (const cb of await form.locator('input[type=checkbox][name^="on:"]').all()) await cb.check();
+  await expect(form.locator('tr.off')).toHaveCount(6);                              // unverified wagers are listed as unavailable
+  await form.getByRole('button', { name: 'Save side bets' }).click();
+  await expect(host.locator('.toast', { hasText: 'Side bets saved' })).toBeVisible();
+  await host.keyboard.press('Escape');
+
+  await Promise.all(ps.map(async ({ page }, i) => {
+    await expect(page.getByRole('button', { name: 'Deal me in' })).toBeVisible({ timeout: 25000 });
+    await page.locator('.rack .chip.c25').click();
+    await page.locator('.spot-ante').click();
+    await page.locator('.rack .chip.c5').click();
+    await page.locator('.bb-btn').click();
+    await expect(page.locator('.bb-panel')).toBeVisible();
+    for (const id of mixes[i]) {
+      const card = page.locator(`.bb-card[data-side="${id}"]`);
+      await card.locator('.bb-act button').first().click();
+      await expect(card.locator('.bb-status')).toHaveText('Placed');
+    }
+    await page.locator('.bb-close').click();
+    await page.waitForTimeout(400);                                                // bet sync
+    await page.getByRole('button', { name: 'Deal me in' }).click();
+  }));
+  // Play: decline insurance, stand on every turn.
+  const seen = ps.map(() => false);
+  const t0 = Date.now();
+  while (Date.now() - t0 < 120_000 && !seen.every(Boolean)) {
+    for (let i = 0; i < 6; i++) {
+      const page = ps[i].page;
+      if (await page.locator('.my-result').isVisible()) { seen[i] = true; continue; }
+      if (await page.locator('button[data-bj="no-insurance"]').isVisible()) await page.locator('button[data-bj="no-insurance"]').click({ timeout: 2000 }).catch(() => {});
+      else if (await page.locator('button[data-bj="stand"]').isVisible()) await page.locator('button[data-bj="stand"]').click({ timeout: 2000 }).catch(() => {});
+    }
+    await host.waitForTimeout(150);
+  }
+  expect(seen).toEqual(ps.map(() => true));
+  // Every wager: the server's recorded result equals an independent evaluation of the hand's real cards.
+  for (let i = 0; i < 6; i++) {
+    const page = ps[i].page;
+    const { bonus, replay } = await page.evaluate(async () => {
+      const auth = { authorization: `Bearer ${localStorage.getItem('uth.token')}` };
+      const bonus = await (await fetch('/api/stats/bonus?limit=1', { headers: auth })).json();
+      const replay = await (await fetch(`/api/hands/${bonus.hands[0].handId}`, { headers: auth })).json();
+      return { bonus, replay };
+    });
+    const me = replay.you as string;
+    const hp = replay.hand.players.find((p: { playerId: string }) => p.playerId === me);
+    const st = hp.settlement;
+    const dealer = st.dealer as string[];
+    const sides = st.sides as { id: string; result: string; stake: number; credit: number; pays: number }[];
+    const ids = mixes[i].filter((x) => x !== 'progressive');
+    expect(sides.map((x) => x.id).sort(), names[i]).toEqual([...ids].sort());
+    for (const x of sides) {
+      const exp = settleBjSide(x.id, BJ_SIDE[x.id].variants[0].id, x.stake, { player: hp.hole, dealer, dealerFinal: true, playerNatural: isNatural(hp.hole, false) });
+      expect({ id: x.id, result: x.result, credit: x.credit }, `${names[i]} ${x.id} ${hp.hole} vs ${dealer}`).toEqual({ id: exp.id, result: exp.result, credit: exp.credit });
+    }
+    expect(!!st.progressive, names[i]).toBe(mixes[i].includes('progressive'));
+    // Main game and bonus bets add up to the hand's net, and the screen shows a line per wager.
+    const mainNet = (st.hands as { net: number }[]).reduce((t, x) => t + x.net, 0) + (st.insuranceNet ?? 0);
+    const sideNet = sides.reduce((t, x) => t + x.credit - x.stake, 0) + (st.progressive ? st.progressive.net : 0);
+    expect(hp.net).toBe(mainNet + sideNet);
+    const exact = (t: string) => new RegExp(`^${t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`);
+    for (const id of ids) await expect(page.locator('.my-result .lines li > span:first-child').filter({ hasText: exact(BJ_SIDE[id].name) })).toHaveCount(1);
+    if (mixes[i].includes('progressive')) await expect(page.locator('.my-result .lines li > span:first-child').filter({ hasText: /^21\+3 Progressive$/ })).toHaveCount(1);
+  }
+  // Same balances on every screen.
+  const bal = (p: Page) => p.locator('.seat:not(.empty-seat)').evaluateAll((els) => els.map((e) => `${e.querySelector('.pname')?.textContent}=${e.querySelector('.pbal')?.textContent}`).sort());
+  await host.waitForTimeout(600);
+  const ref = await bal(host);
+  for (const { page } of ps) expect(await bal(page)).toEqual(ref);
+  for (const p of ps) expect(p.errors, p.name).toEqual([]);
 });

@@ -9,7 +9,7 @@ import type { NightHand } from '../shared/recap.js';
 import type { GameId } from '../shared/rules.js';
 import type { AvatarData, PublicLook } from '../shared/cosmetics.js';
 import {
-  InsufficientFunds, JACKPOT_ID, type HandStart, type SettlementBuilder, type PlayerRow, type PlayerSettlementRow, type PlayerStats,
+  InsufficientFunds, JACKPOT_ID, type HandStart, type MeterSpec, type MeterRow, type SettlementBuilder, type PlayerRow, type PlayerSettlementRow, type PlayerStats,
   type DebtEvent, type NightRow, type CosmeticState, type PurchaseResult, type RewardFacts, type StyleTx, type RecentHandRow, type ReplayData, type StackRow, type Store, type TableRow,
   toQHand,
 } from './store.js';
@@ -159,29 +159,75 @@ export class PgStore implements Store {
     return bal;
   }
 
+  /** Creates any meter this hand may touch, at its seed, without changing an existing one. */
+  private async ensureMeters(c: pg.PoolClient, specs: MeterSpec[] | undefined) {
+    for (const m of specs ?? [])
+      await c.query(`INSERT INTO progressive_meter(id, amount, seed, game, variant, profile) VALUES ($1,$2,$2,$3,$4,$5)
+        ON CONFLICT (id) DO UPDATE SET seed = COALESCE(progressive_meter.seed, EXCLUDED.seed), game = COALESCE(progressive_meter.game, EXCLUDED.game),
+          variant = COALESCE(progressive_meter.variant, EXCLUDED.variant), profile = COALESCE(progressive_meter.profile, EXCLUDED.profile)`,
+        [m.id, m.seed, m.game, m.variant, m.profile]);
+  }
+
   async startHand(h: HandStart) {
     return this.tx(async (c) => {
+      await this.ensureMeters(c, h.meters);
       await c.query(
-        `INSERT INTO hands(id,table_code,hand_number,status,deck_commitment,dealer_cards,community,participant_count,pairs_variant,bad_beat_variant,night_id,rules_version,game)
-         VALUES ($1,$2,$3,'active',$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+        `INSERT INTO hands(id,table_code,hand_number,status,deck_commitment,dealer_cards,community,participant_count,pairs_variant,bad_beat_variant,night_id,rules_version,game,rules_profile)
+         VALUES ($1,$2,$3,'active',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
         [h.id, h.tableCode, h.handNumber, h.deckCommitment, JSON.stringify(h.dealerCards), JSON.stringify(h.community), h.players.length,
-         h.pairsVariant, h.badBeatVariant, h.nightId || null, h.rulesVersion, h.game ?? 'uth']);
+         h.pairsVariant, h.badBeatVariant, h.nightId || null, h.rulesVersion, h.game ?? 'uth', h.rulesProfile ? JSON.stringify(h.rulesProfile) : null]);
       await c.query('UPDATE game_tables SET hand_counter=$2 WHERE code=$1', [h.tableCode, h.handNumber]);
       const balances = new Map<string, number>();
+      const add = new Map<string, number>();
       for (const p of h.players) {
+        const sideStake = Object.values(p.sides ?? {}).reduce((t, x) => t + x, 0);
         await c.query(
-          `INSERT INTO hand_players(hand_id,player_id,seat,name,hole,ante,blind,trips,pairs,bad_beat,progressive,pair_plus,six_card,game) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
-          [h.id, p.playerId, p.seat, p.name, JSON.stringify(p.hole), p.ante, p.blind, p.trips, p.pairs, p.badBeat, p.progressive, p.pairPlus ?? 0, p.sixCard ?? 0, h.game ?? 'uth']);
-        const total = p.ante + p.blind + p.trips + p.pairs + p.badBeat + p.progressive + (p.pairPlus ?? 0) + (p.sixCard ?? 0);
+          `INSERT INTO hand_players(hand_id,player_id,seat,name,hole,ante,blind,trips,pairs,bad_beat,progressive,pair_plus,six_card,game,prog_meter,prog_contrib,side_bets,side_stake)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
+          [h.id, p.playerId, p.seat, p.name, JSON.stringify(p.hole), p.ante, p.blind, p.trips, p.pairs, p.badBeat, p.progressive, p.pairPlus ?? 0, p.sixCard ?? 0, h.game ?? 'uth',
+           p.progressive ? (p.progMeter ?? JACKPOT_ID) : null, p.progressive ? (p.progContribution ?? PROGRESSIVE.contribution) : 0,
+           p.sides && sideStake ? JSON.stringify(p.sides) : null, sideStake]);
+        const total = p.ante + p.blind + p.trips + p.pairs + p.badBeat + p.progressive + (p.pairPlus ?? 0) + (p.sixCard ?? 0) + sideStake;
         const bal = await this.debit(c, p.playerId, h.tableCode, h.id, total, `${h.id}:${p.playerId}:initial`);
         balances.set(p.playerId, bal!);
+        if (p.progressive > 0) { const id = p.progMeter ?? JACKPOT_ID; add.set(id, (add.get(id) ?? 0) + (p.progContribution ?? PROGRESSIVE.contribution)); }
       }
-      // Each progressive wager feeds the linked meter in the same transaction as the debit.
-      const bets = h.players.filter((p) => p.progressive > 0).length;
-      const jackpot = (await c.query('UPDATE progressive_meter SET amount=amount+$2, updated_at=now() WHERE id=$1 RETURNING amount',
-        [JACKPOT_ID, bets * PROGRESSIVE.contribution])).rows[0].amount;
-      return { balances, jackpot };
+      // Each progressive wager feeds its own meter in the same transaction as the debit.
+      const meters = new Map<string, number>();
+      for (const [id, amt] of [...add].sort(([a], [b]) => a.localeCompare(b)))
+        meters.set(id, (await c.query('UPDATE progressive_meter SET amount=amount+$2, updated_at=now() WHERE id=$1 RETURNING amount', [id, amt])).rows[0].amount);
+      const jackpot = meters.get(JACKPOT_ID) ?? (await c.query('SELECT amount FROM progressive_meter WHERE id=$1', [JACKPOT_ID])).rows[0].amount;
+      return { balances, jackpot, meters };
     });
+  }
+
+  async getMeters(): Promise<MeterRow[]> {
+    const r = await this.pool.query('SELECT id, amount, seed, game, variant, profile, hits FROM progressive_meter ORDER BY id');
+    return r.rows.map((x) => ({ id: x.id, amount: Number(x.amount), seed: Number(x.seed ?? 0), game: x.game ?? 'uth', variant: x.variant ?? x.id, profile: x.profile ?? 'casino', hits: x.hits }));
+  }
+
+  async bonusRows(playerId: string) {
+    const r = await this.pool.query(
+      `SELECT hp.hand_id, h.hand_number, h.settled_at, h.table_code, hp.side_results, hp.progressive, hp.prog_contrib, hp.prog_meter, hp.settlement, hp.base_net
+         FROM hand_players hp JOIN hands h ON h.id = hp.hand_id
+        WHERE hp.player_id=$1 AND hp.settled AND hp.game='bj' AND (hp.side_results IS NOT NULL OR hp.progressive > 0)
+        ORDER BY h.settled_at, h.id`, [playerId]);
+    return r.rows.map((x) => {
+      const p = x.settlement?.progressive;
+      return { handId: x.hand_id, handNumber: x.hand_number, at: x.settled_at.getTime(), tableCode: x.table_code, mainNet: Number(x.base_net ?? 0),
+        results: x.side_results ?? [],
+        prog: Number(x.progressive) > 0 ? { stake: Number(x.progressive), amount: Number(p?.amount ?? 0), combo: p?.combo ?? null, contrib: Number(x.prog_contrib),
+          meterId: x.prog_meter, fromMeter: !!p?.fromMeter } : null };
+    });
+  }
+
+  async progressiveTx(f: { playerId?: string; meterId?: string }, limit: number) {
+    const r = await this.pool.query(
+      `SELECT * FROM progressive_tx WHERE ($1::text IS NULL OR player_id=$1) AND ($2::text IS NULL OR meter_id=$2) ORDER BY id DESC LIMIT $3`,
+      [f.playerId ?? null, f.meterId ?? null, limit]);
+    return r.rows.map((x) => ({ handId: x.hand_id, at: x.created_at.getTime(), playerId: x.player_id, game: x.game, meterId: x.meter_id, variant: x.variant, profile: x.profile,
+      wager: Number(x.wager), combo: x.combo, category: x.category, pct: x.pct, fixedAward: Number(x.fixed_award), meterAward: Number(x.meter_award), envy: Number(x.envy),
+      meterBefore: Number(x.meter_before), meterAfter: Number(x.meter_after), amount: Number(x.amount), net: Number(x.net) }));
   }
 
   async getJackpot() {
@@ -220,30 +266,46 @@ export class PgStore implements Store {
       [handId, playerId, phase, evCost, exact, cents ?? null]);
   }
 
-  async settleHand(handId: string, code: string, dealer: { hand: string; qualifies: boolean }, build: SettlementBuilder) {
+  async settleHand(handId: string, code: string, dealer: { hand: string; qualifies: boolean }, build: SettlementBuilder, meterIds: string[] = []) {
     return this.tx(async (c) => {
       const balances = new Map<string, number>();
       const h = await c.query('SELECT status FROM hands WHERE id=$1 FOR UPDATE', [handId]);
-      const meterNow = (await c.query('SELECT amount FROM progressive_meter WHERE id=$1 FOR UPDATE', [JACKPOT_ID])).rows[0].amount as number;
-      if (h.rows[0]?.status !== 'active') return { applied: false, balances, jackpot: meterNow };
-      const { rows, jackpotAfter, hits } = build(meterNow);
-      if (jackpotAfter !== meterNow || hits.length)
-        await c.query(`UPDATE progressive_meter SET amount=$2, hits=hits+$3, last_hit_at=CASE WHEN $3>0 THEN now() ELSE last_hit_at END, updated_at=now() WHERE id=$1`,
-          [JACKPOT_ID, jackpotAfter, hits.length]);
+      // Lock every meter this hand can touch, always in id order, so concurrent tables queue instead of deadlocking.
+      const ids = [...new Set([JACKPOT_ID, ...meterIds])].sort();
+      const locked = new Map<string, number>();
+      for (const id of ids) {
+        const row = (await c.query('SELECT amount FROM progressive_meter WHERE id=$1 FOR UPDATE', [id])).rows[0];
+        if (row) locked.set(id, Number(row.amount));
+      }
+      if (h.rows[0]?.status !== 'active') return { applied: false, balances, jackpot: locked.get(JACKPOT_ID)!, meters: locked };
+      const { rows, meters: after = new Map(), hits = [], progTx = [] } = build(new Map(locked));
+      for (const [id, amount] of after) {
+        if (!locked.has(id)) throw new Error(`Meter ${id} was not locked for this settlement`);
+        if (amount < 0) throw new Error(`Meter ${id} would go negative`);
+        const n = hits.filter((x) => x.meterId === id).length;
+        if (amount !== locked.get(id) || n)
+          await c.query(`UPDATE progressive_meter SET amount=$2, hits=hits+$3, last_hit_at=CASE WHEN $3>0 THEN now() ELSE last_hit_at END, updated_at=now() WHERE id=$1`, [id, amount, n]);
+        locked.set(id, amount);
+      }
       for (const x of hits)
-        await c.query(`INSERT INTO progressive_hits(hand_id,player_id,table_code,hand_name,amount,meter_before) VALUES ($1,$2,$3,$4,$5,$6)`,
-          [handId, x.playerId, code, x.hand, x.amount, x.meterBefore]);
+        await c.query(`INSERT INTO progressive_hits(hand_id,player_id,table_code,hand_name,amount,meter_before,meter_id,meter_after) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+          [handId, x.playerId, code, x.hand, x.amount, x.meterBefore, x.meterId, x.meterAfter]);
+      for (const t of progTx)
+        await c.query(`INSERT INTO progressive_tx(hand_id,player_id,table_code,game,meter_id,variant,profile,wager,combo,category,pct,fixed_award,meter_award,envy,meter_before,meter_after,stake_returned,amount,net)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,false,$17,$18)`,
+          [handId, t.playerId, code, t.game, t.meterId, t.variant, t.profile, t.wager, t.combo, t.category, t.pct, t.fixedAward, t.meterAward, t.envy, t.meterBefore, t.meterAfter, t.amount, t.net]);
       for (const r of rows) {
         await c.query(
           `UPDATE hand_players SET outcome=$3, hand_name=$4, hand_rank=$5, net=$6, trips_net=$7, settlement=$8, play=$9, folded=$10, settled=true,
              pairs_net=$11, bad_beat_net=$12, pairs_combo=$13, bad_beat_combo=$14, pairs_multiplier=$15, bad_beat_multiplier=$16,
              pairs_variant=$17, bad_beat_variant=$18, base_net=$19, progressive_net=$20, progressive_hand=$21,
-             pair_plus_net=$22, six_card_net=$23, ante_bonus_net=$24, pair_plus_hand=$25, six_card_hand=$26
+             pair_plus_net=$22, six_card_net=$23, ante_bonus_net=$24, pair_plus_hand=$25, six_card_hand=$26, side_results=$27
            WHERE hand_id=$1 AND player_id=$2`,
           [handId, r.playerId, r.outcome, r.handName, r.handRank, r.net, r.tripsNet, JSON.stringify(r.settlement), r.play, r.folded,
            r.pairsNet, r.badBeatNet, r.pairsCombo, r.badBeatCombo, r.pairsMultiplier, r.badBeatMultiplier,
            r.pairsVariant, r.badBeatVariant, r.baseNet, r.progressiveNet, r.progressiveHand,
-           r.pairPlusNet ?? null, r.sixCardNet ?? null, r.anteBonusNet ?? null, r.pairPlusHand ?? null, r.sixCardHand ?? null]);
+           r.pairPlusNet ?? null, r.sixCardNet ?? null, r.anteBonusNet ?? null, r.pairPlusHand ?? null, r.sixCardHand ?? null,
+           r.sideResults?.length ? JSON.stringify(r.sideResults) : null]);
         let bal: number;
         if (r.credit > 0) {
           bal = (await c.query('UPDATE stacks SET balance=balance+$3, updated_at=now() WHERE player_id=$1 AND table_code=$2 RETURNING balance',
@@ -257,7 +319,7 @@ export class PgStore implements Store {
       }
       await c.query(`UPDATE hands SET status='settled', settled_at=now(), dealer_hand=$2, dealer_qualifies=$3 WHERE id=$1`,
         [handId, dealer.hand, dealer.qualifies]);
-      return { applied: true, balances, jackpot: jackpotAfter };
+      return { applied: true, balances, jackpot: locked.get(JACKPOT_ID)!, meters: locked };
     });
   }
 
@@ -278,9 +340,11 @@ export class PgStore implements Store {
             [`${h.id}:${d.player_id}:refund`, d.player_id, h.table_code, h.id, amt, bal]);
           refunds++;
         }
-        // The voided hand's progressive contributions come back out of the meter along with the refunds.
-        const prog = (await c.query('SELECT COUNT(*)::int n FROM hand_players WHERE hand_id=$1 AND progressive>0', [h.id])).rows[0].n;
-        if (prog) await c.query('UPDATE progressive_meter SET amount=GREATEST($3, amount-$2) WHERE id=$1', [JACKPOT_ID, prog * PROGRESSIVE.contribution, PROGRESSIVE.seed]);
+        // The voided hand's progressive contributions come back out of each meter they fed, along with the refunds.
+        const contrib = await c.query(`SELECT COALESCE(prog_meter, $2) meter, SUM(CASE WHEN prog_contrib > 0 THEN prog_contrib ELSE $3 END)::bigint amt
+          FROM hand_players WHERE hand_id=$1 AND progressive>0 GROUP BY 1 ORDER BY 1`, [h.id, JACKPOT_ID, PROGRESSIVE.contribution]);
+        for (const x of contrib.rows)
+          await c.query('UPDATE progressive_meter SET amount=GREATEST(COALESCE(seed, $3), amount-$2) WHERE id=$1', [x.meter, Number(x.amt), PROGRESSIVE.seed]);
         await c.query(`UPDATE hands SET status='voided', settled_at=now() WHERE id=$1`, [h.id]);
       });
     }

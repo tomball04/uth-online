@@ -12,7 +12,9 @@ import { buildConfig } from './config.js';
 import { DEFAULT_TIMING, EngineError, TableEngine, cleanName, type Timing } from './engine.js';
 import { newId, newToken, roomCode, secureShuffle, sha256 } from './rng.js';
 import { buildRecap } from '../shared/recap.js';
-import type { PlayerRow, Store } from './store.js';
+import { BJ_SIDES, bonusStats } from '../shared/bjsides.js';
+import { JACKPOT_ID, type PlayerRow, type Store } from './store.js';
+import type { GameId } from '../shared/rules.js';
 import { Cosmetics, CosmeticError, type CosmeticsConfig } from './cosmetics.js';
 import { COLLECTIONS, REACTION_SETS, randomAvatar, DEFAULT_AVATAR } from '../shared/cosmetics.js';
 
@@ -73,6 +75,8 @@ export class TableManager {
   private pendingBroadcast = new Set<string>();
   /** Linked progressive meter, shared by every table on this server. Seeded from the store at startup. */
   jackpot = 0;
+  /** §37 last known value of every progressive meter (the Store is authoritative). */
+  meters = new Map<string, number>();
   /** Test hook: deterministic dealer picks (cosmetic only). */
   dealerRand: ((n: number) => number) | null = null;
   /** Test hook: Blackjack shoe order. */
@@ -126,15 +130,17 @@ export class TableManager {
       kicked: (pid: string, reason: string) => {
         for (const s of [...(this.sockets.get(code) ?? [])]) if (s.data.player.id === pid) { s.emit('kicked', { reason }); this.detach(s); }
       },
-      jackpot: (amount: number) => {
-        if (amount === this.jackpot) return;
-        this.jackpot = amount;
-        for (const c of this.tables.keys()) if (c !== code) this.broadcast(c);
+      jackpot: (meterId: string, amount: number) => {
+        if (this.meters.get(meterId) === amount) return;
+        this.meters.set(meterId, amount);
+        if (meterId === JACKPOT_ID) this.jackpot = amount;
+        // Only tables that show this meter need a refresh.
+        for (const [c, e] of this.tables) if (c !== code && e.showsMeter(meterId)) this.broadcast(c);
       },
-      jackpotAmount: () => this.jackpot,
+      jackpotAmount: (meterId: string = JACKPOT_ID) => this.meters.get(meterId) ?? 0,
       settled: (handId: string, nightId: string | null, pids: string[]) => this.onSettled(code, handId, nightId, pids),
       nightEnded: (nightId: string) => { for (const s of this.sockets.get(code) ?? []) s.emit('night:ended', { nightId }); },
-      jackpotHit: (p: { tableName: string; playerName: string; hand: string; amount: number }) => {
+      jackpotHit: (p: { tableName: string; playerName: string; hand: string; amount: number; meterId?: string; game?: GameId }) => {
         // Every table hears about a linked jackpot hit, like the sign over a casino pit.
         for (const [c, set] of this.sockets) for (const s of set) s.emit('jackpot:hit', { ...p, same: c === code });
       },
@@ -250,6 +256,8 @@ export async function createApp(opts: AppOptions) {
     }
   };
   manager.jackpot = await store.getJackpot();
+  for (const m of await store.getMeters()) manager.meters.set(m.id, m.amount);
+  manager.meters.set(JACKPOT_ID, manager.jackpot);
 
   const auth = async (token: unknown): Promise<PlayerRow | null> =>
     typeof token === 'string' && token.length >= 20 && token.length <= 100 ? store.playerByTokenHash(sha256(token)) : null;
@@ -348,6 +356,23 @@ export async function createApp(opts: AppOptions) {
   app.get('/api/stats/me', requireAuth, wrap(async (req, res) => {
     const g = req.query.game === 'uth' || req.query.game === 'tcp' || req.query.game === 'bj' ? req.query.game : undefined;
     res.json({ stats: await store.playerStats(res.locals.player.id, g) });
+  }));
+  // ---- §34.9 Blackjack bonus statistics: per wager, session and lifetime, plus 21+3 Progressive and its jackpot
+  // history. Kept apart from strategy accuracy (a side-bet win never turns a wrong decision into a right one).
+  app.get('/api/stats/bonus', requireAuth, wrap(async (req, res) => {
+    const rows = await store.bonusRows(res.locals.player.id);
+    const side = typeof req.query.side === 'string' ? req.query.side : '';
+    const combo = typeof req.query.combo === 'string' ? req.query.combo : '';
+    const hands = rows.filter((r) => (!side || (side === 'progressive' ? !!r.prog : r.results.some((x) => x.id === side)))
+      && (!combo || r.results.some((x) => x.label === combo && (!side || x.id === side)) || (side === 'progressive' && r.prog?.combo === combo)))
+      .reverse().slice(0, Math.min(200, Math.max(1, Number(req.query.limit) || 50)));
+    res.json({ stats: bonusStats(rows), hands, catalog: BJ_SIDES.map((d) => ({ id: d.id, name: d.name, status: d.status })) });
+  }));
+  app.get('/api/progressive', wrap(async (_req, res) => {
+    res.json({ meters: await store.getMeters() });
+  }));
+  app.get('/api/progressive/history', requireAuth, wrap(async (req, res) => {
+    res.json({ tx: await store.progressiveTx({ playerId: res.locals.player.id }, Math.min(200, Number(req.query.limit) || 50)) });
   }));
   // ---- §31 decision quality vs. results. Computed here from immutable decisions + settled results; the browser
   // can only read these numbers, never submit a classification or bump a counter.
@@ -497,7 +522,17 @@ export async function createApp(opts: AppOptions) {
     on('bet:place', async (e, p) => {
       const x = obj(p);
       // Raw values go to the engine; validateInitialBet rejects anything that isn't a whole, non-negative number.
-      await e.placeBet(socket.data.player.id, x.actionId, { ante: x.ante, trips: x.trips ?? 0, pairs: x.pairs ?? 0, badBeat: x.badBeat ?? 0, progressive: x.progressive ?? 0, pairPlus: x.pairPlus ?? 0, sixCard: x.sixCard ?? 0 });
+      // §34 Blackjack side bets: a plain {id: number} map; anything else is rejected rather than coerced.
+      let bjSides: Record<string, number> | undefined;
+      if (x.bjSides !== undefined && x.bjSides !== null) {
+        if (typeof x.bjSides !== 'object' || Array.isArray(x.bjSides) || Object.keys(x.bjSides).length > 30) throw new EngineError('Invalid side bets.');
+        bjSides = {};
+        for (const [k, v] of Object.entries(x.bjSides as Record<string, unknown>)) {
+          if (typeof k !== 'string' || k.length > 40 || typeof v !== 'number') throw new EngineError('Invalid side bets.');
+          bjSides[k] = v;
+        }
+      }
+      await e.placeBet(socket.data.player.id, x.actionId, { ante: x.ante, trips: x.trips ?? 0, pairs: x.pairs ?? 0, badBeat: x.badBeat ?? 0, progressive: x.progressive ?? 0, pairPlus: x.pairPlus ?? 0, sixCard: x.sixCard ?? 0, ...(bjSides ? { bjSides } : {}) });
     });
     on('bet:clear', async (e, p) => e.clearBet(socket.data.player.id, obj(p).actionId));
     on('player:ready', async (e, p) => e.setReady(socket.data.player.id, obj(p).actionId, obj(p).ready !== false));

@@ -13,10 +13,10 @@ interface Stats {
   series: { at: string; cumulative: number }[];
 }
 interface Side { bets: number; wins: number; wagered: number; returned: number; net: number; biggestPayout: number; combos: { combo: string; count: number }[] }
-const SIDE_NAME = { trips: 'Trips+', pairs: 'Ultimate Pairs', badBeat: 'Bad Beat', progressive: '$5 Progressive', pairPlus: 'Pair Plus', sixCard: 'Six Card Bonus' } as const;
+const SIDE_NAME = { trips: 'Trips+', pairs: 'Ultimate Pairs', badBeat: 'Bad Beat', progressive: 'Progressive', pairPlus: 'Pair Plus', sixCard: 'Six Card Bonus' } as const;
 type Game = 'all' | 'uth' | 'tcp' | 'bj';
 const GAME_LABEL: Record<Game, string> = { all: 'All games', uth: 'Ultimate Texas Hold’em', tcp: 'Three Card Poker', bj: 'Blackjack' };
-const SIDES_FOR: Record<Game, (keyof typeof SIDE_NAME)[]> = { all: ['trips', 'pairs', 'badBeat', 'progressive', 'pairPlus', 'sixCard'], uth: ['trips', 'pairs', 'badBeat', 'progressive'], tcp: ['pairPlus', 'sixCard'], bj: [] };
+const SIDES_FOR: Record<Game, (keyof typeof SIDE_NAME)[]> = { all: ['trips', 'pairs', 'badBeat', 'progressive', 'pairPlus', 'sixCard'], uth: ['trips', 'pairs', 'badBeat', 'progressive'], tcp: ['pairPlus', 'sixCard', 'progressive'], bj: [] };
 const EDGE: Record<Game, string> = {
   all: 'House edge with perfect strategy: Ultimate Hold’em about 2.2% of the Ante per hand; Three Card Poker about 3.4% of the Ante (Ante/Play).',
   uth: 'With perfect strategy the house edge is about 2.2% of the Ante per hand, roughly 0.5% of total action.',
@@ -73,7 +73,65 @@ export async function mountStats(root: HTMLElement, nav: (p: string) => void) {
       s.commonMistakes.length ? h('ol', { class: 'mistakes' }, ...s.commonMistakes.map((m) => h('li', {},
         `${PHASE[m.phase]}: ${LABEL[m.action]} instead of ${LABEL[m.recommended]}`, h('span', { class: 'muted' }, ` — ${m.count}× · ${m.evCost.toFixed(2)} antes`)))) : h('p', { class: 'muted' }, 'None yet.')),
     qualitySection(currentGame),
-    sideSection(s)));
+    sideSection(s),
+    currentGame === 'bj' || currentGame === 'all' ? bonusSection() : null));
+}
+
+/**
+ * §34.9 Blackjack Bonus Statistics — separate from strategy accuracy on purpose: a 21+3 win never turns a wrong
+ * Blackjack decision into a right one. Loaded on its own; filters the bonus hand history by wager and combination.
+ */
+interface BonusLine { bets: number; wagered: number; returned: number; net: number; wins: number; hitPct: number; biggest: number; topCombo: string | null; combos: { combo: string; count: number }[] }
+interface BonusResp {
+  stats: { lifetime: Record<string, BonusLine>; session: Record<string, BonusLine>;
+    progressive: { lifetime: BonusLine & { contributed: number; jackpots: number }; session: BonusLine & { contributed: number; jackpots: number } };
+    jackpots: { handId: string; at: number; combo: string | null; amount: number }[]; sessionStart: number | null };
+  hands: { handId: string; handNumber: number; at: number; mainNet: number; results: { id: string; name: string; result: string; label: string | null; pays: number; net: number; stake: number }[];
+    prog: { stake: number; amount: number; combo: string | null } | null }[];
+  catalog: { id: string; name: string; status: string }[];
+}
+function bonusSection() {
+  const sec = h('section', { class: 'card-sec bonus-stats' }, h('h2', {}, 'Blackjack Bonus Statistics'), h('p', { class: 'muted' }, 'Loading…'));
+  let side = '', combo = '';
+  const load = async () => {
+    let r: BonusResp;
+    try { r = await api<BonusResp>(`/api/stats/bonus?limit=60${side ? `&side=${encodeURIComponent(side)}` : ''}${combo ? `&combo=${encodeURIComponent(combo)}` : ''}`); }
+    catch (e: any) { sec.replaceChildren(h('h2', {}, 'Blackjack Bonus Statistics'), h('p', { class: 'muted' }, e.message)); return; }
+    const name = (id: string) => r.catalog.find((c) => c.id === id)?.name ?? id;
+    const row = (label: string, l?: BonusLine, extra?: string) => h('tr', {},
+      h('td', {}, label), h('td', { class: 'num' }, String(l?.bets ?? 0)), h('td', { class: 'num' }, money(l?.wagered ?? 0)), h('td', { class: 'num' }, money(l?.returned ?? 0)),
+      h('td', { class: `num ${(l?.net ?? 0) < 0 ? 'neg' : (l?.net ?? 0) > 0 ? 'pos' : ''}` }, money(l?.net ?? 0, true)), h('td', { class: 'num' }, l?.bets ? `${l.hitPct.toFixed(1)}%` : '—'),
+      h('td', { class: 'num' }, l?.biggest ? money(l.biggest) : '—'), h('td', {}, l?.topCombo ?? '—'), extra ? h('td', { class: 'tiny muted' }, extra) : h('td', {}));
+    const table = (which: 'lifetime' | 'session') => {
+      const ids = Object.keys(r.stats[which]);
+      const p = r.stats.progressive[which];
+      return h('table', { class: 'paytable wide' },
+        h('tr', {}, ...['Wager', 'Bets', 'Wagered', 'Returned', 'Net', 'Hit %', 'Biggest', 'Most common win', ''].map((x) => h('th', {}, x))),
+        ...ids.map((id) => row(name(id), r.stats[which][id])),
+        p.bets ? row('21+3 Progressive', p, `contributed ${money(p.contributed)} · ${p.jackpots} jackpot${p.jackpots === 1 ? '' : 's'}`) : null);
+    };
+    const anyBets = Object.keys(r.stats.lifetime).length || r.stats.progressive.lifetime.bets;
+    const sel = h('select', { 'aria-label': 'Filter by wager', onchange: (e: Event) => { side = (e.target as HTMLSelectElement).value; combo = ''; load(); } },
+      h('option', { value: '' }, 'All bonus bets'), ...r.catalog.filter((c) => c.status === 'playable').map((c) => h('option', { value: c.id, selected: c.id === side }, c.name)),
+      h('option', { value: 'progressive', selected: side === 'progressive' }, '21+3 Progressive'));
+    const combos = side && side !== 'progressive' ? r.stats.lifetime[side]?.combos ?? [] : side === 'progressive' ? r.stats.progressive.lifetime.combos : [];
+    const csel = h('select', { 'aria-label': 'Filter by winning combination', disabled: !combos.length, onchange: (e: Event) => { combo = (e.target as HTMLSelectElement).value; load(); } },
+      h('option', { value: '' }, 'Any result'), ...combos.map((c) => h('option', { value: c.combo, selected: c.combo === combo }, `${c.combo} (${c.count})`)));
+    sec.replaceChildren(h('h2', {}, 'Blackjack Bonus Statistics'),
+      h('p', { class: 'muted' }, 'Side bets and the 21+3 Progressive, per wager. These are kept apart from strategy accuracy: a bonus win never makes a Blackjack decision correct.'),
+      !anyBets ? h('p', { class: 'empty' }, 'No Blackjack bonus bets yet.') : h('div', {},
+        h('h3', {}, 'This session'), table('session'),
+        h('h3', {}, 'Lifetime'), table('lifetime'),
+        r.stats.jackpots.length ? h('div', {}, h('h3', {}, 'Jackpot history'), h('ul', {}, ...r.stats.jackpots.map((j) => h('li', {}, `${new Date(j.at).toLocaleString()}: ${j.combo} — ${money(j.amount)}`)))) : null,
+        h('h3', {}, 'Bonus hand history'),
+        h('div', { class: 'row' }, sel, csel),
+        r.hands.length ? h('ul', { class: 'bonus-hands' }, ...r.hands.map((x) => h('li', {},
+          h('b', {}, `#${x.handNumber}`), ` ${new Date(x.at).toLocaleString()} · main ${money(x.mainNet, true)} · `,
+          ...x.results.map((y) => h('span', { class: y.result === 'win' ? 'pos' : 'muted' }, `${y.name}: ${y.result === 'win' ? `${y.label} ${y.pays}:1 ${money(y.net, true)}` : `lost ${money(y.stake)}`}  `)),
+          x.prog ? h('span', { class: x.prog.amount > 0 ? 'pos' : 'muted' }, `21+3 Prog: ${x.prog.amount > 0 ? `${x.prog.combo ?? 'Envy'} ${money(x.prog.amount)}` : `lost ${money(x.prog.stake)}`}`) : null))) : h('p', { class: 'muted' }, 'No hands match this filter.')));
+  };
+  load();
+  return sec;
 }
 
 /** A repeated mistake (3+ times) gets a plain-language tip from basic strategy. */

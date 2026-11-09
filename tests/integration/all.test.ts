@@ -9,7 +9,7 @@ import { PAWN_TIERS } from '../../src/shared/debt';
 import { io as ioc } from 'socket.io-client';
 import { intToCard } from '../../src/shared/cards';
 import { type NightRecap } from '../../src/shared/recap';
-import { PROGRESSIVE, resolveProgressive } from '../../src/shared/progressive';
+import { PROGRESSIVE, progSetup, resolveMeter } from '../../src/shared/progressive';
 import { type PlayerSettlementRow } from '../../src/server/store';
 import { DEFAULT_BJ_RULES, bjEvCost, newHand } from '../../src/shared/blackjack';
 import { LINE } from '../../src/shared/roast/library';
@@ -47,7 +47,7 @@ describe('blackjack', () => {
       expect(v.config.game).toBe('bj');
       expect(v.bj!.rulesText.join(' ')).toMatch(/6 decks.*Blackjack pays 3:2.*stands on all 17s/);
       expect(v.bj!.rules).toMatchObject({ decks: 6, h17: false, maxHands: 4, resplitAces: false, lateSurrender: false, insurance: true, peek: true });
-      expect((await a.bet($(5), $(5))).error).toMatch(/single wager/);
+      expect((await a.bet($(5), $(5))).error).toMatch(/poker bets/);
       expect((await a.bet(550)).error).toMatch(/whole dollars/);
       expect((await a.bet($(50_000))).error).toMatch(/Maximum|Not enough/);
       expect((await a.bet($(2000))).error).toMatch(/Not enough chips/);
@@ -1024,7 +1024,7 @@ describe('multiplayer', () => {
       const handId = a.state.handId!;
       const before = await s.store.ledgerSum(a.id, code);
       const r = await s.store.settleHand(handId, code, { hand: 'x', qualifies: true },
-        (jp) => ({ jackpotAfter: jp + $(999), hits: [], rows: [{ playerId: a.id, credit: $(999), net: 0, outcome: 'win', handName: 'x', handRank: 0, tripsNet: 0, play: 0, folded: false, settlement: {},
+        (jp) => ({ meters: new Map([['five-card-5', jp.get('five-card-5')! + $(999)]]), hits: [], rows: [{ playerId: a.id, credit: $(999), net: 0, outcome: 'win', handName: 'x', handRank: 0, tripsNet: 0, play: 0, folded: false, settlement: {},
           pairsNet: 0, badBeatNet: 0, pairsCombo: null, badBeatCombo: null, pairsMultiplier: null, badBeatMultiplier: null, pairsVariant: null, badBeatVariant: null, baseNet: 0,
           progressiveNet: 0, progressiveHand: null }] }));
       expect(r.applied).toBe(false);
@@ -1432,14 +1432,14 @@ describe('progressive-audit', () => {
         players: [{ playerId: pid, seat: 0, name: 'p', hole, ante: 1000, blind: 1000, trips: 0, pairs: 0, badBeat: 0, progressive: 500 }],
       })));
       expect(await store.getJackpot()).toBe(meter0 + 4 * C);
-      const settleOne = (i: number) => store.settleHand(`race-${i}`, codes[i], { hand: 'Pair', qualifies: true }, (meter) => {
-        const r = resolveProgressive([{ playerId: ids[i], seat: 0, hand: 'Royal Flush' }], meter);
+      const settleOne = (i: number) => store.settleHand(`race-${i}`, codes[i], { hand: 'Pair', qualifies: true }, (meters) => {
+        const r = resolveMeter(progSetup('five-card-5', 'casino'), [{ playerId: ids[i], seat: 0, combo: 'Royal Flush' }], meters.get('five-card-5')!);
         const award = r.awards.get(ids[i])!.amount;
         const row: PlayerSettlementRow = { playerId: ids[i], credit: award, net: award - 2500, outcome: 'loss', handName: 'Royal Flush', handRank: 9,
           tripsNet: 0, play: 0, folded: true, settlement: {}, pairsNet: 0, badBeatNet: 0, pairsCombo: null, badBeatCombo: null, pairsMultiplier: null,
           badBeatMultiplier: null, pairsVariant: null, badBeatVariant: null, baseNet: -2000, progressiveNet: award - 500, progressiveHand: 'Royal Flush' };
-        return { rows: [row], jackpotAfter: r.meterAfter, hits: r.hits.map((h) => ({ ...h, hand: h.hand as string })) };
-      });
+        return { rows: [row], meters: new Map([['five-card-5', r.meterAfter]]), hits: r.hits.map((h) => ({ meterId: 'five-card-5', playerId: h.playerId, hand: h.combo, amount: h.amount, meterBefore: h.meterBefore, meterAfter: h.meterAfter })) };
+      }, ['five-card-5']);
       // Fire all four settlements at once, twice each (a retry must never pay again).
       const results = await Promise.all([0, 1, 2, 3, 0, 1, 2, 3].map(settleOne));
       expect(results.filter((r) => r.applied)).toHaveLength(4);
@@ -1483,8 +1483,8 @@ describe('progressive', () => {
     it('shows the same seeded meter at every table', async () => {
       const a = await p[0].waitState((v) => v.phase === 'betting');
       const b = await lou.waitState((v) => !!v.jackpot);
-      expect(a.jackpot).toEqual({ amount: PROGRESSIVE.seed, wager: 500 });
-      expect(b.jackpot.amount).toBe(PROGRESSIVE.seed);
+      expect(a.jackpot).toMatchObject({ amount: PROGRESSIVE.seed, wager: 500, meterId: 'five-card-5' });
+      expect(b.jackpot!.amount).toBe(PROGRESSIVE.seed);
       expect(a.config.progressive).toBe(true);
     });
 
@@ -1500,8 +1500,8 @@ describe('progressive', () => {
 
       const pre = await p[0].waitState((v) => v.phase === 'preflop');
       expect(pre.seats[0]!.balance).toBe($(1000) - $(25));                    // ante + blind + $5 progressive
-      expect(pre.jackpot.amount).toBe(PROGRESSIVE.seed + 3 * PROGRESSIVE.contribution);
-      await lou.waitState((v) => v.jackpot.amount === PROGRESSIVE.seed + 1050, 3000, 'linked meter rises');
+      expect(pre.jackpot!.amount).toBe(PROGRESSIVE.seed + 3 * PROGRESSIVE.contribution);
+      await lou.waitState((v) => v.jackpot!.amount === PROGRESSIVE.seed + 1050, 3000, 'linked meter rises');
 
       await p[0].decide('preflop', 'play4'); await p[1].decide('preflop', 'play4'); await p[2].decide('preflop', 'check');
       await p[2].decide('flop', 'check');
@@ -1517,7 +1517,7 @@ describe('progressive', () => {
       expect(prog(2).note).toMatch(/Envy/);
       expect(done.seats[2]!.result!.net).toBe(-$(20) + 650_000 - 500);
       expect(done.seats[2]!.cards).toEqual(['2c', '3d']);                    // folded hand shown after the round
-      expect(done.jackpot.amount).toBe(PROGRESSIVE.seed);
+      expect(done.jackpot!.amount).toBe(PROGRESSIVE.seed);
       expect(await s.store.getJackpot()).toBe(PROGRESSIVE.seed);
 
       for (let i = 0; i < 3; i++) expect(await s.store.ledgerSum(p[i].id, code)).toBe(done.seats[i]!.balance);
@@ -1530,13 +1530,13 @@ describe('progressive', () => {
     });
 
     it('announces the hit at the table and at every other table', async () => {
-      await p[1].waitState(() => p[1].chat.some((m) => /JACKPOT! Kim hits a Royal Flush on the progressive/.test(m.text)), 3000);
+      await p[1].waitState(() => p[1].chat.some((m) => /JACKPOT! Kim hits Royal Flush on the Five Card/.test(m.text)), 3000);
       await lou.waitState(() => lou.events.some((e) => e.ev === 'jackpot:hit'), 3000, 'jackpot:hit');
       const ev = lou.events.filter((e) => e.ev === 'jackpot:hit').map((e) => e.args[0] as any);
       expect(ev[0]).toMatchObject({ playerName: 'Kim', hand: 'Royal Flush', amount: 1_001_000, same: false });
       expect(ev[1]).toMatchObject({ playerName: 'Ace', hand: 'Straight Flush', same: false });
       expect(p[0].events.find((e) => e.ev === 'jackpot:hit')!.args[0]).toMatchObject({ same: true });
-      await lou.waitState((v) => v.jackpot.amount === PROGRESSIVE.seed, 3000, 'meter reset seen elsewhere');
+      await lou.waitState((v) => v.jackpot!.amount === PROGRESSIVE.seed, 3000, 'meter reset seen elsewhere');
     });
 
     it('tracks the progressive in statistics', async () => {
@@ -1918,8 +1918,8 @@ describe('sidebets', () => {
       expect((await p[0].emit('host:settings', { pairsVariant: 'up-bonus2', badBeatVariant: 'bb-02' })).ok).toBe(true);
       const v = await p[2].waitState((x) => x.config.pairsVariant === 'up-bonus2');
       expect(v.config.badBeatVariant).toBe('bb-02');
-      await p[2].waitState(() => p[2].chat.some((m) => /Ultimate Pairs is now Ultimate Pairs Bonus 2/.test(m.text)), 3000);
-      expect(p[2].chat.some((m) => /Bad Beat is now Bad Beat Bonus 02/.test(m.text))).toBe(true);
+      await p[2].waitState(() => p[2].chat.some((m) => /Ultimate Pairs is now Ultimate Pairs UP-02/.test(m.text)), 3000);
+      expect(p[2].chat.some((m) => /Bad Beat is now Bad Beat BB-02/.test(m.text))).toBe(true);
       // During a hand: refused
       await p[0].bet($(10)); await p[2].bet($(10)); await ace2.bet($(10));
       await Promise.all([p[0].ready(), p[2].ready(), ace2.ready()]);
@@ -1995,7 +1995,9 @@ describe('tcp', () => {
 
     it('rejects Hold’em side bets, deals three unique cards each, hides others until settlement', async () => {
       expect((await host.bet($(10), $(5))).error).toMatch(/Ultimate Texas Hold’em bets/);
-      expect((await host.bet($(10), 0, 0, 0, $(5))).error).toMatch(/Ultimate Texas Hold’em bets/);
+      // §37: the $5 progressive circle is now the Three Card Progressive here (its own meter), so it is accepted…
+      expect((await host.bet($(10), 0, 0, 0, $(5))).ok).toBe(true);
+      expect((await host.bet($(10), 0, 0, 0, $(1))).error).toMatch(/fixed \$5 bet/);
       const meter0 = await s.store.getJackpot();
       // Tom: straight (Ante Bonus) loses to dealer trips; Ann: Q-6-4 plays and loses; Bo folds a pair with Pair Plus + Six Card.
       s.decks.push(rigTcp(['4c 5d 6s', 'Qh 6c 4d', '9h 9c 2s'], '7h 7d 7c'));
@@ -2106,6 +2108,244 @@ describe('tcp', () => {
       const replays = await Promise.all((await s.store.recentHands(code, 10)).map((h) => s.store.handReplay(h.handId)));
       expect(replays.map((r) => r!.game).sort()).toEqual(['tcp', 'tcp', 'tcp', 'uth']);
       expect(replays.find((r) => r!.game === 'tcp')!.community).toEqual([]);
+    });
+  });
+});
+
+// ==================================================================== §34–§39 Blackjack side bets, progressives, TCP repro (PostgreSQL)
+import { BJ_SIDES } from '../../src/shared/bjsides';
+describe('bonus', () => {
+  type S = Awaited<ReturnType<typeof startServer>>;
+  const ALL_ON = { preset: 'custom', bets: Object.fromEntries(BJ_SIDES.filter((d) => d.status === 'playable').map((d) => [d.id, { on: true, min: 100, max: 2500 }])) };
+  const bjBet = (p: TC, ante: number, bjSides: Record<string, number> = {}, progressive = 0) =>
+    p.emit('bet:place', { actionId: aid(), ante, trips: 0, pairs: 0, badBeat: 0, progressive, bjSides });
+  const line = (v: TableView, p: TC, id: string) => v.seats.find((x) => x?.playerId === p.id)!.result!.lines.find((l) => l.sideId === id);
+
+  describe('§34 six players, six different side-bet mixes, one shoe (PostgreSQL)', () => {
+    let s: S; let code: string; const ps: TC[] = [];
+    beforeAll(async () => {
+      s = await startServer();
+      for (const n of ['Ann', 'Bo', 'Cy', 'Di', 'Ed', 'Fa']) ps.push(await s.player(n));
+      code = await s.createTable(ps[0].token, { game: 'bj', minAnte: 100, maxAnte: 100_000, startingBankroll: 100_000, bjSides: ALL_ON });
+      for (const p of ps) await p.join(code);
+      await ps[0].waitState((v) => v.seats.filter(Boolean).length === 6);
+    });
+    afterAll(() => s.stop());
+
+    it('every wager is recorded, evaluated and paid independently; results reconcile to the cent', async () => {
+      const [ann, bo, cy, di, ed, fa] = ps;
+      // Dealer 6♥ T♠ (16) draws K♦ and busts with three cards. Everyone stands.
+      s.rigShoe(code, rigShoe(['8h 8h', '6h 6h', '7s 8s', 'Qh Qh', '6d 2c', 'Tc Kh'], '6h Ts', 'Kd'));
+      expect((await bjBet(ann, $(25), { 'perfect-player': $(5), twentyone3: $(5), buster: $(5) })).ok).toBe(true);
+      expect((await bjBet(bo, $(25), { twentyone3: $(5), top3: $(5), 'lucky-lucky': $(5) })).ok).toBe(true);
+      expect((await bjBet(cy, $(25), { 'lucky-lucky': $(5), 'match-dealer': $(5) })).ok).toBe(true);
+      expect((await bjBet(di, $(25), { 'lucky-ladies': $(5), 'perfect-dealer': $(5) })).ok).toBe(true);
+      expect((await bjBet(ed, $(25), { 'match-dealer': $(5) }, $(5))).ok).toBe(true);
+      expect((await bjBet(fa, $(25), { 'perfect-player': $(5), top3: $(5), 'lucky-lucky': $(5) })).ok).toBe(true);
+      const before = new Map(ps.map((p) => [p.id, p.state.seats.find((x) => x?.playerId === p.id)!.balance]));
+      await Promise.all(ps.map((p) => p.ready()));
+      // Initial-card wagers show at once; dealer-hole wagers stay pending while the hole card is hidden.
+      const dealt = await di.waitState((v) => v.phase === 'turns' && !!v.seats.find((x) => x?.playerId === di.id)?.bj?.sides?.length);
+      const diSides = dealt.seats.find((x) => x?.playerId === di.id)!.bj!.sides!;
+      expect(diSides.find((x) => x.id === 'perfect-dealer')!.result).toBeUndefined();
+      expect(diSides.find((x) => x.id === 'lucky-ladies')!.result).toBeUndefined();
+      expect(dealt.dealer.cards[1]).toBeNull();
+      expect(dealt.seats.find((x) => x?.playerId === bo.id)!.bj!.sides!.find((x) => x.id === 'top3')).toMatchObject({ result: 'win', pays: 270 });
+      for (const p of ps) await p.bj('stand');
+      const v = await ann.waitState((x) => x.phase === 'settled', 8000, 'settled');
+      expect(v.dealer.cards).toEqual(['6h', 'Ts', 'Kd']);
+      const L = (p: TC, id: string) => line(v, p, id);
+      expect(L(ann, 'perfect-player')).toMatchObject({ result: 'win', multiplier: 25, net: $(125) });
+      expect(L(ann, 'twentyone3')).toMatchObject({ result: 'win', multiplier: 5 });               // 8♥ 8♥ 6♥: a flush
+      expect(L(ann, 'buster')).toMatchObject({ result: 'win', multiplier: 2 });                   // three-card bust
+      expect(L(bo, 'twentyone3')).toMatchObject({ result: 'win', multiplier: 100 });              // suited three of a kind (multi-deck)
+      expect(L(bo, 'top3')).toMatchObject({ result: 'win', multiplier: 270 });
+      expect(L(bo, 'lucky-lucky')).toMatchObject({ result: 'lose' });
+      expect(L(cy, 'lucky-lucky')).toMatchObject({ result: 'win', multiplier: 25 });              // 6-7-8 unsuited
+      expect(L(cy, 'match-dealer')).toMatchObject({ result: 'lose' });
+      expect(L(di, 'lucky-ladies')).toMatchObject({ result: 'win', multiplier: 200 });            // Q♥ pair, no dealer blackjack
+      expect(L(di, 'perfect-dealer')).toMatchObject({ result: 'lose' });
+      expect(L(ed, 'match-dealer')).toMatchObject({ result: 'win', multiplier: 4 });
+      const edProg = v.seats.find((x) => x?.playerId === ed.id)!.result!.lines.find((l) => l.wager === 'progressive')!;
+      expect(edProg).toMatchObject({ result: 'lose', stake: $(5), credit: 0 });
+      for (const id of ['perfect-player', 'top3', 'lucky-lucky']) expect(L(fa, id)).toMatchObject({ result: 'lose' });
+      // Main hands are independent: everybody's stood hand wins against the bust.
+      for (const p of ps) {
+        const st = v.seats.find((x) => x?.playerId === p.id)!;
+        expect(st.result!.lines.filter((l) => l.wager === 'ante')[0]).toMatchObject({ result: 'win', net: $(25) });
+        const net = st.result!.lines.reduce((t, l) => t + l.net, 0);
+        expect(st.result!.net).toBe(net);
+        expect(st.balance - before.get(p.id)!).toBe(net);
+        expect(await s.store.ledgerSum(p.id, code)).toBe(st.balance);
+      }
+      // §34.9 per-wager statistics (separate from strategy) and the §37.8 progressive history row.
+      const bo1 = (await s.api('/api/stats/bonus', bo.token)).body;
+      expect(bo1.stats.lifetime.top3).toMatchObject({ bets: 1, wins: 1, wagered: $(5), returned: $(5) * 271, topCombo: 'Suited Three of a Kind' });
+      expect(bo1.hands[0].results.map((x: { id: string }) => x.id).sort()).toEqual(['lucky-lucky', 'top3', 'twentyone3']);
+      const filtered = (await s.api('/api/stats/bonus?side=lucky-lucky', cy.token)).body;
+      expect(filtered.hands).toHaveLength(1);
+      const tx = (await s.api('/api/progressive/history', ed.token)).body.tx;
+      expect(tx[0]).toMatchObject({ game: 'bj', variant: 'bj-213-16', profile: 'high-roller', wager: $(5), category: 'loss', amount: 0, net: -$(5) });
+      const pool = (s.store as any).pool;
+      const prof = (await pool.query(`SELECT rules_profile FROM hands WHERE id=$1`, [v.handId])).rows[0].rules_profile;
+      expect(prof.sides.top3.variant).toBe('allbets');
+      expect(prof.progressive).toMatchObject({ meterId: 'bj-213-16:high-roller', wager: $(5) });
+      // The dealer roasts real outcomes only: a double 21+3 / Top 3 is recognised from the recorded results.
+      await bo.waitState(() => bo.chat.some((m) => /Top 3/.test(m.text)), 3000, 'side-bet chat');
+    });
+
+    it('dealer blackjack before play: dealer-card wagers settle on the revealed hand; Buster loses; nothing else is dealt', async () => {
+      const [ann, bo, , di] = ps;
+      await ann.waitState((v) => v.phase === 'betting', 8000);
+      s.rigShoe(code, rigShoe(['8h 8h', '9s 9d', '7s 8s', 'Qh Qh', '6d 2c', 'Td Th'], 'As Kd'));
+      expect((await bjBet(ann, $(25), { buster: $(5) })).ok).toBe(true);
+      expect((await bjBet(bo, $(25), { 'perfect-dealer': $(5) })).ok).toBe(true);
+      for (const p of [ps[2], ps[4], ps[5]]) expect((await bjBet(p, $(25))).ok).toBe(true);
+      expect((await bjBet(di, $(25), { 'lucky-ladies': $(5) })).ok).toBe(true);
+      await Promise.all(ps.map((p) => p.ready()));
+      for (const p of ps) await p.bj('no-insurance');
+      const v = await ann.waitState((x) => x.phase === 'settled', 8000, 'settled');
+      expect(v.dealer.cards).toEqual(['As', 'Kd']);
+      expect(line(v, di, 'lucky-ladies')).toMatchObject({ result: 'win', multiplier: 1000 });
+      expect(line(v, bo, 'perfect-dealer')).toMatchObject({ result: 'lose' });
+      expect(line(v, ann, 'buster')).toMatchObject({ result: 'lose' });
+      for (const p of ps) expect(await s.store.ledgerSum(p.id, code)).toBe(v.seats.find((x) => x?.playerId === p.id)!.balance);
+    });
+
+    it('every hand busts: the dealer draws nothing, so Buster loses — no card is dealt to settle it', async () => {
+      const [ann] = ps;
+      await ann.waitState((v) => v.phase === 'betting', 8000);
+      s.rigShoe(code, rigShoe(['Ts 6d'], '5h 9c', 'Kc 2d 3d'));
+      for (const p of ps.slice(1)) await p.emit('player:prefs', { sitOut: true });
+      expect((await bjBet(ann, $(25), { buster: $(5) })).ok).toBe(true);
+      await ann.ready();
+      await ann.bj('hit');
+      const v = await ann.waitState((x) => x.phase === 'settled', 8000, 'settled');
+      expect(v.dealer.cards).toEqual(['5h', '9c']);
+      expect(line(v, ann, 'buster')).toMatchObject({ result: 'lose', net: -$(5) });
+      expect(await s.store.ledgerSum(ann.id, code)).toBe(v.seats[0]!.balance);
+      for (const p of ps.slice(1)) await p.emit('player:prefs', { sitOut: false });
+    });
+
+    it('rebet after the host changes the bonus menu: closed wagers come off by name, the main bet stays', async () => {
+      const [ann] = ps;
+      await ann.waitState((v) => v.phase === 'betting', 8000);
+      expect((await bjBet(ann, $(25), { top3: $(5), 'lucky-lucky': $(5) })).ok).toBe(true);
+      expect((await ann.emit('host:settings', { bjSides: { preset: 'allbets' } })).ok).toBe(true);
+      const v = await ann.waitState((x) => x.config.bjSides.preset === 'allbets');
+      expect(v.you.pending.ante).toBe($(25));
+      expect(v.you.pending.bjSides).toEqual({ top3: $(5), 'lucky-lucky': $(5) });       // both still open under All Bets
+      expect((await ann.emit('host:settings', { bjSides: { preset: 'classic' } })).ok).toBe(true);
+      const w = await ann.waitState((x) => x.config.bjSides.preset === 'classic');
+      expect(w.you.pending).toMatchObject({ ante: $(25) });
+      expect(w.you.pending.bjSides ?? {}).toEqual({});
+      await ann.waitState(() => ann.chat.some((m) => /Top 3, Lucky Lucky taken back/.test(m.text)), 3000, 'taken back');
+      expect((await bjBet(ann, $(25), { top3: $(5) })).error).toMatch(/not open at this table/);
+      expect((await ann.emit('host:settings', { bjSides: ALL_ON })).ok).toBe(true);
+    });
+  });
+
+  describe('§37 concurrent claims on one shared meter (PostgreSQL)', () => {
+    let s: S;
+    beforeAll(async () => { s = await startServer(); });
+    afterAll(() => s.stop());
+    it('four tables claiming the 21+3 jackpot at once: paid once each, serialized, meter never negative, history recorded', async () => {
+      const store = s.store;
+      const setup = progSetup('bj-213-16', 'high-roller');
+      const ids: string[] = [], codes: string[] = [];
+      for (const n of ['Q1', 'Q2', 'Q3', 'Q4']) {
+        const g = await s.guest(n); const code = await s.createTable(g.token);
+        await store.createStack(g.player.id, code, $(1000)); ids.push(g.player.id); codes.push(code);
+      }
+      const spec = { id: setup.meterId, seed: setup.seed, game: 'bj', variant: setup.variant.id, profile: setup.profile };
+      await Promise.all(ids.map((pid, i) => store.startHand({ id: `bjrace-${i}`, tableCode: codes[i], handNumber: 1, nightId: '', rulesVersion: 'bj', deckCommitment: 'x', dealerCards: ['Qs', '2c'], community: [],
+        pairsVariant: 'up-bonus4', badBeatVariant: 'bb-01', game: 'bj', meters: [spec],
+        players: [{ playerId: pid, seat: 0, name: 'p', hole: ['As', 'Ks'], ante: 1000, blind: 0, trips: 0, pairs: 0, badBeat: 0, progressive: setup.wager, progMeter: setup.meterId, progContribution: setup.contribution }] })));
+      const start = (await store.getMeters()).find((m) => m.id === setup.meterId)!.amount;
+      expect(start).toBe(setup.seed + 4 * setup.contribution);
+      const settleOne = (i: number) => store.settleHand(`bjrace-${i}`, codes[i], { hand: '12', qualifies: true }, (meters) => {
+        const r = resolveMeter(setup, [{ playerId: ids[i], seat: 0, combo: 'Mini Royal (jackpot suit)' }], meters.get(setup.meterId)!);
+        const amt = r.awards.get(ids[i])!.amount;
+        const row: PlayerSettlementRow = { playerId: ids[i], credit: amt, net: amt - 1000 - setup.wager, outcome: 'lose', handName: '20', handRank: 0, tripsNet: 0, play: 0, folded: false, settlement: {},
+          pairsNet: 0, badBeatNet: 0, pairsCombo: null, badBeatCombo: null, pairsMultiplier: null, badBeatMultiplier: null, pairsVariant: null, badBeatVariant: null, baseNet: -1000, progressiveNet: amt - setup.wager, progressiveHand: 'Mini Royal (jackpot suit)' };
+        return { rows: [row], meters: new Map([[setup.meterId, r.meterAfter]]),
+          hits: r.hits.map((h) => ({ meterId: setup.meterId, playerId: h.playerId, hand: h.combo, amount: h.amount, meterBefore: h.meterBefore, meterAfter: h.meterAfter })),
+          progTx: [{ playerId: ids[i], game: 'bj', meterId: setup.meterId, variant: setup.variant.id, profile: setup.profile, wager: setup.wager, combo: 'Mini Royal (jackpot suit)', category: 'meter' as const, pct: 100,
+            fixedAward: 0, meterAward: amt, envy: 0, meterBefore: r.hits[0].meterBefore, meterAfter: r.meterAfter, amount: amt, net: amt - setup.wager }] };
+      }, [setup.meterId]);
+      const results = await Promise.all([0, 1, 2, 3, 0, 1, 2, 3].map(settleOne));
+      expect(results.filter((r) => r.applied)).toHaveLength(4);                       // replays never pay twice
+      const pool = (store as any).pool;
+      const hits = (await pool.query(`SELECT amount, meter_before, meter_after FROM progressive_hits WHERE meter_id=$1 ORDER BY id`, [setup.meterId])).rows.map((r: any) => ({ a: Number(r.amount), b: Number(r.meter_before), c: Number(r.meter_after) }));
+      expect(hits).toHaveLength(4);
+      expect(hits[0].b).toBe(start);
+      for (let i = 1; i < 4; i++) expect(hits[i].b).toBe(hits[i - 1].c);              // each claim sees the previous claim's result
+      const final = (await store.getMeters()).find((m) => m.id === setup.meterId)!.amount;
+      expect(hits.reduce((t: number, h: { a: number }) => t + h.a, 0) + final).toBe(start + 4 * setup.seed);
+      expect(final).toBeGreaterThanOrEqual(setup.seed);
+      const tx = (await pool.query(`SELECT COUNT(*)::int n FROM progressive_tx WHERE meter_id=$1`, [setup.meterId])).rows[0].n;
+      expect(tx).toBe(4);
+      for (let i = 0; i < 4; i++) expect(await store.ledgerSum(ids[i], codes[i])).toBe((await store.getStack(ids[i], codes[i]))!.balance);
+      // Other games' meters were never touched.
+      expect((await store.getMeters()).find((m) => m.id === 'five-card-5')!.amount).toBe(PROGRESSIVE.seed);
+    });
+    it('a hand interrupted by a restart refunds every stake (side bets included) and takes its contribution back off its own meter', async () => {
+      const store = s.store;
+      const setup = progSetup('bj-213-16', 'casino');
+      const g = await s.guest('Rx'); const code = await s.createTable(g.token);
+      await store.createStack(g.player.id, code, $(1000));
+      const spec = { id: setup.meterId, seed: setup.seed, game: 'bj', variant: setup.variant.id, profile: setup.profile };
+      await store.startHand({ id: 'bjvoid', tableCode: code, handNumber: 1, nightId: '', rulesVersion: 'bj', deckCommitment: 'x', dealerCards: [], community: [], pairsVariant: 'up-bonus4', badBeatVariant: 'bb-01', game: 'bj', meters: [spec],
+        players: [{ playerId: g.player.id, seat: 0, name: 'p', hole: ['2s', '3s'], ante: $(25), blind: 0, trips: 0, pairs: 0, badBeat: 0, progressive: setup.wager, progMeter: setup.meterId, progContribution: setup.contribution, sides: { top3: $(5), buster: $(5) } }] });
+      expect((await store.getStack(g.player.id, code))!.balance).toBe($(1000) - $(25) - $(10) - setup.wager);
+      const m0 = (await store.getMeters()).find((m) => m.id === setup.meterId)!.amount;
+      await store.voidActiveHands();
+      expect((await store.getStack(g.player.id, code))!.balance).toBe($(1000));
+      expect((await store.getMeters()).find((m) => m.id === setup.meterId)!.amount).toBe(Math.max(setup.seed, m0 - setup.contribution));
+      expect(await store.ledgerSum(g.player.id, code)).toBe($(1000));
+    });
+  });
+
+  describe('§35 Three Card Poker reproduction at a live table (PostgreSQL)', () => {
+    let s: S; let code: string; let a: TC; let b: TC;
+    beforeAll(async () => {
+      s = await startServer();
+      a = await s.player('Tri'); b = await s.player('Flu');
+      code = await s.createTable(a.token, { game: 'tcp', decisionSeconds: 5 });
+      await a.join(code); await b.join(code);
+      await a.waitState((v) => v.phase === 'betting' && v.seats.filter(Boolean).length === 2);
+    });
+    afterAll(() => s.stop());
+    it('8♠ 8♥ 8♦ against the dealer’s A♣ J♣ 6♣: player wins; Ante, Play, Ante Bonus, Pair Plus and the Progressive all pay; history ranks Trips above Flush', async () => {
+      // The exact case: dealer A♣ J♣ 6♣ (Flush) vs player 8♠ 8♥ 8♦ (Three of a Kind).
+      s.decks.push(rigTcp(['8s 8h 8d', '2d 5h 9s'], 'Ac Jc 6c'));
+      expect((await a.emit('bet:place', { actionId: aid(), ante: $(10), trips: 0, pairPlus: $(5), sixCard: 0, progressive: $(5) })).ok).toBe(true);
+      expect((await b.emit('bet:place', { actionId: aid(), ante: $(10), trips: 0, pairPlus: 0, sixCard: 0 })).ok).toBe(true);
+      const bal0 = a.state.seats[0]!.balance;
+      await Promise.all([a.ready(), b.ready()]);
+      await a.decide('decide', 'play1'); await b.decide('decide', 'fold');
+      const v = await a.waitState((x) => x.phase === 'settled');
+      expect(v.dealer).toMatchObject({ cards: ['Ac', 'Jc', '6c'], handName: 'Flush', qualifies: true });
+      const r = v.seats[0]!.result!;
+      const L = (k: string) => r.lines.find((l) => l.wager === k);
+      expect(r.outcome).toBe('win');
+      expect(L('ante')).toMatchObject({ result: 'win', net: $(10) });
+      expect(L('play')).toMatchObject({ result: 'win', net: $(10) });
+      expect(L('anteBonus')).toMatchObject({ result: 'win', net: $(40), multiplier: 4 });
+      expect(L('pairPlus')).toMatchObject({ result: 'win', net: $(150), multiplier: 30 });       // default pp-8: Trips 30:1
+      expect(L('progressive')).toMatchObject({ result: 'win', credit: $(500), net: $(495) });    // PT7 at $5: 100 for 1 = 500 chips, the $5 not returned
+      expect(v.seats[0]!.balance - bal0 + $(10) + $(10) + $(5) + $(5)).toBe($(20) + $(20) + $(40) + $(155) + $(500));
+      expect(await s.store.ledgerSum(a.id, code)).toBe(v.seats[0]!.balance);
+      const pool = (s.store as any).pool;
+      const rows = (await pool.query(`SELECT hand_name, hand_rank FROM hand_players WHERE player_id=$1 AND game='tcp' AND settled ORDER BY hand_rank DESC`, [a.id])).rows;
+      expect(rows[0]).toEqual({ hand_name: 'Three of a Kind', hand_rank: 4 });
+      const stats = (await s.api('/api/stats/me?game=tcp', a.token)).body.stats;
+      expect(stats.bestHand).toBe('Three of a Kind');
+      const tx = (await s.api('/api/progressive/history', a.token)).body.tx;
+      expect(tx[0]).toMatchObject({ game: 'tcp', variant: 'tcp-pt7', combo: 'Three of a Kind', category: 'fixed', fixedAward: $(500), amount: $(500) });
+      // Separate meters: the TCP meter moved; the Hold'em and Blackjack meters did not.
+      const meters = await s.store.getMeters();
+      expect(meters.find((m) => m.id === 'five-card-5')!.amount).toBe(PROGRESSIVE.seed);
     });
   });
 });

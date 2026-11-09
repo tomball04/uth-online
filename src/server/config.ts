@@ -3,13 +3,41 @@ import { cleanName } from './engine.js';
 import { DEFAULT_BACK, DEFAULT_FELT, isBack, isEffects, isFelt } from '../shared/themes.js';
 import { DEFAULT_DEALER_SETTINGS, parseDealerSettings } from '../shared/dealers.js';
 import { DEFAULT_BAD_BEAT_VARIANT, DEFAULT_PAIRS_VARIANT, isBadBeatVariant, isPairsVariant } from '../shared/sidebets.js';
+import { DEFAULT_TRIPS_VARIANT, isTripsVariant } from '../shared/rules.js';
+import { DEFAULT_PAIR_PLUS_VARIANT, isPairPlusVariant } from '../shared/tcp.js';
+import { isProgProfile, isProgVariant, type ProgGame } from '../shared/progressive.js';
+import { DEFAULT_BJ_SIDES, parseBjSidesConfig } from '../shared/bjsides.js';
+
+/**
+ * §33–§39 pay-table and progressive defaults. UTH keeps the published $5 Five Card Progressive by default
+ * (V2 is selectable); Three Card Poker and Blackjack open with the custom High Roller profile ($5 wager,
+ * $25,000 starting meter), clearly labelled as custom. Blackjack side bets start on Classic (none).
+ */
+export const GAME_EXTRAS: Pick<TableConfig, 'tripsVariant' | 'pairPlusVariant' | 'uthProg' | 'tcpProg' | 'bjProg' | 'jackpotSuit' | 'bjSides'> = {
+  tripsVariant: DEFAULT_TRIPS_VARIANT, pairPlusVariant: DEFAULT_PAIR_PLUS_VARIANT,
+  uthProg: { variant: 'five-card-5', profile: 'casino' },
+  tcpProg: { on: true, variant: 'tcp-pt7', profile: 'high-roller' },
+  bjProg: { on: true, variant: 'bj-213-16', profile: 'high-roller' },
+  jackpotSuit: 0, bjSides: DEFAULT_BJ_SIDES,
+};
+/** Validates one game's progressive settings; returns an error message or the parsed value. */
+export function parseProg<T extends { variant: string; profile: string; on?: boolean }>(game: ProgGame, x: unknown, cur: T): T | string {
+  if (x === undefined) return cur;
+  if (!x || typeof x !== 'object') return 'Invalid progressive settings.';
+  const o = x as Partial<T>;
+  const out = { ...cur };
+  if (o.variant !== undefined) { if (!isProgVariant(game, o.variant)) return 'Unknown progressive pay table.'; out.variant = o.variant; }
+  if (o.profile !== undefined) { if (!isProgProfile(o.profile)) return 'Unknown progressive profile.'; out.profile = o.profile; }
+  if (o.on !== undefined && 'on' in cur) out.on = !!o.on;
+  return out;
+}
 
 export const MULTI_DEFAULTS: Omit<TableConfig, 'name'> = {
   isPublic: false, allowSpectators: true, maxSeats: 6,
   minAnte: 500, maxAnte: 10_000, maxTrips: 2_500, maxPairs: 2_500, maxBadBeat: 2_500, startingBankroll: 100_000,
   pairsVariant: DEFAULT_PAIRS_VARIANT, badBeatVariant: DEFAULT_BAD_BEAT_VARIANT, progressive: true, felt: DEFAULT_FELT, cardBack: DEFAULT_BACK, effects: 'all',
   game: 'uth', maxPairPlus: 2_500, maxSixCard: 2_500,
-  decisionSeconds: 25, bettingSeconds: 20, solo: false, bjSurrender: false, dealer: DEFAULT_DEALER_SETTINGS,
+  decisionSeconds: 25, bettingSeconds: 20, solo: false, bjSurrender: false, dealer: DEFAULT_DEALER_SETTINGS, ...GAME_EXTRAS,
 };
 
 export const SOLO_DEFAULTS: Omit<TableConfig, 'name'> = {
@@ -17,7 +45,7 @@ export const SOLO_DEFAULTS: Omit<TableConfig, 'name'> = {
   minAnte: 100, maxAnte: 50_000, maxTrips: 10_000, maxPairs: 10_000, maxBadBeat: 10_000, startingBankroll: 50_000,
   pairsVariant: DEFAULT_PAIRS_VARIANT, badBeatVariant: DEFAULT_BAD_BEAT_VARIANT, progressive: true, felt: DEFAULT_FELT, cardBack: DEFAULT_BACK, effects: 'all',
   game: 'uth', maxPairPlus: 10_000, maxSixCard: 10_000,
-  decisionSeconds: 0, bettingSeconds: 5, solo: true, bjSurrender: false, dealer: DEFAULT_DEALER_SETTINGS,
+  decisionSeconds: 0, bettingSeconds: 5, solo: true, bjSurrender: false, dealer: DEFAULT_DEALER_SETTINGS, ...GAME_EXTRAS,
 };
 
 /** Build a validated config from untrusted input. Throws Error with a user-facing message. */
@@ -42,6 +70,7 @@ export function buildConfig(input: unknown, hostName: string): TableConfig {
     if (!ok(v)) throw new Error(`Unknown pay table for ${k}.`);
     return v;
   };
+  const must = <T>(r: T | string): T => { if (typeof r === 'string') throw new Error(r); return r; };
   const name = cleanName(typeof i.name === 'string' ? i.name : '', 40) || (solo ? 'Practice Table' : `${hostName}'s Table`);
   const c: TableConfig = {
     name, solo,
@@ -68,6 +97,13 @@ export function buildConfig(input: unknown, hostName: string): TableConfig {
     bettingSeconds: int('bettingSeconds', 5, 120, base.bettingSeconds),
     // §32: private tables default to the "Asshole" attitude (v1 "Savage"); public tables to Smartass. Hosts can go up to No Mercy.
     dealer: parseDealerSettings(i.dealer, { ...base.dealer, attitude: i.isPublic === true && !solo ? 'smartass' : 'asshole' }),
+    tripsVariant: variant('tripsVariant', isTripsVariant, base.tripsVariant),
+    pairPlusVariant: variant('pairPlusVariant', isPairPlusVariant, base.pairPlusVariant),
+    uthProg: must(parseProg('uth', i.uthProg, base.uthProg)),
+    tcpProg: must(parseProg('tcp', i.tcpProg, base.tcpProg)),
+    bjProg: must(parseProg('bj', i.bjProg, base.bjProg)),
+    jackpotSuit: int('jackpotSuit', 0, 3, base.jackpotSuit),
+    bjSides: i.bjSides === undefined ? base.bjSides : must(parseBjSidesConfig(i.bjSides)),
   };
   if (c.maxAnte < c.minAnte) throw new Error('Maximum ante must be at least the minimum ante.');
   if (c.startingBankroll < c.minAnte * 3) throw new Error('Starting bankroll must cover at least one minimum hand (3× the minimum ante).');

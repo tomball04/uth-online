@@ -19,6 +19,10 @@ export interface HandStartPlayer {
   playerId: string; seat: number; name: string; hole: string[];
   ante: number; blind: number; trips: number; pairs: number; badBeat: number; progressive: number;
   pairPlus?: number; sixCard?: number;
+  /** §37 the meter this player's progressive wager feeds and how much of it goes on (cents). */
+  progMeter?: string | null; progContribution?: number;
+  /** §34 Blackjack side bets as placed: {sideId: cents}. */
+  sides?: Record<string, number>;
 }
 export interface HandStart {
   id: string; tableCode: string; handNumber: number; deckCommitment: string;
@@ -26,7 +30,20 @@ export interface HandStart {
   pairsVariant: string; badBeatVariant: string;
   nightId: string; rulesVersion: string;
   game?: GameId;
+  /** §34.5 every pay table / profile in force for this hand. */
+  rulesProfile?: Record<string, unknown>;
+  /** Meters this hand may touch, with their reset values, created on first use. */
+  meters?: MeterSpec[];
 }
+export interface MeterSpec { id: string; seed: number; game: string; variant: string; profile: string }
+export interface MeterRow extends MeterSpec { amount: number; hits: number }
+/** §37.8 one settled progressive wager. */
+export interface ProgTx {
+  playerId: string; game: string; meterId: string; variant: string; profile: string; wager: number;
+  combo: string | null; category: 'meter' | 'fixed' | 'envy' | 'loss'; pct: number | null;
+  fixedAward: number; meterAward: number; envy: number; meterBefore: number; meterAfter: number; amount: number; net: number;
+}
+export interface ProgHitRow { meterId: string; playerId: string; hand: string; amount: number; meterBefore: number; meterAfter: number }
 export interface DebtEvent { id: number; playerId: string; name: string; kind: 'marker' | 'payoff'; amount: number; debtAfter: number; item: string; at: number }
 export interface NightRow { id: string; tableCode: string; startedAt: number; endedAt: number | null; hands: number }
 export interface PlayerSettlementRow {
@@ -37,6 +54,8 @@ export interface PlayerSettlementRow {
   pairsVariant: string | null; badBeatVariant: string | null; baseNet: number;
   progressiveNet: number; progressiveHand: string | null;
   pairPlusNet?: number; sixCardNet?: number; anteBonusNet?: number; pairPlusHand?: string | null; sixCardHand?: string | null;
+  /** §34 one result per Blackjack side bet. */
+  sideResults?: unknown[] | null;
 }
 
 export interface SideBetStats {
@@ -108,9 +127,15 @@ export interface Store {
   debtEvents(code: string, limit: number): Promise<DebtEvent[]>;
 
   /** Atomically records the hand, debits every initial wager, and adds progressive contributions to the meter. */
-  startHand(h: HandStart): Promise<{ balances: Map<string, number>; jackpot: number }>;
-  /** Current linked progressive meter (cents). */
+  startHand(h: HandStart): Promise<{ balances: Map<string, number>; jackpot: number; meters: Map<string, number> }>;
+  /** Current Five Card meter (cents) — the original UTH meter. */
   getJackpot(): Promise<number>;
+  /** §37 every progressive meter that exists (created on first use). */
+  getMeters(): Promise<MeterRow[]>;
+  /** §34.9 settled Blackjack hands with side-bet / 21+3 Progressive results for one player (oldest first). */
+  bonusRows(playerId: string): Promise<import('../shared/bjsides.js').BonusRow[]>;
+  /** §37.8 progressive transaction history, newest first. */
+  progressiveTx(filter: { playerId?: string; meterId?: string }, limit: number): Promise<(ProgTx & { handId: string; at: number })[]>;
   /** Debits a Play wager. Returns new balance, or null if this tx_key was already applied. */
   wager(handId: string, playerId: string, code: string, amount: number, key: string): Promise<number | null>;
   /** Blackjack: debits a double, split or insurance wager (idempotent by key) and records the round's running totals. */
@@ -121,8 +146,8 @@ export interface Store {
    * Atomically credits payouts. `build` is called inside the transaction with the locked progressive meter and
    * returns the final rows plus the meter after any jackpot awards. `applied` is false if already settled/voided.
    */
-  settleHand(handId: string, code: string, dealer: { hand: string; qualifies: boolean }, build: SettlementBuilder):
-    Promise<{ applied: boolean; balances: Map<string, number>; jackpot: number }>;
+  settleHand(handId: string, code: string, dealer: { hand: string; qualifies: boolean }, build: SettlementBuilder, meterIds?: string[]):
+    Promise<{ applied: boolean; balances: Map<string, number>; jackpot: number; meters: Map<string, number> }>;
   /** Startup recovery: refund every committed stake of hands interrupted by a restart. */
   voidActiveHands(): Promise<{ hands: number; refunds: number }>;
 
@@ -168,9 +193,16 @@ export interface Store {
   rewardFacts(playerId: string, nightId: string | null): Promise<RewardFacts>;
 }
 
-export type SettlementBuilder = (jackpot: number) => {
-  rows: PlayerSettlementRow[]; jackpotAfter: number;
-  hits: { playerId: string; hand: string; amount: number; meterBefore: number }[];
+/**
+ * Called inside the settlement transaction with every requested meter locked (FOR UPDATE, in id order, so two
+ * tables can never pay the same jackpot twice or deadlock). Returns the rows, the meters it changed and the
+ * progressive history. `jackpot` is the Five Card meter, kept for older callers.
+ */
+export type SettlementBuilder = (meters: Map<string, number>) => {
+  rows: PlayerSettlementRow[];
+  meters?: Map<string, number>;
+  hits?: ProgHitRow[];
+  progTx?: ProgTx[];
 };
 
 export const JACKPOT_ID = 'five-card-5';

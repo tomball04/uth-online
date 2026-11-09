@@ -20,7 +20,12 @@ import {
   RULES_VERSION, dealerQualifies, settle, validateInitialBet, type Decision, type DecisionPhase, type InitialBets, type Settlement,
 } from '../shared/rules.js';
 import { advise, mistakeCost, outsFor } from '../shared/strategy.js';
-import { PROGRESSIVE, progressiveHand, resolveProgressive, type ProgressiveEntry, type ProgressiveResolution } from '../shared/progressive.js';
+import { PROGRESSIVE, progSetup, resolveMeter, isProgVariant, isProgProfile, type ProgEntry, type ProgResolution, type ProgSetup } from '../shared/progressive.js';
+import { BJ_SIDE, DEFAULT_BJ_SIDES, enabledBjSides, parseBjSidesConfig, resolvableNow, settleBjSide, sumSides, type BjSideContext, type BjSideResult, type BjSidesConfig } from '../shared/bjsides.js';
+import { DEFAULT_TRIPS_VARIANT, isTripsVariant, TRIPS_VARIANTS } from '../shared/rules.js';
+import { DEFAULT_PAIR_PLUS_VARIANT, isPairPlusVariant, PAIR_PLUS_VARIANTS, TCP_STORED_RANK } from '../shared/tcp.js';
+import type { MeterSpec, ProgHitRow, ProgTx } from './store.js';
+import { GAME_EXTRAS, parseProg } from './config.js';
 import {
   BAD_BEAT_VARIANTS, DEFAULT_BAD_BEAT_VARIANT, DEFAULT_PAIRS_VARIANT, PAIRS_VARIANTS, isBadBeatVariant, isPairsVariant,
 } from '../shared/sidebets.js';
@@ -42,6 +47,13 @@ export function withSideBetDefaults(c: TableConfig): TableConfig {
     maxPairPlus: typeof c.maxPairPlus === 'number' ? c.maxPairPlus : (c.solo ? 10_000 : 2_500),
     maxSixCard: typeof c.maxSixCard === 'number' ? c.maxSixCard : (c.solo ? 10_000 : 2_500),
     dealer: (() => { try { return parseDealerSettings(c.dealer); } catch { return DEFAULT_DEALER_SETTINGS; } })(),
+    tripsVariant: isTripsVariant(c.tripsVariant) ? c.tripsVariant : DEFAULT_TRIPS_VARIANT,
+    pairPlusVariant: isPairPlusVariant(c.pairPlusVariant) ? c.pairPlusVariant : DEFAULT_PAIR_PLUS_VARIANT,
+    uthProg: c.uthProg && isProgVariant('uth', c.uthProg.variant) && isProgProfile(c.uthProg.profile) ? c.uthProg : GAME_EXTRAS.uthProg,
+    tcpProg: c.tcpProg && isProgVariant('tcp', c.tcpProg.variant) && isProgProfile(c.tcpProg.profile) ? { ...c.tcpProg, on: c.tcpProg.on !== false } : GAME_EXTRAS.tcpProg,
+    bjProg: c.bjProg && isProgVariant('bj', c.bjProg.variant) && isProgProfile(c.bjProg.profile) ? { ...c.bjProg, on: c.bjProg.on !== false } : GAME_EXTRAS.bjProg,
+    jackpotSuit: Number.isInteger(c.jackpotSuit) && c.jackpotSuit >= 0 && c.jackpotSuit <= 3 ? c.jackpotSuit : 0,
+    bjSides: (() => { const r = c.bjSides ? parseBjSidesConfig(c.bjSides) : DEFAULT_BJ_SIDES; return typeof r === 'string' ? DEFAULT_BJ_SIDES : r; })(),
   };
 }
 import { newId, sha256 } from './rng.js';
@@ -79,9 +91,11 @@ export interface EngineHooks {
   analysis(playerId: string, payload: { handId: string; decisions: DecisionRecord[] }): void;
   kicked(playerId: string, reason: string): void;
   closed(reason: string): void;
-  jackpot(amount: number): void;
-  jackpotHit(p: { tableName: string; playerName: string; hand: string; amount: number }): void;
-  jackpotAmount(): number;
+  /** A progressive meter changed (meter id, new amount). */
+  jackpot(meterId: string, amount: number): void;
+  jackpotHit(p: { tableName: string; playerName: string; hand: string; amount: number; meterId?: string; game?: GameId }): void;
+  /** Current amount of a meter (the last value the server saw; the Store is authoritative). */
+  jackpotAmount(meterId?: string): number;
   nightEnded(nightId: string): void;
   /** A hand settled (drives cosmetic rewards; never affects chips). */
   settled?(handId: string, nightId: string | null, playerIds: string[]): void;
@@ -107,6 +121,8 @@ interface HandPlayer {
   acted: boolean; lastAction?: Decision; decisions: DecisionRecord[];
   settlement?: Settlement; tcp?: TcpSettlement; best5?: number[];
   bj?: BjPlayer;
+  /** §37 this player's progressive award once resolved. */
+  progAward?: { amount: number; combo: string | null; label: string; envy: number; base: number; fromMeter: boolean } | null;
 }
 interface BjPlayer {
   hands: BjHand[]; active: number;
@@ -117,19 +133,30 @@ interface BjPlayer {
   results?: BjHandResult[]; insuranceNet?: number; net?: number;
   /** §32: verified Blackjack blunders this round (cards are public, so the dealer may remark on them). */
   hit20?: boolean; split10?: boolean;
+  /** Net of side bets + 21+3 Progressive, once settled. */
+  sidesNet?: number;
+  /** §34 side bets as placed {sideId: cents}, and results keyed by side id (recorded once each). */
+  sides: Record<string, number>;
+  sideResults: Map<string, BjSideResult>;
+  /** The player's first two cards, kept for side bets after a split changes the hands. */
+  first2: string[];
 }
 
 interface Hand {
   id: string; number: number; dealer: number[]; community: number[]; revealed: number;
   players: Map<string, HandPlayer>; settled: boolean; dealerScore?: number; game: GameId;
-  bj?: { turn: string | null; holeShown: boolean; order: string[] };
+  bj?: { turn: string | null; holeShown: boolean; order: string[]; dealerDone?: boolean };
+  /** §34.5 / §37 pay tables in force for this hand, fixed when it was dealt. */
+  prog: ProgSetup | null;
+  sides: BjSidesConfig;
+  tripsVariant: string; pairPlusVariant: string; jackpotSuit: number;
 }
 
 export class EngineError extends Error {}
 
 const DECISION_PHASES: Phase[] = ['preflop', 'flop', 'river', 'decide'];
-/** Three Card Poker categories mapped onto five-card ranks so best-hand records compare across games. */
-const TCP_EQUIV_RANK: Record<string, number> = { 'High Card': 0, Pair: 1, Flush: 5, Straight: 4, 'Three of a Kind': 3, 'Straight Flush': 8 };
+/** §35: stored Three Card Poker rank in THREE CARD order (the old map stored Flush above Three of a Kind). */
+const TCP_EQUIV_RANK: Record<string, number> = TCP_STORED_RANK;
 
 export class TableEngine {
   phase: Phase = 'waiting';
@@ -270,15 +297,19 @@ export class TableEngine {
       if (h.tcp) {
         const st = h.tcp;
         return { ...base, mainNet: st.baseNet, sideNet: st.sideNet, totalNet: st.net, handName: st.playerHand,
-          improbable: st.playerHand === 'Straight Flush' || st.playerHand === 'Three of a Kind' ? st.playerHand : undefined };
+          improbable: st.playerHand === 'Straight Flush' || st.playerHand === 'Three of a Kind' ? st.playerHand : undefined,
+          progressiveWin: hits.filter((x) => x.playerId === h.playerId).reduce((t, x) => t + x.amount, 0) || undefined };
       }
       const b = h.bj!;
       const ins = b.insuranceNet ?? 0;
       const busted = b.hands.find((y) => bjTotal(y.cards).bust);
       const six21 = b.hands.some((y) => y.cards.length >= 6 && bjTotal(y.cards).total === 21);
-      return { ...base, mainNet: (b.net ?? 0) - ins, sideNet: ins, totalNet: b.net ?? 0, handName: b.results?.[0]?.total,
+      const sn = b.sidesNet ?? 0;
+      return { ...base, mainNet: (b.net ?? 0) - ins - sn, sideNet: ins + sn, totalNet: b.net ?? 0, handName: b.results?.[0]?.total,
         natural: !!b.results?.some((r) => r.outcome === 'blackjack'), improbable: six21 ? `${b.hands.find((y) => y.cards.length >= 6)!.cards.length}-card 21` : undefined,
-        bj: { hit20: !!b.hit20, split10: !!b.split10, busted: !!busted, total: busted ? String(bjTotal(busted.cards).total) : undefined } };
+        bj: { hit20: !!b.hit20, split10: !!b.split10, busted: !!busted, total: busted ? String(bjTotal(busted.cards).total) : undefined },
+        bjSides: b.sideResults.size ? [...b.sideResults.values()].map((x) => ({ id: x.id, bet: x.name, combo: x.label, result: x.result, net: x.net })) : undefined,
+        progressiveWin: hits.filter((x) => x.playerId === h.playerId).reduce((t, x) => t + x.amount, 0) || undefined };
     });
     return { handId: hand.id, nightId: this.nightId, game: hand.game, dealerHand, players };
   }
@@ -349,11 +380,87 @@ export class TableEngine {
   /** Opening-bet rules for the game the table is playing. */
   private validate(b: InitialBets, balance: number): string | null {
     const c = this.config;
-    if (c.game === 'bj') return validateBjBet({ ...NO_BETS, ...b }, balance, c);
+    const pw = this.progFor(c.game)?.wager ?? null;
+    if (c.game === 'bj') return validateBjBet({ ...NO_BETS, ...b }, balance, { ...c, progressiveWager: pw });
     return c.game === 'tcp'
-      ? validateTcpBet({ ...NO_BETS, ...b }, balance, { minAnte: c.minAnte, maxAnte: c.maxAnte, maxPairPlus: c.maxPairPlus, maxSixCard: c.maxSixCard })
-      : validateInitialBet(b, balance, this.limits());
+      ? validateTcpBet({ ...NO_BETS, ...b }, balance, { minAnte: c.minAnte, maxAnte: c.maxAnte, maxPairPlus: c.maxPairPlus, maxSixCard: c.maxSixCard, progressiveWager: pw })
+      : validateInitialBet(b, balance, { ...this.limits(), progressiveWager: pw ?? PROGRESSIVE.wager });
   }
+  /**
+   * §34.6 a saved bet re-checked against the table as it is now: side bets the host has closed and a progressive
+   * whose wager changed are removed (and named), never silently repriced. The main bet is untouched.
+   */
+  fitToTable(b: InitialBets): { bet: InitialBets; dropped: string[] } {
+    const dropped: string[] = [];
+    const bet = { ...b, ...(b.bjSides ? { bjSides: { ...b.bjSides } } : {}) };
+    for (const [id, amt] of Object.entries(bet.bjSides ?? {})) {
+      const set = this.config.bjSides.bets[id];
+      if (!amt) continue;
+      if (this.config.game !== 'bj' || !set?.on || amt < set.min || amt > set.max) { delete bet.bjSides![id]; dropped.push(BJ_SIDE[id]?.name ?? id); }
+    }
+    const pw = this.progFor(this.config.game)?.wager ?? 0;
+    if (bet.progressive && bet.progressive !== pw) { bet.progressive = 0; dropped.push('the progressive'); }
+    return { bet, dropped };
+  }
+
+  /** §37 the progressive offered for a game at the current settings (null when that game's progressive is off). */
+  progFor(game: GameId): ProgSetup | null {
+    const c = this.config;
+    if (game === 'uth') return c.progressive ? progSetup(c.uthProg.variant, c.uthProg.profile) : null;
+    if (game === 'tcp') return c.tcpProg.on ? progSetup(c.tcpProg.variant, c.tcpProg.profile) : null;
+    return c.bjProg.on ? progSetup(c.bjProg.variant, c.bjProg.profile) : null;
+  }
+  private meterSpec(p: ProgSetup): MeterSpec { return { id: p.meterId, seed: p.seed, game: p.variant.game, variant: p.variant.id, profile: p.profile }; }
+  /** §34.5 the exact pay tables and profiles a hand is dealt under (stored with the hand). */
+  private handRules(game: GameId, prog: ProgSetup | null): Record<string, unknown> {
+    const c = this.config;
+    return {
+      game, rulesVersion: game === 'tcp' ? TCP_RULES_VERSION : game === 'bj' ? BJ_RULES_VERSION : RULES_VERSION,
+      ...(game === 'uth' ? { trips: c.tripsVariant, blind: '500-50-10-3-3:2-1', ultimatePairs: c.pairsVariant, badBeat: c.badBeatVariant } : {}),
+      ...(game === 'tcp' ? { pairPlus: c.pairPlusVariant, anteBonus: '5-4-1', sixCard: '1000-200-100-20-15-10-7' } : {}),
+      ...(game === 'bj' ? { bjRules: this.bjRules, sidesPreset: c.bjSides.preset, sidesProfile: 'All Bets six-deck adaptation (not the eight-deck Nevada game)',
+        sides: Object.fromEntries(enabledBjSides(c.bjSides).map((d) => [d.id, c.bjSides.bets[d.id]])) } : {}),
+      progressive: prog ? { meterId: prog.meterId, variant: prog.variant.id, profile: prog.profile, custom: prog.custom, wager: prog.wager, seed: prog.seed,
+        contributionPct: prog.variant.contributionPct, jackpotSuit: prog.variant.suited ? c.jackpotSuit : null } : null,
+    };
+  }
+  /**
+   * Resolves one hand's progressive wagers against the meter value the store locked for this settlement.
+   * Returns the new meter, the jackpot hits and one §37.8 history row for every wager (wins and losses).
+   */
+  private resolveProg(hand: Hand, entries: ProgEntry[], meters: Map<string, number>) {
+    const p = hand.prog;
+    if (!p || !entries.length) return { res: null as ProgResolution | null, meters: new Map<string, number>(), hits: [] as ProgHitRow[], progTx: [] as ProgTx[] };
+    const before = meters.get(p.meterId) ?? p.seed;
+    const res = resolveMeter(p, entries, before);
+    const hits: ProgHitRow[] = res.hits.map((x) => ({ meterId: p.meterId, playerId: x.playerId, hand: x.combo, amount: x.amount, meterBefore: x.meterBefore, meterAfter: x.meterAfter }));
+    const progTx: ProgTx[] = [...res.awards.values()].map((a) => {
+      const hit = res.hits.find((x) => x.playerId === a.playerId);
+      return { playerId: a.playerId, game: hand.game, meterId: p.meterId, variant: p.variant.id, profile: p.profile, wager: p.wager, combo: a.combo,
+        category: a.fromMeter ? 'meter' : a.base > 0 ? 'fixed' : a.envy > 0 ? 'envy' : 'loss', pct: a.pct ?? null,
+        fixedAward: a.fromMeter ? 0 : a.base, meterAward: a.fromMeter ? a.base : 0, envy: a.envy,
+        meterBefore: hit ? hit.meterBefore : before, meterAfter: hit ? hit.meterAfter : res.meterAfter, amount: a.amount, net: a.amount - p.wager };
+    });
+    for (const a of res.awards.values()) { const h = hand.players.get(a.playerId); if (h) h.progAward = { amount: a.amount, combo: a.combo, label: a.label, envy: a.envy, base: a.base, fromMeter: a.fromMeter }; }
+    return { res, meters: new Map([[p.meterId, res.meterAfter]]), hits, progTx };
+  }
+  /** After settlement: tell every table about the new meter and announce any jackpot hit. */
+  private afterProg(hand: Hand, meters: Map<string, number>, hits: ProgHitRow[]) {
+    const p = hand.prog;
+    if (p && meters.has(p.meterId)) this.hooks.jackpot(p.meterId, meters.get(p.meterId)!);
+    for (const hit of hits) {
+      const who = hand.players.get(hit.playerId)!.name;
+      this.hooks.jackpotHit({ tableName: this.config.name, playerName: who, hand: hit.hand, amount: hit.amount, meterId: hit.meterId, game: hand.game });
+      const row = p?.variant.rows.find((r) => r.combo === hit.hand);
+      this.say(`${row?.pct === 100 ? 'JACKPOT! ' : ''}${who} hits ${hit.hand} on the ${p?.variant.short ?? 'progressive'} — ${formatMoney(hit.amount)}${row?.pct && row.pct < 100 ? ` (${row.pct}% of the meter)` : ''}.`);
+    }
+  }
+  /** The hand's pay-table fields, fixed when it is dealt. */
+  private handTables(game: GameId) {
+    const c = this.config;
+    return { prog: this.progFor(game), sides: game === 'bj' ? structuredClone(c.bjSides) : DEFAULT_BJ_SIDES, tripsVariant: c.tripsVariant, pairPlusVariant: c.pairPlusVariant, jackpotSuit: c.jackpotSuit };
+  }
+
   private minToPlay() { return this.config.game === 'bj' ? this.config.minAnte : this.config.game === 'tcp' ? tcpRequiredToStart(this.config.minAnte) : requiredToStart(this.config.minAnte); }
   private gameOf(): GameId { return this.hand?.game ?? this.config.game; }
   private needsToAct(h: HandPlayer) {
@@ -451,8 +558,9 @@ export class TableEngine {
     if (this.phase !== 'betting') throw new EngineError('Bets can only be placed between hands.');
     const err = this.validate(bets, s.balance);
     if (err) throw new EngineError(err);
+    const sides = Object.fromEntries(Object.entries(bets.bjSides ?? {}).filter(([, v]) => v > 0));
     s.pending = { ante: bets.ante, trips: bets.trips, pairs: bets.pairs, badBeat: bets.badBeat, progressive: bets.progressive,
-      pairPlus: bets.pairPlus ?? 0, sixCard: bets.sixCard ?? 0 };
+      pairPlus: bets.pairPlus ?? 0, sixCard: bets.sixCard ?? 0, ...(Object.keys(sides).length ? { bjSides: sides } : {}) };
     s.ready = false;
     s.autoRebet = null;   // changing the bet by hand turns same-bet off
     this.checkStart();
@@ -543,17 +651,21 @@ export class TableEngine {
     if (night.id !== this.nightId) this.say(this.freshNight || !this.nightId ? 'A new night begins. Good luck, everyone.' : 'Welcome back — a new night begins.');
     this.freshNight = false;
     this.nightId = night.id;
-    const { balances, jackpot } = await this.store.startHand({
+    const tables = this.handTables(game);
+    const prog = tables.prog;
+    const { balances, meters } = await this.store.startHand({
       nightId: night.id, rulesVersion: game === 'tcp' ? TCP_RULES_VERSION : RULES_VERSION, game,
       id, tableCode: this.code, handNumber: number,
       deckCommitment: sha256(deck.map(intToCard).join('') + ':' + id),
       dealerCards: dealer.map(intToCard), community: community.map(intToCard),
       pairsVariant: this.config.pairsVariant, badBeatVariant: this.config.badBeatVariant,
+      rulesProfile: this.handRules(game, prog), meters: prog ? [this.meterSpec(prog)] : [],
       players: players.map((s) => ({ playerId: s.playerId, seat: s.seat, name: s.name, hole: holes.get(s.playerId)!.map(intToCard),
         ante: s.pending.ante, blind: game === 'tcp' ? 0 : s.pending.ante, trips: s.pending.trips, pairs: s.pending.pairs, badBeat: s.pending.badBeat,
-        progressive: s.pending.progressive, pairPlus: s.pending.pairPlus, sixCard: s.pending.sixCard })),
+        progressive: s.pending.progressive, pairPlus: s.pending.pairPlus, sixCard: s.pending.sixCard,
+        progMeter: s.pending.progressive && prog ? prog.meterId : null, progContribution: s.pending.progressive && prog ? prog.contribution : 0 })),
     });
-    this.hooks.jackpot(jackpot);
+    for (const [id, amt] of meters) this.hooks.jackpot(id, amt);
     this.handCounter = number;
     const map = new Map<string, HandPlayer>();
     for (const s of players) {
@@ -564,7 +676,7 @@ export class TableEngine {
         progressive: s.pending.progressive, pairPlus: s.pending.pairPlus, sixCard: s.pending.sixCard,
         play: 0, folded: false, acted: false, decisions: [] });
     }
-    this.hand = { id, number, dealer, community, revealed: 0, players: map, settled: false, game };
+    this.hand = { id, number, dealer, community, revealed: 0, players: map, settled: false, game, ...tables };
     for (const s of this.seats) if (s) { s.ready = false; }
     const n = `${players.length} player${players.length > 1 ? 's' : ''} in`;
     if (game === 'tcp') {
@@ -707,20 +819,23 @@ export class TableEngine {
     const players = [...hand.players.values()];
     const dealerName = handName(dealerScore);
     const qualifies = dealerQualifies(dealerScore);
-    // Progressive: the hand is decided by hole cards + flop; the award is resolved against the live meter
-    // inside the settlement transaction, so two tables can never both take the same jackpot.
-    const entries: ProgressiveEntry[] = players.filter((h) => h.progressive > 0)
-      .map((h) => ({ playerId: h.playerId, seat: h.seat, hand: progressiveHand(h.hole, hand.community) }));
-    let resolution: ProgressiveResolution | null = null;
-    const build = (meter: number) => {
-      resolution = resolveProgressive(entries, meter);
+    // Progressive: each wager's qualifying hand is read by its own variant's rule (Five Card: hole cards + flop;
+    // V2: best five of all seven). Awards are resolved against the meter the store locks inside the settlement
+    // transaction, so two tables can never both take the same jackpot.
+    const prog = hand.prog;
+    const entries: ProgEntry[] = prog ? players.filter((h) => h.progressive > 0)
+      .map((h) => ({ playerId: h.playerId, seat: h.seat, combo: prog.variant.evaluate({ hole: h.hole, board: hand.community, suit: hand.jackpotSuit }) })) : [];
+    let progOut: ReturnType<TableEngine['resolveProg']> = { res: null, meters: new Map(), hits: [], progTx: [] };
+    const build = (meters: Map<string, number>) => {
+      progOut = this.resolveProg(hand, entries, meters);
       const rows = players.map((h) => {
         const playerScore = evaluate([...h.hole, ...hand.community]);
+        const aw = h.progAward;
         const st = settle({
           ante: h.ante, blind: h.blind, play: h.play, trips: h.trips, pairs: h.pairs, badBeat: h.badBeat, folded: h.folded,
           playerScore, dealerScore, playerHole: h.hole, dealerHole: hand.dealer,
-          pairsVariant: this.config.pairsVariant, badBeatVariant: this.config.badBeatVariant,
-          progressive: h.progressive, progressiveAward: resolution!.awards.get(h.playerId) ?? null,
+          pairsVariant: this.config.pairsVariant, badBeatVariant: this.config.badBeatVariant, tripsVariant: hand.tripsVariant as never,
+          progressive: h.progressive, progressiveAward: h.progressive && aw ? { playerId: h.playerId, hand: aw.combo ?? 'No qualifying hand', base: aw.base, envy: aw.envy, amount: aw.amount, label: aw.label, fromMeter: aw.fromMeter } : null,
         });
         h.settlement = st;
         h.best5 = bestFive([...h.hole, ...hand.community]);
@@ -731,19 +846,14 @@ export class TableEngine {
           pairsMultiplier: st.pairs.multiplier ?? null, badBeatMultiplier: st.badBeat.multiplier ?? null,
           pairsVariant: h.pairs ? this.config.pairsVariant : null, badBeatVariant: h.badBeat ? this.config.badBeatVariant : null,
           baseNet: st.baseNet, progressiveNet: st.progressive.net,
-          progressiveHand: h.progressive ? (resolution!.awards.get(h.playerId)?.envy && !resolution!.awards.get(h.playerId)?.base ? 'Envy bonus' : st.progressive.combo ?? null) : null,
+          progressiveHand: h.progressive ? (aw?.envy && !aw.base ? 'Envy bonus' : st.progressive.result === 'win' ? st.progressive.combo ?? null : null) : null,
         };
       });
-      return { rows, jackpotAfter: resolution.meterAfter, hits: resolution.hits.map((x) => ({ ...x, hand: x.hand as string })) };
+      return { rows, meters: progOut.meters, hits: progOut.hits, progTx: progOut.progTx };
     };
-    const res = await this.store.settleHand(hand.id, this.code, { hand: dealerName, qualifies }, build);
+    const res = await this.store.settleHand(hand.id, this.code, { hand: dealerName, qualifies }, build, prog ? [prog.meterId] : []);
     if (!res.applied) console.warn(`[engine] hand ${hand.id} was already settled — skipping payout`);
-    this.hooks.jackpot(res.jackpot);
-    const hitList = (resolution as ProgressiveResolution | null)?.hits ?? [];
-    for (const hit of hitList) {
-      const who = hand.players.get(hit.playerId)!.name;
-      this.hooks.jackpotHit({ tableName: this.config.name, playerName: who, hand: hit.hand, amount: hit.amount });
-    }
+    const hitList = res.applied ? progOut.hits : [];
     for (const [pid, bal] of res.balances) { const s = this.seatOf(pid); if (s) s.balance = bal; }
     hand.settled = true;
     if (res.applied) this.hooks.settled?.(hand.id, this.nightId, [...hand.players.keys()]);
@@ -751,8 +861,7 @@ export class TableEngine {
 
     const parts = [...hand.players.values()].map((h) => `${h.name} ${formatMoney(h.settlement!.net, { sign: true })}`);
     this.say(`Dealer has ${dealerName}${qualifies ? '' : ' — does not qualify (Ante pushes)'}. ${parts.join(' · ')}`);
-    for (const hit of hitList)
-      this.say(`${hit.hand === 'Royal Flush' ? 'JACKPOT! ' : ''}${hand.players.get(hit.playerId)!.name} hits a ${hit.hand} on the progressive — ${formatMoney(hit.amount)}.`);
+    if (res.applied) this.afterProg(hand, res.meters, hitList);
     for (const h of hand.players.values()) {
       const st = h.settlement!;
       if (st.progressive.result === 'win' && !hitList.some((x) => x.playerId === h.playerId))
@@ -785,23 +894,32 @@ export class TableEngine {
     hand.dealerScore = dealerScore;
     const dealerName = tcpHandName(dealerScore), qualifies = tcpQualifies(dealerScore);
     const players = [...hand.players.values()];
-    const build = (meter: number) => ({
-      jackpotAfter: meter, hits: [],
+    // §35.4 the Three Card Progressive reads only the player's three cards: it pays whatever the dealer has,
+    // whether the player won, lost or folded.
+    const prog = hand.prog;
+    const entries: ProgEntry[] = prog ? players.filter((h) => h.progressive > 0)
+      .map((h) => ({ playerId: h.playerId, seat: h.seat, combo: prog.variant.evaluate({ hole: h.hole, suit: hand.jackpotSuit }) })) : [];
+    let progOut: ReturnType<TableEngine['resolveProg']> = { res: null, meters: new Map(), hits: [], progTx: [] };
+    const build = (meters: Map<string, number>) => ({
+      ...(progOut = this.resolveProg(hand, entries, meters), { meters: progOut.meters, hits: progOut.hits, progTx: progOut.progTx }),
       rows: players.map((h) => {
-        const st = settleTcp({ ante: h.ante, play: h.play, pairPlus: h.pairPlus, sixCard: h.sixCard, folded: h.folded, player: h.hole, dealer: hand.dealer });
+        const aw = h.progAward;
+        const st = settleTcp({ ante: h.ante, play: h.play, pairPlus: h.pairPlus, sixCard: h.sixCard, folded: h.folded, player: h.hole, dealer: hand.dealer,
+          pairPlusVariant: hand.pairPlusVariant, progressive: h.progressive, progressiveAward: h.progressive && aw ? { amount: aw.amount, combo: aw.combo, label: aw.label } : null });
         h.tcp = st;
         return {
           playerId: h.playerId, credit: st.totalCredit, net: st.net, outcome: st.outcome, handName: st.playerHand,
           handRank: TCP_EQUIV_RANK[st.playerHand], tripsNet: 0, play: h.play, folded: h.folded, settlement: st,
           pairsNet: 0, badBeatNet: 0, pairsCombo: null, badBeatCombo: null, pairsMultiplier: null, badBeatMultiplier: null,
-          pairsVariant: null, badBeatVariant: null, baseNet: st.baseNet, progressiveNet: 0, progressiveHand: null,
+          pairsVariant: null, badBeatVariant: null, baseNet: st.baseNet, progressiveNet: st.progressive.net,
+          progressiveHand: h.progressive ? (aw?.envy && !aw.base ? 'Envy bonus' : st.progressive.result === 'win' ? st.progressive.combo ?? null : null) : null,
           pairPlusNet: h.pairPlus ? st.pairPlus.net : undefined, sixCardNet: h.sixCard ? st.sixCard.net : undefined,
           anteBonusNet: st.anteBonus.net, pairPlusHand: h.pairPlus && st.pairPlus.result === 'win' ? st.playerHand : null,
           sixCardHand: h.sixCard ? st.sixCardHand : null,
         };
       }),
     });
-    const res = await this.store.settleHand(hand.id, this.code, { hand: dealerName, qualifies }, build);
+    const res = await this.store.settleHand(hand.id, this.code, { hand: dealerName, qualifies }, build, prog ? [prog.meterId] : []);
     if (!res.applied) console.warn(`[engine] hand ${hand.id} was already settled — skipping payout`);
     for (const [pid, bal] of res.balances) { const s = this.seatOf(pid); if (s) s.balance = bal; }
     hand.settled = true;
@@ -809,19 +927,23 @@ export class TableEngine {
     this.phase = 'settled';
     const parts = players.map((h) => `${h.name} ${formatMoney(h.tcp!.net, { sign: true })}`);
     this.say(`Dealer has ${tcpDescribe(dealerScore)}${qualifies ? '' : ' — does not qualify (Ante pays, Play pushes)'}. ${parts.join(' · ')}`);
+    const tcpHits = res.applied ? progOut.hits : [];
+    if (res.applied) this.afterProg(hand, res.meters, tcpHits);
+    for (const h of players) if (h.tcp!.progressive.result === 'win' && !tcpHits.some((x) => x.playerId === h.playerId))
+      this.say(`${h.name}: Three Card Progressive — ${h.tcp!.progressive.note} (${formatMoney(h.tcp!.progressive.credit)}).`);
     for (const h of players) {
       const st = h.tcp!;
       if (st.anteBonus.result === 'win') this.say(`${h.name}: Ante Bonus — ${st.playerHand} pays ${st.anteBonus.multiplier}:1 (${formatMoney(st.anteBonus.net, { sign: true })}).`);
       if (st.pairPlus.result === 'win') this.say(`${h.name}: Pair Plus — ${st.playerHand} pays ${st.pairPlus.multiplier}:1 (${formatMoney(st.pairPlus.net, { sign: true })}).`);
       if (st.sixCard.result === 'win') this.say(`${h.name}: Six Card Bonus — ${st.sixCardHand} pays ${st.sixCard.multiplier!.toLocaleString('en-US')}:1 (${formatMoney(st.sixCard.net, { sign: true })}).`);
     }
-    if (res.applied) this.countRound(players.map((h) => ({ pid: h.playerId, name: h.name, net: h.tcp!.net, opening: h.ante })), 0);
-    if (res.applied) this.afterSettle(this.roundFacts(hand, tcpDescribe(dealerScore), []));
+    if (res.applied) this.countRound(players.map((h) => ({ pid: h.playerId, name: h.name, net: h.tcp!.net, opening: h.ante })), tcpHits.reduce((t, x) => t + x.amount, 0));
+    if (res.applied) this.afterSettle(this.roundFacts(hand, tcpDescribe(dealerScore), tcpHits));
     this.recent.unshift({
       handId: hand.id, handNumber: hand.number, at: this.now(), dealerHand: dealerName, dealerQualifies: qualifies,
       players: players.sort((a, b) => a.seat - b.seat).map((h) => ({ name: h.name, net: h.tcp!.net, outcome: h.tcp!.outcome, handName: h.tcp!.playerHand,
         sideHits: [h.tcp!.anteBonus.result === 'win' ? `Ante Bonus ${h.tcp!.anteBonus.multiplier}:1` : '', h.tcp!.pairPlus.result === 'win' ? `Pair Plus ${h.tcp!.pairPlus.multiplier}:1` : '',
-          h.tcp!.sixCard.result === 'win' ? `Six Card ${h.tcp!.sixCard.multiplier}:1` : ''].filter(Boolean) })),
+          h.tcp!.sixCard.result === 'win' ? `Six Card ${h.tcp!.sixCard.multiplier}:1` : '', h.tcp!.progressive.result === 'win' ? `Progressive ${h.tcp!.progressive.combo ?? ''}`.trim() : ''].filter(Boolean) })),
     });
     this.recent = this.recent.slice(0, 15);
     this.scheduleAnalysis(hand);
@@ -885,6 +1007,8 @@ export class TableEngine {
     let auto = false;
     for (const s of this.seats) {
       if (!s?.autoRebet || s.sitOut || !s.connected || this.phase !== 'betting') continue;
+      const fit = this.fitToTable(s.autoRebet);
+      if (fit.dropped.length) { s.autoRebet = fit.bet; this.say(`${s.name}: same-bet continues without ${fit.dropped.join(', ')} (no longer offered at this table).`, 'system'); }
       const err = this.validate(s.autoRebet, s.balance);
       if (err) { s.autoRebet = null; this.say(`${s.name}: same-bet is off — ${err}`, 'system'); continue; }
       s.pending = { ...s.autoRebet }; s.ready = true; auto = true;
@@ -1102,6 +1226,14 @@ export class TableEngine {
     const surrenderChanged = p.bjSurrender !== undefined && !!p.bjSurrender !== !!c.bjSurrender;
     if (p.bjSurrender !== undefined) c.bjSurrender = !!p.bjSurrender;
     if (p.badBeatVariant !== undefined) { if (!isBadBeatVariant(p.badBeatVariant)) throw new EngineError('Unknown Bad Beat pay table.'); c.badBeatVariant = p.badBeatVariant; }
+    if (p.tripsVariant !== undefined) { if (!isTripsVariant(p.tripsVariant)) throw new EngineError('Unknown Trips pay table.'); c.tripsVariant = p.tripsVariant; }
+    if (p.pairPlusVariant !== undefined) { if (!isPairPlusVariant(p.pairPlusVariant)) throw new EngineError('Unknown Pair Plus pay table.'); c.pairPlusVariant = p.pairPlusVariant; }
+    const progOk = <T>(r: T | string): T => { if (typeof r === 'string') throw new EngineError(r); return r; };
+    if (p.uthProg !== undefined) c.uthProg = progOk(parseProg('uth', p.uthProg, c.uthProg));
+    if (p.tcpProg !== undefined) c.tcpProg = progOk(parseProg('tcp', p.tcpProg, c.tcpProg));
+    if (p.bjProg !== undefined) c.bjProg = progOk(parseProg('bj', p.bjProg, c.bjProg));
+    if (p.jackpotSuit !== undefined) c.jackpotSuit = int(p.jackpotSuit, 0, 3, 'jackpot suit');
+    if (p.bjSides !== undefined) c.bjSides = progOk(parseBjSidesConfig(p.bjSides, c.bjSides));
     if (p.startingBankroll !== undefined) c.startingBankroll = int(p.startingBankroll, 1000, 100_000_000_000, 'starting bankroll');
     if (p.decisionSeconds !== undefined) c.decisionSeconds = c.solo ? int(p.decisionSeconds, 0, 300, 'timer') : int(p.decisionSeconds, 5, 120, 'decision timer');
     if (p.bettingSeconds !== undefined) c.bettingSeconds = int(p.bettingSeconds, 5, 120, 'betting timer');
@@ -1114,7 +1246,30 @@ export class TableEngine {
     const pairsChanged = c.pairsVariant !== this.config.pairsVariant;
     const badBeatChanged = c.badBeatVariant !== this.config.badBeatVariant;
     const progressiveChanged = c.progressive !== this.config.progressive;
+    const prev = this.config;
     this.config = c;
+    // §34.5 / §36.3: pay-table changes are announced to the whole table and apply from the next hand only.
+    const SUIT = ['Spades', 'Hearts', 'Diamonds', 'Clubs'];
+    if (c.tripsVariant !== prev.tripsVariant) this.say(`Pay table change: Trips is now ${TRIPS_VARIANTS[c.tripsVariant].name}, starting next hand.`);
+    if (c.pairPlusVariant !== prev.pairPlusVariant) this.say(`Pay table change: Pair Plus is now ${PAIR_PLUS_VARIANTS[c.pairPlusVariant].name}, starting next hand.`);
+    for (const g of ['uth', 'tcp', 'bj'] as GameId[]) {
+      const a = g === 'uth' ? prev.uthProg : g === 'tcp' ? prev.tcpProg : prev.bjProg, b = g === 'uth' ? c.uthProg : g === 'tcp' ? c.tcpProg : c.bjProg;
+      const onA = g === 'uth' ? prev.progressive : (a as unknown as { on: boolean }).on, onB = g === 'uth' ? c.progressive : (b as unknown as { on: boolean }).on;
+      if (a.variant !== b.variant || a.profile !== b.profile || (g !== 'uth' && onA !== onB)) {
+        const ps = progSetup(b.variant, b.profile);
+        this.say(onB ? `${GAME_NAME[g]} progressive: ${ps.variant.name}, ${ps.custom ? 'custom High Roller profile' : 'published profile'} — $${ps.wager / 100} bet, starting next hand.` : `The ${GAME_NAME[g]} progressive is closed, starting next hand.`);
+      }
+    }
+    if (c.jackpotSuit !== prev.jackpotSuit) this.say(`The jackpot suit is now ${SUIT[c.jackpotSuit]}, starting next hand.`);
+    if (JSON.stringify(c.bjSides) !== JSON.stringify(prev.bjSides)) {
+      const on = enabledBjSides(c.bjSides).map((d) => d.short);
+      this.say(`Blackjack side bets (${c.bjSides.preset === 'allbets' ? 'All Bets Blackjack' : c.bjSides.preset === 'classic' ? 'Classic Blackjack' : 'Custom Casino'}): ${on.length ? on.join(', ') : 'none'} — starting next hand.`);
+    }
+    // Pending bets: closed side bets and a changed progressive come off; the rest of the bet stays.
+    for (const s of this.seats) if (s) {
+      const fit = this.fitToTable(s.pending);
+      if (fit.dropped.length) { s.pending = fit.bet; s.ready = false; this.say(`${s.name}: ${fit.dropped.join(', ')} taken back (no longer offered as placed).`, 'system'); }
+    }
     // Switching the progressive off takes back any $5 already placed, without touching the rest of the bet.
     if (!c.progressive) for (const s of this.seats) if (s?.pending.progressive) s.pending = { ...s.pending, progressive: 0 };
     await this.store.updateTable(this.code, { config: c });
@@ -1183,26 +1338,35 @@ export class TableEngine {
     if (night.id !== this.nightId) this.say(this.freshNight || !this.nightId ? 'A new night begins. Good luck, everyone.' : 'Welcome back — a new night begins.');
     this.freshNight = false;
     this.nightId = night.id;
-    const { balances } = await this.store.startHand({
+    const tables = this.handTables('bj');
+    const prog = tables.prog;
+    const { balances, meters } = await this.store.startHand({
       nightId: night.id, rulesVersion: BJ_RULES_VERSION, game: 'bj', id, tableCode: this.code, handNumber: number,
       deckCommitment: `${this.shoe!.commitment}@${this.shoe!.pos - this.roundCards.length}`,
       dealerCards: dealer.map(intToCard), community: [],
       pairsVariant: this.config.pairsVariant, badBeatVariant: this.config.badBeatVariant,
+      rulesProfile: this.handRules('bj', prog), meters: prog ? [this.meterSpec(prog)] : [],
       players: players.map((s) => ({ playerId: s.playerId, seat: s.seat, name: s.name, hole: holes.get(s.playerId)!.map(intToCard),
-        ante: s.pending.ante, blind: 0, trips: 0, pairs: 0, badBeat: 0, progressive: 0, pairPlus: 0, sixCard: 0 })),
+        ante: s.pending.ante, blind: 0, trips: 0, pairs: 0, badBeat: 0, progressive: s.pending.progressive, pairPlus: 0, sixCard: 0,
+        sides: s.pending.bjSides ?? {},
+        progMeter: s.pending.progressive && prog ? prog.meterId : null, progContribution: s.pending.progressive && prog ? prog.contribution : 0 })),
     });
+    for (const [mid, amt] of meters) this.hooks.jackpot(mid, amt);
     this.handCounter = number;
     const map = new Map<string, HandPlayer>();
     for (const s of players) {
       s.balance = balances.get(s.playerId)!;
-      s.lastBet = { ...s.pending };
+      s.lastBet = { ...s.pending, ...(s.pending.bjSides ? { bjSides: { ...s.pending.bjSides } } : {}) };
       const hole = holes.get(s.playerId)!;
       map.set(s.playerId, { playerId: s.playerId, seat: s.seat, name: s.name, hole,
-        ante: s.pending.ante, blind: 0, trips: 0, pairs: 0, badBeat: 0, progressive: 0, pairPlus: 0, sixCard: 0,
+        ante: s.pending.ante, blind: 0, trips: 0, pairs: 0, badBeat: 0, progressive: s.pending.progressive, pairPlus: 0, sixCard: 0,
         play: 0, folded: false, acted: false, decisions: [],
-        bj: { hands: [newHand(hole.map(intToCard), s.pending.ante)], active: 0, insurance: null, offered: false, extra: 0, n: 0 } });
+        bj: { hands: [newHand(hole.map(intToCard), s.pending.ante)], active: 0, insurance: null, offered: false, extra: 0, n: 0,
+          sides: { ...(s.pending.bjSides ?? {}) }, sideResults: new Map(), first2: hole.map(intToCard) } });
     }
-    this.hand = { id, number, dealer, community: [], revealed: 0, players: map, settled: false, game: 'bj', bj: { turn: null, holeShown: false, order: [] } };
+    this.hand = { id, number, dealer, community: [], revealed: 0, players: map, settled: false, game: 'bj', bj: { turn: null, holeShown: false, order: [] }, ...tables };
+    // §34.7 initial-card side bets are decided by visible cards only: settle (record) them now, once.
+    this.bjResolveSides(false);
     for (const s of this.seats) if (s) s.ready = false;
     const up = intToCard(dealer[0]);
     this.say(`Hand #${number} — Blackjack. ${players.length} player${players.length > 1 ? 's' : ''} in. Dealer shows ${up[0] === 'T' ? '10' : up[0]}.`);
@@ -1396,6 +1560,7 @@ export class TableEngine {
   private async bjDealer() {
     const hand = this.hand!;
     hand.bj!.holeShown = true;
+    this.bjResolveSides(false);           // dealer-hole wagers (Dealer Pairs, Lucky Ladies) settle with the hole card
     this.phase = 'showdown';
     const all = [...hand.players.values()].flatMap((h) => h.bj!.hands);
     const before = hand.dealer.length;
@@ -1411,6 +1576,8 @@ export class TableEngine {
   private async bjSettle() {
     const hand = this.hand!;
     if (hand.settled) return;
+    hand.bj!.dealerDone = true;
+    this.bjResolveSides(true);            // anything still open (Buster) settles on the dealer's finished hand
     const dealer = hand.dealer.map(intToCard);
     const r = this.bjRules;
     const players = [...hand.players.values()];
@@ -1421,21 +1588,40 @@ export class TableEngine {
       b.insuranceNet = ins.net;
       b.net = b.results.reduce((t, x) => t + x.net, 0) + ins.net;
     }
+    // 21+3 Progressive: first two cards + up-card, independent of the hand; resolved against the locked meter.
+    const prog = hand.prog;
+    const entries: ProgEntry[] = prog ? players.filter((h) => h.progressive > 0)
+      .map((h) => ({ playerId: h.playerId, seat: h.seat, combo: prog.variant.evaluate({ hole: h.bj!.first2.map(cardToIntLocal), upcard: hand.dealer[0], suit: hand.jackpotSuit }) })) : [];
     const dealerName = describeTotal(dealer);
-    const rows = players.map((h) => {
-      const b = h.bj!;
-      const credit = b.results!.reduce((t, x) => t + x.credit, 0) + settleInsurance(b.insurance ?? 0, dealer).credit;
-      const net = b.net!;
-      const outcome = net > 0 ? 'win' : net < 0 ? 'lose' : 'push';
-      const handName = b.hands.length > 1 ? `${b.hands.length} hands` : b.results![0].total;
-      const settlement = { game: 'bj', hands: b.hands.map((x, i) => ({ ...x, ...b.results![i] })), insurance: b.insurance ?? 0, insuranceNet: b.insuranceNet, dealer, net };
-      return {
-        playerId: h.playerId, credit, net, outcome, handName, handRank: 0, tripsNet: 0, play: b.extra, folded: false, settlement,
-        pairsNet: 0, badBeatNet: 0, pairsCombo: null, badBeatCombo: null, pairsMultiplier: null, badBeatMultiplier: null,
-        pairsVariant: null, badBeatVariant: null, baseNet: net - (b.insuranceNet ?? 0), progressiveNet: 0, progressiveHand: null,
-      } as PlayerSettlementRow;
-    });
-    const res = await this.store.settleHand(hand.id, this.code, { hand: dealerName, qualifies: true }, (meter) => ({ jackpotAfter: meter, hits: [], rows }));
+    let progOut: ReturnType<TableEngine['resolveProg']> = { res: null, meters: new Map(), hits: [], progTx: [] };
+    const build = (meters: Map<string, number>) => {
+      progOut = this.resolveProg(hand, entries, meters);
+      const rows = players.map((h) => {
+        const b = h.bj!;
+        const sides = [...b.sideResults.values()];
+        const sidesCredit = sides.reduce((t, x) => t + x.credit, 0), sidesStake = sides.reduce((t, x) => t + x.stake, 0);
+        const aw = h.progressive ? h.progAward : null;
+        const progCredit = h.progressive ? aw?.amount ?? 0 : 0;
+        b.sidesNet = sidesCredit - sidesStake + (h.progressive ? progCredit - h.progressive : 0);
+        b.net = b.net! + b.sidesNet;
+        const credit = b.results!.reduce((t, x) => t + x.credit, 0) + settleInsurance(b.insurance ?? 0, dealer).credit + sidesCredit + progCredit;
+        const net = b.net;
+        const outcome = net > 0 ? 'win' : net < 0 ? 'lose' : 'push';
+        const handName = b.hands.length > 1 ? `${b.hands.length} hands` : b.results![0].total;
+        const progressive = h.progressive ? { stake: h.progressive, combo: aw?.combo ?? null, amount: progCredit, net: progCredit - h.progressive, label: aw?.label ?? '', convention: 'for-1', fromMeter: !!aw?.fromMeter, envy: aw?.envy ?? 0 } : null;
+        const settlement = { game: 'bj', hands: b.hands.map((x, i) => ({ ...x, ...b.results![i] })), insurance: b.insurance ?? 0, insuranceNet: b.insuranceNet, dealer, net,
+          sides, progressive, mainNet: net - (b.insuranceNet ?? 0) - b.sidesNet };
+        return {
+          playerId: h.playerId, credit, net, outcome, handName, handRank: 0, tripsNet: 0, play: b.extra, folded: false, settlement,
+          pairsNet: 0, badBeatNet: 0, pairsCombo: null, badBeatCombo: null, pairsMultiplier: null, badBeatMultiplier: null,
+          pairsVariant: null, badBeatVariant: null, baseNet: net - (b.insuranceNet ?? 0) - b.sidesNet,
+          progressiveNet: progressive ? progressive.net : 0, progressiveHand: progressive && progCredit > 0 ? (aw?.base ? aw.combo : 'Envy bonus') : null,
+          sideResults: sides,
+        } as PlayerSettlementRow;
+      });
+      return { rows, meters: progOut.meters, hits: progOut.hits, progTx: progOut.progTx };
+    };
+    const res = await this.store.settleHand(hand.id, this.code, { hand: dealerName, qualifies: true }, build, prog ? [prog.meterId] : []);
     if (!res.applied) console.warn(`[engine] hand ${hand.id} was already settled — skipping payout`);
     for (const [pid, bal] of res.balances) { const s = this.seatOf(pid); if (s) s.balance = bal; }
     hand.settled = true;
@@ -1443,21 +1629,51 @@ export class TableEngine {
     this.phase = 'settled';
     this.deadline = null;
     this.say(`Dealer: ${dealerName}. ${players.map((h) => `${h.name} ${formatMoney(h.bj!.net!, { sign: true })}`).join(' · ')}`);
+    const bjHits = res.applied ? progOut.hits : [];
+    if (res.applied) this.afterProg(hand, res.meters, bjHits);
     for (const h of players) {
       const bjs = h.bj!.results!.filter((x) => x.outcome === 'blackjack');
       if (bjs.length) this.say(`${h.name}: Blackjack pays 3:2 (${formatMoney(bjs[0].net, { sign: true })}).`);
       if (h.bj!.insurance) this.say(`${h.name}: Insurance ${h.bj!.insuranceNet! > 0 ? `pays 2:1 (${formatMoney(h.bj!.insuranceNet!, { sign: true })})` : 'loses'}.`);
+      const wins = [...h.bj!.sideResults.values()].filter((x) => x.result === 'win');
+      if (wins.length) this.say(`${h.name}: ${wins.map((x) => `${x.name} — ${x.label} ${x.pays.toLocaleString('en-US')}:1 (${formatMoney(x.net, { sign: true })})`).join(' · ')}.`);
+      const aw = h.progAward;
+      if (h.progressive && aw && aw.amount > 0 && !bjHits.some((x) => x.playerId === h.playerId)) this.say(`${h.name}: 21+3 Progressive — ${aw.label} (${formatMoney(aw.amount)}).`);
     }
-    if (res.applied) this.countRound(players.map((h) => ({ pid: h.playerId, name: h.name, net: h.bj!.net!, opening: h.ante })), 0);
-    if (res.applied) this.afterSettle(this.roundFacts(hand, describeTotal(hand.dealer.map(intToCard)), []));
+    if (res.applied) this.countRound(players.map((h) => ({ pid: h.playerId, name: h.name, net: h.bj!.net!, opening: h.ante })), bjHits.reduce((t, x) => t + x.amount, 0));
+    if (res.applied) this.afterSettle(this.roundFacts(hand, describeTotal(hand.dealer.map(intToCard)), bjHits));
     this.recent.unshift({
       handId: hand.id, handNumber: hand.number, at: this.now(), dealerHand: dealerName, dealerQualifies: true,
       players: players.sort((a, b) => a.seat - b.seat).map((h) => ({ name: h.name, net: h.bj!.net!, outcome: h.bj!.net! > 0 ? 'win' : h.bj!.net! < 0 ? 'lose' : 'push',
-        handName: h.bj!.hands.length > 1 ? `${h.bj!.hands.length} hands` : h.bj!.results![0].total, sideHits: [] })),
+        handName: h.bj!.hands.length > 1 ? `${h.bj!.hands.length} hands` : h.bj!.results![0].total,
+        sideHits: [...[...h.bj!.sideResults.values()].filter((x) => x.result === 'win').map((x) => `${BJ_SIDE[x.id]?.short ?? x.name} ${x.pays}:1`),
+          ...(h.progressive && (h.progAward?.amount ?? 0) > 0 ? [`21+3 Prog ${h.progAward!.combo ?? 'Envy'}`] : [])] })),
     } as never);
     this.recent = this.recent.slice(0, 15);
     for (const h of players) this.hooks.analysis(h.playerId, { handId: hand.id, decisions: h.decisions });
     this.setTimer(this.timing.resultsMs, () => this.nextRound());
+  }
+
+  /**
+   * §34.7 records each side bet's result exactly once, as soon as the cards it needs are legitimately known:
+   * initial-card wagers right after the deal, dealer-hole wagers once the hole card is shown, and Buster once
+   * the dealer's hand is complete. Nothing here draws a card or changes the order of the shoe.
+   */
+  private bjResolveSides(final: boolean) {
+    const hand = this.hand!;
+    const known = hand.bj!.holeShown ? hand.dealer.map(intToCard) : [intToCard(hand.dealer[0])];
+    const dealerDone = final;
+    for (const h of hand.players.values()) {
+      const b = h.bj!;
+      for (const [id, stake] of Object.entries(b.sides)) {
+        if (!stake || b.sideResults.has(id)) continue;
+        const d = BJ_SIDE[id];
+        if (!resolvableNow(d.phase, hand.bj!.holeShown, dealerDone) && !final) continue;
+        const ctx: BjSideContext = { player: b.first2, dealer: final ? hand.dealer.map(intToCard) : known, dealerFinal: dealerDone,
+          playerNatural: isNatural(b.first2, false) };
+        b.sideResults.set(id, settleBjSide(id, hand.sides.bets[id]?.variant ?? d.variants[0].id, stake, ctx));
+      }
+    }
   }
 
   private bjView(viewerId: string): BjTableView | null {
@@ -1494,7 +1710,33 @@ export class TableEngine {
       hands: b.hands.map((x, i) => ({ cards: x.cards, bet: x.bet, doubled: x.doubled, fromSplit: x.fromSplit, total: describeTotal(x.cards, x.fromSplit), done: x.done,
         surrendered: x.surrendered, outcome: b.results?.[i].outcome, net: b.results?.[i].net })),
       active: live ? b.active : null, insurance: b.insurance, insuranceNet: b.results ? b.insuranceNet : undefined, offered: b.offered,
+      // Results appear only once recorded — a dealer-hole wager is never shown before the hole card is.
+      sides: Object.entries(b.sides).filter(([, v]) => v > 0).map(([id, stake]) => {
+        const r = b.sideResults.get(id);
+        return { id, name: BJ_SIDE[id]?.name ?? id, stake, phase: BJ_SIDE[id]?.phase ?? 'initial',
+          ...(r ? { result: r.result, label: r.label, pays: r.pays, net: r.net } : {}) };
+      }),
+      prog: h.progressive ? { stake: h.progressive, combo: this.hand?.prog?.variant.evaluate({ hole: b.first2.map(cardToIntLocal), upcard: this.hand.dealer[0], suit: this.hand.jackpotSuit }) ?? null,
+        ...(h.progAward ? { amount: h.progAward.amount, label: h.progAward.label } : {}) } : null,
     };
+  }
+
+  /** Does this table display the meter (the current game's progressive, or any game's in the jackpot strip)? */
+  showsMeter(meterId: string) { return (['uth', 'tcp', 'bj'] as GameId[]).some((g) => this.progMeterId(g) === meterId); }
+  private progMeterId(g: GameId) {
+    const c = this.config;
+    const x = g === 'uth' ? c.uthProg : g === 'tcp' ? c.tcpProg : c.bjProg;
+    return progSetup(x.variant, x.profile).meterId;
+  }
+  /** §37.7 the three games' meters at this table's settings — shown together, never one jackpot. */
+  private jackpotsView(): NonNullable<TableView['jackpots']> {
+    const c = this.config;
+    return (['uth', 'tcp', 'bj'] as GameId[]).map((g) => {
+      const x = g === 'uth' ? c.uthProg : g === 'tcp' ? c.tcpProg : c.bjProg;
+      const p = progSetup(x.variant, x.profile);
+      return { game: g, meterId: p.meterId, name: p.variant.name, amount: this.hooks.jackpotAmount(p.meterId) || p.seed, wager: p.wager,
+        on: g === 'uth' ? c.progressive : g === 'tcp' ? c.tcpProg.on : c.bjProg.on, custom: p.custom };
+    });
   }
 
   viewFor(viewerId: string): TableView {
@@ -1543,7 +1785,11 @@ export class TableEngine {
         autoRebet: me?.autoRebet ?? null,
       },
       recent: this.recent,
-      jackpot: { amount: this.hooks.jackpotAmount(), wager: PROGRESSIVE.wager },
+      jackpot: (() => {
+        const p = this.hand && !this.hand.settled ? this.hand.prog : this.progFor(this.config.game);
+        return p ? { amount: this.hooks.jackpotAmount(p.meterId) || p.seed, wager: p.wager, meterId: p.meterId, variant: p.variant.id, name: p.variant.name, custom: p.custom } : null;
+      })(),
+      jackpots: this.jackpotsView(),
       nightId: this.nightId, rulesVersion: this.config.game === 'tcp' ? TCP_RULES_VERSION : RULES_VERSION,
       pendingGame: this.pendingGame,
       house: this.houseView(),
@@ -1566,11 +1812,15 @@ export class TableEngine {
     const result: SeatResult | undefined = h?.bj?.results ? {
       outcome: (h.bj.net! > 0 ? 'win' : h.bj.net! < 0 ? 'lose' : 'push') as SeatResult['outcome'], net: h.bj.net!, handName: h.bj.hands.length > 1 ? `${h.bj.hands.length} hands` : h.bj.results[0].total,
       lines: [...h.bj.results.map((x) => ({ wager: 'ante' as const, result: x.outcome, net: x.net, stake: x.bet, credit: x.credit })),
-        ...(h.bj.insurance ? [{ wager: 'play' as const, result: h.bj.insuranceNet! > 0 ? 'win' : 'lose', net: h.bj.insuranceNet!, stake: h.bj.insurance, credit: h.bj.insuranceNet! > 0 ? h.bj.insurance * 3 : 0, note: 'Insurance' }] : [])],
-      baseNet: h.bj.net! - (h.bj.insuranceNet ?? 0), sideNet: h.bj.insuranceNet ?? 0,
+        ...(h.bj.insurance ? [{ wager: 'play' as const, result: h.bj.insuranceNet! > 0 ? 'win' : 'lose', net: h.bj.insuranceNet!, stake: h.bj.insurance, credit: h.bj.insuranceNet! > 0 ? h.bj.insurance * 3 : 0, note: 'Insurance' }] : []),
+        ...[...h.bj.sideResults.values()].map((x) => ({ wager: 'bjSide' as const, sideId: x.id, name: x.name, result: x.result, net: x.net, stake: x.stake, credit: x.credit,
+          multiplier: x.pays || undefined, combo: x.label ?? undefined, variant: x.variant, note: x.result === 'win' ? `${x.label} pays ${x.pays}:1` : 'No qualifying combination' })),
+        ...(h.progressive ? [{ wager: 'progressive' as const, result: (h.progAward?.amount ?? 0) > 0 ? 'win' : 'lose', net: (h.progAward?.amount ?? 0) - h.progressive, stake: h.progressive,
+          credit: h.progAward?.amount ?? 0, combo: h.progAward?.combo ?? undefined, note: h.progAward?.label || 'No qualifying hand' }] : [])],
+      baseNet: h.bj.net! - (h.bj.insuranceNet ?? 0) - (h.bj.sidesNet ?? 0), sideNet: (h.bj.insuranceNet ?? 0) + (h.bj.sidesNet ?? 0),
     } : h?.tcp ? {
       outcome: h.tcp.outcome, net: h.tcp.net, handName: h.tcp.playerHand, best5: h.hole.map(intToCard),
-      lines: (['ante', 'play', 'anteBonus', 'pairPlus', 'sixCard'] as const).filter((k) => h.tcp![k].stake > 0 || h.tcp![k].result === 'win')
+      lines: (['ante', 'play', 'anteBonus', 'pairPlus', 'sixCard', 'progressive'] as const).filter((k) => h.tcp![k].stake > 0 || h.tcp![k].result === 'win')
         .map((k) => { const w = h.tcp![k]; return { wager: k, result: w.result, net: w.net, stake: w.stake, credit: w.credit, note: w.note, multiplier: w.multiplier, combo: w.combo }; }),
       baseNet: h.tcp.baseNet, sideNet: h.tcp.sideNet,
     } : h?.settlement ? {
@@ -1587,8 +1837,9 @@ export class TableEngine {
       seat: s.seat, playerId: s.playerId, name: s.name, avatar: s.avatar, look: this.looks.get(s.playerId), balance: s.balance, connected: s.connected,
       isHost: s.playerId === this.hostId, status,
       bet: h ? { ante: h.ante, blind: h.blind, trips: h.trips, play: h.play, pairs: h.pairs, badBeat: h.badBeat, progressive: h.progressive, pairPlus: h.pairPlus, sixCard: h.sixCard }
-             : { ante: s.pending.ante, blind: this.config.game === 'tcp' ? 0 : s.pending.ante, trips: s.pending.trips, play: 0, pairs: s.pending.pairs,
+             : { ante: s.pending.ante, blind: this.config.game === 'tcp' || this.config.game === 'bj' ? 0 : s.pending.ante, trips: s.pending.trips, play: 0, pairs: s.pending.pairs,
                  badBeat: s.pending.badBeat, progressive: s.pending.progressive, pairPlus: s.pending.pairPlus, sixCard: s.pending.sixCard },
+      bonus: h?.bj ? sumSides(h.bj.sides) : sumSides(s.pending.bjSides),
       acted: !!h && !this.needsToAct(h), needsToAct: !!h && this.needsToAct(h), lastAction: h?.lastAction,
       cards: h ? (h.bj ? h.bj.hands[0].cards : canSee ? h.hole.map(intToCard) : h.hole.map(() => null)) : [],
       bj: h?.bj ? this.seatBj(h) : undefined,

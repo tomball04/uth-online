@@ -5,12 +5,14 @@ import type { DealerSettings } from './dealers.js';
 // only what that viewer is authorized to see. Hidden cards are represented as null.
 
 import type { CardStr } from './cards.js';
-import type { Decision, DecisionPhase, GameId, InitialBets, Settlement } from './rules.js';
+import type { Decision, DecisionPhase, GameId, InitialBets, Settlement, TripsVariantId } from './rules.js';
+import type { ProgProfile } from './progressive.js';
+import type { BjSidesConfig } from './bjsides.js';
 import type { BadBeatVariant, PairsVariant } from './sidebets.js';
 import type { CardBack, EffectsLevel, FeltColor } from './themes.js';
 import type { PublicLook } from './cosmetics.js';
 
-export type WagerKey = 'ante' | 'blind' | 'play' | 'trips' | 'pairs' | 'badBeat' | 'progressive' | 'anteBonus' | 'pairPlus' | 'sixCard';
+export type WagerKey = 'ante' | 'blind' | 'play' | 'trips' | 'pairs' | 'badBeat' | 'progressive' | 'anteBonus' | 'pairPlus' | 'sixCard' | 'bjSide';
 import type { Advice, Outs } from './strategy.js';
 
 export type Phase = 'waiting' | 'betting' | 'preflop' | 'flop' | 'river' | 'decide' | 'insurance' | 'turns' | 'showdown' | 'settled';
@@ -27,7 +29,19 @@ export interface TableConfig {
   maxBadBeat: number;          // cents, Bad Beat limit
   pairsVariant: PairsVariant['id'];     // complete pay table, never mixed
   badBeatVariant: BadBeatVariant['id'];
-  progressive: boolean;        // $5 Five Card Progressive offered at this table
+  progressive: boolean;        // UTH progressive offered at this table
+  /** §36.3 Trips configuration UTH-01 … UTH-05 (default UTH-02). */
+  tripsVariant: TripsVariantId;
+  /** Three Card Poker Pair Plus table. */
+  pairPlusVariant: string;
+  /** §37 per-game progressive: variant and profile (published 'casino' or custom 'high-roller'). UTH on/off is `progressive`. */
+  uthProg: { variant: string; profile: ProgProfile };
+  tcpProg: { on: boolean; variant: string; profile: ProgProfile };
+  bjProg: { on: boolean; variant: string; profile: ProgProfile };
+  /** Designated jackpot suit for suit-specific progressive awards (0 spades, 1 hearts, 2 diamonds, 3 clubs). */
+  jackpotSuit: number;
+  /** §34.5 Blackjack side bets (Classic / All Bets / Custom). */
+  bjSides: BjSidesConfig;
   /** Which casino game the table plays. The server switches it between hands only. */
   game: GameId;
   maxPairPlus: number;         // cents, Three Card Poker
@@ -58,6 +72,8 @@ export interface SeatView {
   isHost: boolean;
   status: 'sitting-out' | 'betting' | 'ready' | 'in-hand' | 'waiting-next' | 'folded';
   bet: { ante: number; blind: number; trips: number; play: number; pairs: number; badBeat: number; progressive: number; pairPlus: number; sixCard: number };
+  /** §34 total Blackjack bonus bets placed (cents). */
+  bonus?: number;
   acted: boolean;              // has submitted decision for current phase (or doesn't need to)
   needsToAct: boolean;
   lastAction?: Decision;
@@ -82,7 +98,7 @@ export interface SeatResult {
   net: number;
   handName: string;
   best5?: CardStr[];
-  lines: { wager: WagerKey; result: string; net: number; stake: number; credit: number; note?: string; multiplier?: number; combo?: string; variant?: string }[];
+  lines: { wager: WagerKey; result: string; net: number; stake: number; credit: number; note?: string; multiplier?: number; combo?: string; variant?: string; sideId?: string; name?: string }[];
   baseNet: number;
   sideNet: number;
 }
@@ -115,8 +131,10 @@ export interface TableView {
     autoRebet: InitialBets | null;
   };
   recent: HandSummary[];
-  /** Linked jackpot meter shared by every table on this server (cents). */
-  jackpot: { amount: number; wager: number };
+  /** The progressive meter for the game being played (null when that game's progressive is off). */
+  jackpot: { amount: number; wager: number; meterId?: string; variant?: string; name?: string; custom?: boolean } | null;
+  /** §37.7 every game's meter at this table's settings, shown together but never one jackpot. */
+  jackpots?: { game: GameId; meterId: string; name: string; amount: number; wager: number; on: boolean; custom: boolean }[];
   /** Open table night (running tab), null before the first hand of a night. */
   nightId: string | null;
   rulesVersion: string;
@@ -133,7 +151,13 @@ export interface BjHandView {
   cards: CardStr[]; bet: number; doubled: boolean; fromSplit: boolean; total: string; done: boolean; surrendered: boolean;
   outcome?: BjOutcome; net?: number;
 }
-export interface SeatBj { hands: BjHandView[]; active: number | null; insurance: number | null; insuranceNet?: number; offered: boolean }
+export interface SeatBj {
+  hands: BjHandView[]; active: number | null; insurance: number | null; insuranceNet?: number; offered: boolean;
+  /** §34 side bets: stake per wager, and each result once it can be shown without revealing the hole card. */
+  sides?: { id: string; name: string; stake: number; phase: string; result?: 'win' | 'lose'; label?: string | null; pays?: number; net?: number }[];
+  /** 21+3 Progressive: the qualifying hand once known. */
+  prog?: { stake: number; combo: string | null; amount?: number; label?: string } | null;
+}
 export interface BjTableView {
   rules: BjRules;
   rulesText: string[];

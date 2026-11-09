@@ -9,6 +9,11 @@
 //    "Ultimate Texas Hold'em Bad Beat Bonus — options sheet", Options 1 and 2 (also MLGCA v1.5
 //    Bad Beat Paytables A and B).
 //    https://www.oag.ca.gov/sites/all/files/agweb/pdfs/gambling/bcg-ult-texas-bad-beat-bonus-options-sheet.pdf
+//  * All six Ultimate Pairs schedules (UP-01 … UP-06) and the three Bad Beat schedules (BB-01 … BB-03) were
+//    re-checked against the Stadium Ultimate Texas Hold'em rules of play and paytables (Washington State
+//    Gambling Commission, 2024): https://wsgc.wa.gov/sites/default/files/2024-08/3160_Approval&ROP_StadiumUltimateTexasHold'Em.pdf
+//    That document prints the player-and-dealer-aces 1,000:1 award in only one of the first two columns and
+//    its text layer does not say which; it is assigned to UP-02, as in the scope addendum and MLGCA Paytable B.
 //  The sources do not specify companion-wager or fold handling. Those follow this project's scope
 //  addendum §22: Bad Beat requires Ante, Blind and Trips+; both side bets stay live after a fold.
 
@@ -18,7 +23,8 @@ import { categoryOf, Cat, handName, type HandName } from './evaluator.js';
 export interface Source { title: string; url: string; section: string }
 
 export interface PairsVariant {
-  id: 'up-bonus4' | 'up-bonus2';
+  /** up-bonus2 = UP-02 and up-bonus4 = UP-04 (ids kept from earlier releases, so stored hands still resolve). */
+  id: 'up-01' | 'up-bonus2' | 'up-03' | 'up-bonus4' | 'up-05' | 'up-06';
   name: string;
   short: string;
   /** Rows in display order. `payout` is X to 1. `needsDealer` rows depend on the dealer's hole cards. */
@@ -34,7 +40,7 @@ export type PairsCombo =
   | 'ak-offsuit' | 'aqj-offsuit' | 'akqj-offsuit' | 'pair-jqk' | 'pair-2-10' | 'pair-2-k';
 
 export interface BadBeatVariant {
-  id: 'bb-01' | 'bb-02';
+  id: 'bb-01' | 'bb-02' | 'bb-03';
   name: string;
   short: string;
   /** Pays on the category of the LOSING hand. X to 1. */
@@ -50,15 +56,54 @@ const MD: Source = {
   url: 'https://www.mdgaming.com/wp-content/uploads/2026/04/Ultimate-Texas-HoldEm-Poker-Standard-Rules-Version-1.5-accessible.pdf',
   section: 'Chapter 12, Ultimate Pairs paytables',
 };
+const WA: Source = {
+  title: 'WSGC Stadium Ultimate Texas Hold’em rules of play and paytables',
+  url: "https://wsgc.wa.gov/sites/default/files/2024-08/3160_Approval&ROP_StadiumUltimateTexasHold'Em.pdf",
+  section: 'Ultimate Pairs paytables 1–6; Bad Beat Bonus 01–03',
+};
 const CA: Source = {
   title: 'California BGC Ultimate Texas Hold’em Bad Beat Bonus options sheet',
   url: 'https://www.oag.ca.gov/sites/all/files/agweb/pdfs/gambling/bcg-ult-texas-bad-beat-bonus-options-sheet.pdf',
   section: 'Bad Beat Paytable',
 };
 
+const UP_HIGH = (both: boolean): PairsVariant['rows'] => [
+  ...(both ? [{ combo: 'aa-both' as const, label: 'Player and dealer both hold aces', payout: 1000, needsDealer: true }] : []),
+  { combo: 'aa', label: 'Pair of aces', payout: 30 },
+  { combo: 'ak-suited', label: 'A-K suited', payout: 25 },
+  { combo: 'aqj-suited', label: 'A-Q or A-J suited', payout: 20 },
+  { combo: 'ak-offsuit', label: 'A-K unsuited', payout: 15 },
+  { combo: 'pair-jqk', label: 'Pair of Jacks, Queens or Kings', payout: 10 },
+  { combo: 'aqj-offsuit', label: 'A-Q or A-J unsuited', payout: 5 },
+  { combo: 'pair-2-10', label: 'Pair of 2s through 10s', payout: 3 },
+];
+const UP_FACE = (ahad: number | null, aces: number, pair: number): PairsVariant['rows'] => [
+  ...(ahad ? [{ combo: 'ahad' as const, label: 'A♥ A♦', payout: ahad }] : []),
+  { combo: 'aa', label: ahad ? 'Any other pair of aces' : 'Pair of aces', payout: aces },
+  { combo: 'akqj-suited', label: 'Ace + K, Q or J, suited', payout: 20 },
+  { combo: 'akqj-offsuit', label: 'Ace + K, Q or J, unsuited', payout: 10 },
+  { combo: 'pair-2-k', label: ahad || aces ? 'Pair of 2s through Kings' : 'Other pair', payout: pair },
+];
+
 export const PAIRS_VARIANTS: Record<PairsVariant['id'], PairsVariant> = {
+  'up-01': {
+    id: 'up-01', name: 'Ultimate Pairs UP-01', short: 'UP-01', rows: UP_HIGH(false),
+    requires: ['ante', 'blind'], foldHandling: 'stays-live', maxPayoutMultiple: null, source: { ...WA, section: 'Ultimate Pairs paytable 1/2 (without the both-aces award)' },
+  },
+  'up-03': {
+    id: 'up-03', name: 'Ultimate Pairs UP-03', short: 'UP-03', rows: UP_FACE(null, 30, 5),
+    requires: ['ante', 'blind'], foldHandling: 'stays-live', maxPayoutMultiple: null, source: { ...WA, section: 'Ultimate Pairs paytable 3' },
+  },
+  'up-05': {
+    id: 'up-05', name: 'Ultimate Pairs UP-05', short: 'UP-05', rows: UP_FACE(50, 25, 5),
+    requires: ['ante', 'blind'], foldHandling: 'stays-live', maxPayoutMultiple: null, source: { ...WA, section: 'Ultimate Pairs paytable 5' },
+  },
+  'up-06': {
+    id: 'up-06', name: 'Ultimate Pairs UP-06', short: 'UP-06', rows: UP_FACE(null, 25, 5),
+    requires: ['ante', 'blind'], foldHandling: 'stays-live', maxPayoutMultiple: null, source: { ...WA, section: 'Ultimate Pairs paytable 6' },
+  },
   'up-bonus4': {
-    id: 'up-bonus4', name: 'Ultimate Pairs Bonus 4', short: 'Bonus 4',
+    id: 'up-bonus4', name: 'Ultimate Pairs UP-04', short: 'UP-04',
     rows: [
       { combo: 'ahad', label: 'A♥ A♦', payout: 100 },
       { combo: 'aa', label: 'Any other pair of aces', payout: 30 },
@@ -67,10 +112,10 @@ export const PAIRS_VARIANTS: Record<PairsVariant['id'], PairsVariant> = {
       { combo: 'pair-2-k', label: 'Pair of 2s through Kings', payout: 4 },
     ],
     requires: ['ante', 'blind'], foldHandling: 'stays-live', maxPayoutMultiple: null,
-    source: { ...MD, section: 'Chapter 12, Ultimate Pairs Paytable D' },
+    source: { ...MD, section: 'Chapter 12, Ultimate Pairs Paytable D; WSGC Stadium UTH paytable 4' },
   },
   'up-bonus2': {
-    id: 'up-bonus2', name: 'Ultimate Pairs Bonus 2', short: 'Bonus 2',
+    id: 'up-bonus2', name: 'Ultimate Pairs UP-02', short: 'UP-02',
     rows: [
       { combo: 'aa-both', label: 'Player and dealer both hold aces', payout: 1000, needsDealer: true },
       { combo: 'aa', label: 'Pair of aces', payout: 30 },
@@ -82,13 +127,13 @@ export const PAIRS_VARIANTS: Record<PairsVariant['id'], PairsVariant> = {
       { combo: 'pair-2-10', label: 'Pair of 2s through 10s', payout: 3 },
     ],
     requires: ['ante', 'blind'], foldHandling: 'stays-live', maxPayoutMultiple: null,
-    source: { ...MD, section: 'Chapter 12, Ultimate Pairs Paytable B' },
+    source: { ...MD, section: 'Chapter 12, Ultimate Pairs Paytable B; WSGC Stadium UTH paytables 1/2' },
   },
 };
 
 export const BAD_BEAT_VARIANTS: Record<BadBeatVariant['id'], BadBeatVariant> = {
   'bb-01': {
-    id: 'bb-01', name: 'Bad Beat Bonus 01', short: 'Bonus 01',
+    id: 'bb-01', name: 'Bad Beat BB-01', short: 'BB-01',
     rows: [
       { losing: 'Straight Flush', payout: 10000 },
       { losing: 'Four of a Kind', payout: 500 },
@@ -101,7 +146,7 @@ export const BAD_BEAT_VARIANTS: Record<BadBeatVariant['id'], BadBeatVariant> = {
     source: { ...CA, section: 'Bad Beat Option 1 (MLGCA Paytable A)' },
   },
   'bb-02': {
-    id: 'bb-02', name: 'Bad Beat Bonus 02', short: 'Bonus 02',
+    id: 'bb-02', name: 'Bad Beat BB-02', short: 'BB-02',
     rows: [
       { losing: 'Straight Flush', payout: 7500 },
       { losing: 'Four of a Kind', payout: 500 },
@@ -113,7 +158,22 @@ export const BAD_BEAT_VARIANTS: Record<BadBeatVariant['id'], BadBeatVariant> = {
     requires: ['ante', 'blind', 'trips'], foldHandling: 'stays-live', maxPayoutMultiple: null,
     source: { ...CA, section: 'Bad Beat Option 2 (MLGCA Paytable B)' },
   },
+  'bb-03': {
+    id: 'bb-03', name: 'Bad Beat BB-03', short: 'BB-03',
+    rows: [
+      { losing: 'Straight Flush', payout: 2500 },
+      { losing: 'Four of a Kind', payout: 500 },
+      { losing: 'Full House', payout: 50 },
+      { losing: 'Flush', payout: 30 },
+      { losing: 'Straight', payout: 20 },
+      { losing: 'Three of a Kind', payout: 9 },
+    ],
+    requires: ['ante', 'blind', 'trips'], foldHandling: 'stays-live', maxPayoutMultiple: null,
+    source: { ...WA, section: 'Bad Beat Bonus 03' },
+  },
 };
+/** Display order for host menus and the payout audit. */
+export const PAIRS_ORDER: PairsVariant['id'][] = ['up-01', 'up-bonus2', 'up-03', 'up-bonus4', 'up-05', 'up-06'];
 
 export const DEFAULT_PAIRS_VARIANT: PairsVariant['id'] = 'up-bonus4';
 export const DEFAULT_BAD_BEAT_VARIANT: BadBeatVariant['id'] = 'bb-01';
