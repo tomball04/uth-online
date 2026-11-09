@@ -2,6 +2,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { existsSync } from 'node:fs';
 import { createApp } from './app.js';
+import { cosmeticsConfigFromEnv } from './cosmetics.js';
 import { MemoryStore } from './memoryStore.js';
 import { PgStore } from './pgStore.js';
 import type { Store } from './store.js';
@@ -24,6 +25,7 @@ async function main() {
     store,
     staticDir: join(root, 'dist', 'client'),
     trustProxy: process.env.TRUST_PROXY === '1',
+    cosmetics: cosmeticsConfigFromEnv(),
     allowedOrigins: (process.env.ALLOWED_ORIGINS ?? '').split(',').map((s) => s.trim()).filter(Boolean),
   });
   const port = Number(process.env.PORT ?? 3000);

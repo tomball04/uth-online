@@ -24,12 +24,16 @@ export async function startServer(opts: { memory?: boolean; reset?: boolean; tim
   if (!opts.memory && opts.reset !== false) await resetDb();
   const store = opts.memory ? new MemoryStore() : new PgStore(TEST_DB, join(__dirname, '..', '..', 'migrations'));
   const decks: number[][] = [];
+  const shoes: number[][] = [];
   const server = await createApp({ store, shuffle: () => decks.shift() ?? secureShuffle(), timing: opts.timing ?? FAST, log: false, rateLimitScale: 1000 });
+  server.manager.shoeShuffle = () => shoes.shift() ?? secureShoe();
   await new Promise<void>((r) => server.http.listen(0, r));
   const url = `http://localhost:${(server.http.address() as AddressInfo).port}`;
   const clients: TC[] = [];
   return {
-    url, server, store, decks, clients,
+    url, server, store, decks, shoes, clients,
+    /** Queue a rigged blackjack shoe and make the table use it for its next round. */
+    rigShoe(code: string, shoe: number[]) { shoes.push(shoe); server.manager.tables.get(code)!.resetShoe(); },
     async guest(name: string) {
       const r = await fetch(url + '/api/guest', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name }) });
       return (await r.json()) as { token: string; player: { id: string; name: string } };
@@ -98,6 +102,11 @@ export class TC {
     }
     throw new Error(`${this.name}: timed out waiting for ${label}; last phase=${this.state?.phase}`);
   }
+  /** Blackjack: act on your turn (waits until it is your turn or insurance is offered). */
+  async bj(action: string, extra: { amount?: number; hand?: number } = {}) {
+    const v = await this.waitState((s) => !!s.bj && s.bj.actions.includes(action as never), 8000, `bj ${action}`);
+    return this.emit('bj:act', { actionId: aid(), handId: v.handId, action, ...extra });
+  }
   join(code: string, asSpectator = false) { return this.emit('table:join', { code, asSpectator }); }
   bet(ante: number, trips = 0, pairs = 0, badBeat = 0, progressive = 0) { return this.emit('bet:place', { actionId: aid(), ante, trips, pairs, badBeat, progressive }); }
   ready() { return this.emit('player:ready', { actionId: aid(), ready: true }); }
@@ -138,4 +147,31 @@ export function rigTcp(players: string[], dealer: string): number[] {
   const deck: number[] = [];
   for (let r = 0; r < 3; r++) { deck.push(...P.map((p) => p[r]), D[r]); }
   return [...deck, ...filler];
+}
+
+/** A secure-ish shuffled six-deck shoe for tests that don't rig one. */
+export function secureShoe(): number[] {
+  const d: number[] = [];
+  for (let k = 0; k < 6; k++) for (let i = 0; i < 52; i++) d.push(i);
+  for (let i = d.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [d[i], d[j]] = [d[j], d[i]]; }
+  return d;
+}
+/**
+ * A six-deck shoe in blackjack deal order: first card to each player in seat order, dealer upcard, second card to
+ * each player, dealer hole card, then `draws` in the order they'll be taken (hits, doubles, split cards, dealer).
+ */
+export function rigShoe(players: string[], dealer: string, draws = ''): number[] {
+  const P = players.map((p) => p.split(' ').map(cardToInt));
+  const D = dealer.split(' ').map(cardToInt);
+  const X = draws.trim() ? draws.trim().split(/\s+/).map(cardToInt) : [];
+  const head: number[] = [];
+  for (let r = 0; r < 2; r++) { head.push(...P.map((p) => p[r]), D[r]); }
+  head.push(...X);
+  const left = new Map<number, number>();
+  for (let i = 0; i < 52; i++) left.set(i, 6);
+  for (const c of head) { const n = left.get(c)! - 1; if (n < 0) throw new Error('rigShoe: more than six of a card'); left.set(c, n); }
+  // Filler keeps the shoe a legal six-deck multiset; low cards last so tests that over-draw see small cards first.
+  const filler: number[] = [];
+  for (const [c, n] of left) for (let k = 0; k < n; k++) filler.push(c);
+  return [...head, ...filler.sort((a, b) => a - b)];
 }

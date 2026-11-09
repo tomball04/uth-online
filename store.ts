@@ -1,3 +1,5 @@
+import type { RivalryEvent, RivalryRow } from './roast.js';
+import type { QHand } from '../shared/quality.js';
 // Persistence interface. Two implementations: PgStore (production, PostgreSQL) and MemoryStore
 // (zero-config local dev and fast tests). Both enforce the same invariants:
 //   * every balance change is a ledger row with a unique tx_key (idempotent),
@@ -7,15 +9,20 @@
 import type { DecisionRecord, TableConfig } from '../shared/protocol.js';
 import type { NightHand } from '../shared/recap.js';
 import type { GameId } from '../shared/rules.js';
+import type { AvatarData, PublicLook } from '../shared/cosmetics.js';
 
 export interface PlayerRow { id: string; name: string; avatar: string }
 export interface StackRow { balance: number; reloads: number; debt: number }
-export interface TableRow { code: string; hostId: string; config: TableConfig; handCounter: number; closed: boolean }
+export interface TableRow { code: string; hostId: string; config: TableConfig; handCounter: number; closed: boolean; dealer?: { dealerId: string | null; rounds: number } }
 
 export interface HandStartPlayer {
   playerId: string; seat: number; name: string; hole: string[];
   ante: number; blind: number; trips: number; pairs: number; badBeat: number; progressive: number;
   pairPlus?: number; sixCard?: number;
+  /** §37 the meter this player's progressive wager feeds and how much of it goes on (cents). */
+  progMeter?: string | null; progContribution?: number;
+  /** §34 Blackjack side bets as placed: {sideId: cents}. */
+  sides?: Record<string, number>;
 }
 export interface HandStart {
   id: string; tableCode: string; handNumber: number; deckCommitment: string;
@@ -23,7 +30,20 @@ export interface HandStart {
   pairsVariant: string; badBeatVariant: string;
   nightId: string; rulesVersion: string;
   game?: GameId;
+  /** §34.5 every pay table / profile in force for this hand. */
+  rulesProfile?: Record<string, unknown>;
+  /** Meters this hand may touch, with their reset values, created on first use. */
+  meters?: MeterSpec[];
 }
+export interface MeterSpec { id: string; seed: number; game: string; variant: string; profile: string }
+export interface MeterRow extends MeterSpec { amount: number; hits: number }
+/** §37.8 one settled progressive wager. */
+export interface ProgTx {
+  playerId: string; game: string; meterId: string; variant: string; profile: string; wager: number;
+  combo: string | null; category: 'meter' | 'fixed' | 'envy' | 'loss'; pct: number | null;
+  fixedAward: number; meterAward: number; envy: number; meterBefore: number; meterAfter: number; amount: number; net: number;
+}
+export interface ProgHitRow { meterId: string; playerId: string; hand: string; amount: number; meterBefore: number; meterAfter: number }
 export interface DebtEvent { id: number; playerId: string; name: string; kind: 'marker' | 'payoff'; amount: number; debtAfter: number; item: string; at: number }
 export interface NightRow { id: string; tableCode: string; startedAt: number; endedAt: number | null; hands: number }
 export interface PlayerSettlementRow {
@@ -34,6 +54,8 @@ export interface PlayerSettlementRow {
   pairsVariant: string | null; badBeatVariant: string | null; baseNet: number;
   progressiveNet: number; progressiveHand: string | null;
   pairPlusNet?: number; sixCardNet?: number; anteBonusNet?: number; pairPlusHand?: string | null; sixCardHand?: string | null;
+  /** §34 one result per Blackjack side bet. */
+  sideResults?: unknown[] | null;
 }
 
 export interface SideBetStats {
@@ -69,6 +91,15 @@ export interface ReplayData {
   decisions: (DecisionRecord & { playerId: string; at: string })[];
 }
 
+export interface StyleTx { id: number; kind: 'earn' | 'purchase'; amount: number; balanceAfter: number; itemId: string | null; rewardId: string | null; note: string; at: number }
+export interface CosmeticState { balance: number; owned: { itemId: string; method: string; at: number }[]; avatar: AvatarData | null; rewards: { rewardId: string; at: number }[] }
+/** Facts the reward rules read. None of them involve wager size, wins, losses or jackpots. */
+export interface RewardFacts { hands: number; games: GameId[]; friendHands: number; nights: number; nightHands: number; decisions: number; correct: number }
+export type PurchaseResult =
+  | { status: 'ok' | 'duplicate'; balance: number }
+  | { status: 'owned'; balance: number }
+  | { status: 'insufficient'; balance: number };
+
 export interface RecentHandRow {
   handId: string; handNumber: number; at: number; dealerHand: string; dealerQualifies: boolean;
   players: { name: string; net: number; outcome: string; handName: string; sideHits?: string[] }[];
@@ -83,6 +114,8 @@ export interface Store {
 
   createTable(code: string, hostId: string, config: TableConfig): Promise<void>;
   loadTable(code: string): Promise<TableRow | null>;
+  /** §25: the dealer working this table and rounds into the shift (presentation only). */
+  updateDealer(code: string, dealerId: string, rounds: number): Promise<void>;
   updateTable(code: string, p: { config?: TableConfig; hostId?: string; closed?: boolean; handCounter?: number }): Promise<void>;
 
   getStack(playerId: string, code: string): Promise<StackRow | null>;
@@ -94,24 +127,37 @@ export interface Store {
   debtEvents(code: string, limit: number): Promise<DebtEvent[]>;
 
   /** Atomically records the hand, debits every initial wager, and adds progressive contributions to the meter. */
-  startHand(h: HandStart): Promise<{ balances: Map<string, number>; jackpot: number }>;
-  /** Current linked progressive meter (cents). */
+  startHand(h: HandStart): Promise<{ balances: Map<string, number>; jackpot: number; meters: Map<string, number> }>;
+  /** Current Five Card meter (cents) — the original UTH meter. */
   getJackpot(): Promise<number>;
+  /** §37 every progressive meter that exists (created on first use). */
+  getMeters(): Promise<MeterRow[]>;
+  /** §34.9 settled Blackjack hands with side-bet / 21+3 Progressive results for one player (oldest first). */
+  bonusRows(playerId: string): Promise<import('../shared/bjsides.js').BonusRow[]>;
+  /** §37.8 progressive transaction history, newest first. */
+  progressiveTx(filter: { playerId?: string; meterId?: string }, limit: number): Promise<(ProgTx & { handId: string; at: number })[]>;
   /** Debits a Play wager. Returns new balance, or null if this tx_key was already applied. */
   wager(handId: string, playerId: string, code: string, amount: number, key: string): Promise<number | null>;
+  /** Blackjack: debits a double, split or insurance wager (idempotent by key) and records the round's running totals. */
+  extraWager(handId: string, playerId: string, code: string, amount: number, key: string, totals: { extra: number; insurance: number }): Promise<number | null>;
   recordDecision(handId: string, playerId: string, d: DecisionRecord, state: { play: number; folded: boolean }): Promise<void>;
-  updateDecisionEV(handId: string, playerId: string, phase: string, evCost: number, exact: boolean): Promise<void>;
+  updateDecisionEV(handId: string, playerId: string, phase: string, evCost: number, exact: boolean, cents?: number): Promise<void>;
   /**
    * Atomically credits payouts. `build` is called inside the transaction with the locked progressive meter and
    * returns the final rows plus the meter after any jackpot awards. `applied` is false if already settled/voided.
    */
-  settleHand(handId: string, code: string, dealer: { hand: string; qualifies: boolean }, build: SettlementBuilder):
-    Promise<{ applied: boolean; balances: Map<string, number>; jackpot: number }>;
+  settleHand(handId: string, code: string, dealer: { hand: string; qualifies: boolean }, build: SettlementBuilder, meterIds?: string[]):
+    Promise<{ applied: boolean; balances: Map<string, number>; jackpot: number; meters: Map<string, number> }>;
   /** Startup recovery: refund every committed stake of hands interrupted by a restart. */
   voidActiveHands(): Promise<{ hands: number; refunds: number }>;
 
   /** Statistics for one game, or all games when `game` is omitted. The bankroll series always covers every game. */
   playerStats(playerId: string, game?: GameId): Promise<PlayerStats>;
+  /** §31: every settled hand for this player with its recorded decisions (oldest first). */
+  qualityHands(playerId: string, game?: GameId): Promise<QHand[]>;
+  /** §32: comedic dealer-vs-player records (never read by dealing or settlement). */
+  rivalries(dealerId: string, playerIds: string[]): Promise<Map<string, RivalryRow>>;
+  bumpRivalry(dealerId: string, playerId: string, d: Partial<Record<'witnessed' | 'wins' | 'jackpots' | 'mockedThenWon', number>>, ev?: RivalryEvent): Promise<void>;
   recentHands(code: string, limit: number): Promise<RecentHandRow[]>;
   handReplay(handId: string): Promise<ReplayData | null>;
   /**
@@ -129,13 +175,55 @@ export interface Store {
   ledgerSummary(playerId: string, code: string): Promise<Record<string, number>>;
   /** Sum of ledger amounts for a stack — used to reconcile balances in tests and audits. */
   ledgerSum(playerId: string, code: string): Promise<number>;
+
+  // ---- §24 cosmetics. Fully separate from stacks and the chip ledger.
+  getCosmetics(playerId: string): Promise<CosmeticState>;
+  saveAvatar(playerId: string, data: AvatarData): Promise<void>;
+  /** Public looks for a set of players (seats, chat, recap, replay). Players without a saved look are omitted. */
+  publicLooks(playerIds: string[]): Promise<Map<string, PublicLook>>;
+  /**
+   * Credits a reward and/or grants items, once per `key`. Returns applied=false if the key was already used.
+   * Never touches casino chips.
+   */
+  grant(playerId: string, g: { key: string; rewardId: string | null; amount: number; items: string[]; method: 'reward' | 'collection'; note: string }):
+    Promise<{ applied: boolean; balance: number }>;
+  /** Buys an item for `price` credits, atomically and once per `key`. */
+  purchase(playerId: string, itemId: string, price: number, key: string, note: string): Promise<PurchaseResult>;
+  styleHistory(playerId: string, limit: number): Promise<StyleTx[]>;
+  rewardFacts(playerId: string, nightId: string | null): Promise<RewardFacts>;
 }
 
-export type SettlementBuilder = (jackpot: number) => {
-  rows: PlayerSettlementRow[]; jackpotAfter: number;
-  hits: { playerId: string; hand: string; amount: number; meterBefore: number }[];
+/**
+ * Called inside the settlement transaction with every requested meter locked (FOR UPDATE, in id order, so two
+ * tables can never pay the same jackpot twice or deadlock). Returns the rows, the meters it changed and the
+ * progressive history. `jackpot` is the Five Card meter, kept for older callers.
+ */
+export type SettlementBuilder = (meters: Map<string, number>) => {
+  rows: PlayerSettlementRow[];
+  meters?: Map<string, number>;
+  hits?: ProgHitRow[];
+  progTx?: ProgTx[];
 };
 
 export const JACKPOT_ID = 'five-card-5';
 
 export class InsufficientFunds extends Error {}
+
+/** Normalizes a raw row from either store into a §31 QHand (fills EV cents from ante units for older rows). */
+export function toQHand(x: {
+  handId: string; handNumber: number; tableCode: string; game: GameId; at: number; nightId: string | null; mainNet: number; totalNet: number;
+  folded: boolean; hole: string[]; community: string[]; dealer: string[]; ante: number; settlement: unknown; decisions: any[];
+}): QHand {
+  const st = x.game === 'bj' && x.settlement && typeof x.settlement === 'object' ? x.settlement as { hands?: { cards: string[] }[]; dealer?: string[] } : null;
+  return {
+    handId: x.handId, handNumber: x.handNumber, tableCode: x.tableCode, game: x.game, at: x.at, nightId: x.nightId,
+    mainNet: x.mainNet, totalNet: x.totalNet, folded: x.folded, hole: x.hole, community: x.game === 'uth' ? x.community : [],
+    dealer: st?.dealer ?? x.dealer, bjHands: st?.hands?.map((h) => h.cards),
+    decisions: x.decisions.map((d) => {
+      const evCost = d.evCost === null || d.evCost === undefined ? null : Number(d.evCost);
+      const evCents = d.evCents !== null && d.evCents !== undefined ? Number(d.evCents) : evCost !== null ? Math.round(evCost * x.ante) : null;
+      return { phase: d.phase, action: d.action, recommended: d.recommended, correct: !!d.correct, graded: d.graded !== false, timedOut: !!d.timedOut,
+        reason: d.reason ?? '', evCost: d.correct ? 0 : evCost, evCents: d.correct ? 0 : evCents };
+    }),
+  };
+}

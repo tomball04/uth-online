@@ -63,14 +63,69 @@ export function tcpQualifies(dealerScore: number): boolean {
   return tcpCategory(dealerScore) > TCP_CAT.HighCard || ((dealerScore >> 8) & 15) >= QUEEN;
 }
 
+/**
+ * Stored hand rank for history, "best hand" stats and the night recap. It keeps the THREE CARD order
+ * (Straight Flush > Three of a Kind > Straight > Flush > Pair > High Card). §35: earlier builds stored a
+ * five-card-style rank here (Flush 5 > Straight 4 > Three of a Kind 3), so a Flush outranked Three of a Kind
+ * in history and recaps even though settlement was right. Migration 013 rewrites the old rows.
+ */
+export const TCP_STORED_RANK: Record<TcpHandName, number> = { 'High Card': 0, Pair: 1, Flush: 2, Straight: 3, 'Three of a Kind': 4, 'Straight Flush': 8 };
+/** A-K-Q of one suit. In the main game it is simply the best Straight Flush; some side-bet tables pay it separately. */
+export function isMiniRoyal(cards: number[]): boolean {
+  if (cards.length !== 3) return false;
+  const r = cards.map(rankOf).sort((a, b) => b - a);
+  return r[0] === 12 && r[1] === 11 && r[2] === 10 && new Set(cards.map(suitOf)).size === 1;
+}
+
 export const ANTE_BONUS: Partial<Record<TcpHandName, number>> = { 'Straight Flush': 5, 'Three of a Kind': 4, Straight: 1 };
-export const PAIR_PLUS: Partial<Record<TcpHandName, number>> = { 'Straight Flush': 40, 'Three of a Kind': 30, Straight: 6, Flush: 3, Pair: 1 };
+
+/**
+ * Pair Plus pay tables (X to 1), every table as listed by the Wizard of Odds Three Card Poker page
+ * ("Pairplus Pay Tables: Without Mini Royal" 1–10 and "With Mini Royal" 1–7). Mini Royal = A-K-Q suited,
+ * paid only by the "mr-" tables; elsewhere it is an ordinary Straight Flush. pp-8 (40-30-6-3-1) is the table
+ * this game has always used and stays the default.
+ */
+export type PairPlusCombo = 'Mini Royal' | TcpHandName;
+export interface PairPlusVariant { id: string; name: string; table: Partial<Record<PairPlusCombo, number>>; edge: string }
+const pp = (id: string, name: string, edge: string, sf: number, trips: number, st: number, fl: number, pair: number, mr?: number): PairPlusVariant =>
+  ({ id, name, edge, table: { ...(mr ? { 'Mini Royal': mr } : {}), 'Straight Flush': sf, 'Three of a Kind': trips, Straight: st, Flush: fl, Pair: pair } });
+export const PAIR_PLUS_VARIANTS: Record<string, PairPlusVariant> = Object.fromEntries([
+  pp('pp-1', 'Pay Table 1 (40-30-6-4-1)', '2.32%', 40, 30, 6, 4, 1),
+  pp('pp-2', 'Pay Table 2 (35-33-6-4-1)', '2.70%', 35, 33, 6, 4, 1),
+  pp('pp-3', 'Pay Table 3 (40-25-6-4-1)', '3.49%', 40, 25, 6, 4, 1),
+  pp('pp-4', 'Pay Table 4 (35-25-6-4-1)', '4.58%', 35, 25, 6, 4, 1),
+  pp('pp-5', 'Pay Table 5 (50-30-6-3-1)', '5.10%', 50, 30, 6, 3, 1),
+  pp('pp-6', 'Pay Table 6 (40-30-5-4-1)', '5.57%', 40, 30, 5, 4, 1),
+  pp('pp-7', 'Pay Table 7 (40-25-5-4-1)', '6.75%', 40, 25, 5, 4, 1),
+  pp('pp-8', 'Pay Table 8 (40-30-6-3-1)', '7.28%', 40, 30, 6, 3, 1),
+  pp('pp-9', 'Pay Table 9 (40-32-6-4-1)', '1.85%', 40, 32, 6, 4, 1),
+  pp('pp-10', 'Pay Table 10 (42-38-6-4-1)', '0.00%', 42, 38, 6, 4, 1),
+  pp('pp-mr1', 'Mini Royal Table 1 (80-40-25-6-3-1)', '7.73%', 40, 25, 6, 3, 1, 80),
+  pp('pp-mr2', 'Mini Royal Table 2 (50-40-30-6-3-1)', '7.10%', 40, 30, 6, 3, 1, 50),
+  pp('pp-mr3', 'Mini Royal Table 3 (50-40-30-5-4-1)', '5.39%', 40, 30, 5, 4, 1, 50),
+  pp('pp-mr4', 'Mini Royal Table 4 (200-40-30-6-3-1)', '4.38%', 40, 30, 6, 3, 1, 200),
+  pp('pp-mr5', 'Mini Royal Table 5 (100-50-30-6-3-1)', '4.20%', 50, 30, 6, 3, 1, 100),
+  pp('pp-mr6', 'Mini Royal Table 6 (50-40-30-6-4-1)', '2.14%', 40, 30, 6, 4, 1, 50),
+].map((v) => [v.id, v]));
+export const DEFAULT_PAIR_PLUS_VARIANT = 'pp-8';
+export const isPairPlusVariant = (x: unknown): x is string => typeof x === 'string' && x in PAIR_PLUS_VARIANTS;
+/** Default table, kept under its old name. */
+export const PAIR_PLUS = PAIR_PLUS_VARIANTS[DEFAULT_PAIR_PLUS_VARIANT].table;
+/** Pair Plus result for one hand under one table: highest row only (a Mini Royal is never also paid as a Straight Flush). */
+export function pairPlusPay(variantId: string, cards: number[]): { combo: PairPlusCombo; mult: number } | null {
+  const v = PAIR_PLUS_VARIANTS[variantId] ?? PAIR_PLUS_VARIANTS[DEFAULT_PAIR_PLUS_VARIANT];
+  if (v.table['Mini Royal'] && isMiniRoyal(cards)) return { combo: 'Mini Royal', mult: v.table['Mini Royal']! };
+  const name = tcpHandName(evaluate3(cards));
+  const m = v.table[name];
+  return m ? { combo: name, mult: m } : null;
+}
 export const SIX_CARD: Partial<Record<HandName, number>> = {
   'Royal Flush': 1000, 'Straight Flush': 200, 'Four of a Kind': 100, 'Full House': 20, Flush: 15, Straight: 10, 'Three of a Kind': 7,
 };
 export const TCP_SOURCES = [
   { title: 'Wizard of Odds — Three Card Poker', url: 'https://wizardofodds.com/games/three-card-poker/' },
   { title: 'Wizard of Odds — Six Card Bonus', url: 'https://wizardofodds.com/games/three-card-poker/six-card-bonus/' },
+  { title: 'Nevada Gaming Control Board — Three Card Poker Progressive Link', url: 'https://www.gaming.nv.gov/siteassets/content/divisions/technology/rules-of-play/three-card-poker-progressive-link.pdf' },
 ];
 
 export interface TcpLine { stake: number; result: 'win' | 'lose' | 'push' | 'none'; net: number; credit: number; note?: string; multiplier?: number; combo?: string }
@@ -80,6 +135,8 @@ export interface TcpSettlement {
   dealerQualifies: boolean;
   playerHand: TcpHandName; dealerHand: TcpHandName; sixCardHand: HandName | null;
   ante: TcpLine; play: TcpLine; anteBonus: TcpLine; pairPlus: TcpLine; sixCard: TcpLine;
+  /** §37 Three Card Progressive: independent of the Ante/Play result and of a fold; paid "for 1" (stake not returned). */
+  progressive: TcpLine;
   totalStake: number; totalCredit: number; net: number; baseNet: number; sideNet: number;
 }
 
@@ -88,7 +145,10 @@ const lose = (stake: number, note?: string): TcpLine => ({ stake, result: 'lose'
 const push = (stake: number, note?: string): TcpLine => ({ stake, result: 'push', net: 0, credit: stake, note });
 const none = (): TcpLine => ({ stake: 0, result: 'none', net: 0, credit: 0 });
 
-export interface TcpSettleInput { ante: number; play: number; pairPlus: number; sixCard: number; folded: boolean; player: number[]; dealer: number[] }
+export interface TcpSettleInput {
+  ante: number; play: number; pairPlus: number; sixCard: number; folded: boolean; player: number[]; dealer: number[]; pairPlusVariant?: string;
+  progressive?: number; progressiveAward?: { amount: number; combo: string | null; label: string } | null;
+}
 
 export function settleTcp(i: TcpSettleInput): TcpSettlement {
   const ps = evaluate3(i.player), ds = evaluate3(i.dealer);
@@ -117,8 +177,8 @@ export function settleTcp(i: TcpSettleInput): TcpSettlement {
   }
   let pairPlus = none();
   if (i.pairPlus > 0) {
-    const m = PAIR_PLUS[playerHand];
-    pairPlus = m ? win(i.pairPlus, i.pairPlus * m, `${playerHand} pays ${m}:1`, { multiplier: m, combo: playerHand }) : lose(i.pairPlus);
+    const r = pairPlusPay(i.pairPlusVariant ?? DEFAULT_PAIR_PLUS_VARIANT, i.player);
+    pairPlus = r ? win(i.pairPlus, i.pairPlus * r.mult, `${r.combo} pays ${r.mult}:1`, { multiplier: r.mult, combo: r.combo }) : lose(i.pairPlus);
   }
   let sixCard = none(), sixCardHand: HandName | null = null;
   if (i.sixCard > 0) {
@@ -126,10 +186,17 @@ export function settleTcp(i: TcpSettleInput): TcpSettlement {
     const m = SIX_CARD[sixCardHand];
     sixCard = m ? win(i.sixCard, i.sixCard * m, `${sixCardHand} pays ${m.toLocaleString('en-US')}:1`, { multiplier: m, combo: sixCardHand }) : lose(i.sixCard);
   }
-  const lines = [ante, play, anteBonus, pairPlus, sixCard];
+  let progressive = none();
+  if (i.progressive) {
+    const a = i.progressiveAward;
+    progressive = a && a.amount > 0
+      ? { stake: i.progressive, result: 'win', net: a.amount - i.progressive, credit: a.amount, note: `${a.label} (for 1 — the wager is not returned)`, combo: a.combo ?? undefined }
+      : lose(i.progressive, a?.combo ? `${a.combo} — no award on this table` : 'No qualifying hand');
+  }
+  const lines = [ante, play, anteBonus, pairPlus, sixCard, progressive];
   const totalStake = lines.reduce((s, l) => s + l.stake, 0), totalCredit = lines.reduce((s, l) => s + l.credit, 0);
-  const baseNet = ante.net + play.net + anteBonus.net, sideNet = pairPlus.net + sixCard.net;
-  return { game: 'tcp', outcome, dealerQualifies: qualifies, playerHand, dealerHand, sixCardHand, ante, play, anteBonus, pairPlus, sixCard,
+  const baseNet = ante.net + play.net + anteBonus.net, sideNet = pairPlus.net + sixCard.net + progressive.net;
+  return { game: 'tcp', outcome, dealerQualifies: qualifies, playerHand, dealerHand, sixCardHand, ante, play, anteBonus, pairPlus, sixCard, progressive,
     totalStake, totalCredit, net: totalCredit - totalStake, baseNet, sideNet };
 }
 

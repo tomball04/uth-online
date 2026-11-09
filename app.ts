@@ -1,3 +1,4 @@
+import { classify, currentSession, matches, summarize, type HistoryFilter } from '../shared/quality.js';
 import express, { type Request, type Response, type NextFunction } from 'express';
 import { createServer, type Server as HttpServer } from 'node:http';
 import { existsSync } from 'node:fs';
@@ -11,7 +12,11 @@ import { buildConfig } from './config.js';
 import { DEFAULT_TIMING, EngineError, TableEngine, cleanName, type Timing } from './engine.js';
 import { newId, newToken, roomCode, secureShuffle, sha256 } from './rng.js';
 import { buildRecap } from '../shared/recap.js';
-import type { PlayerRow, Store } from './store.js';
+import { BJ_SIDES, bonusStats } from '../shared/bjsides.js';
+import { JACKPOT_ID, type PlayerRow, type Store } from './store.js';
+import type { GameId } from '../shared/rules.js';
+import { Cosmetics, CosmeticError, type CosmeticsConfig } from './cosmetics.js';
+import { COLLECTIONS, REACTION_SETS, randomAvatar, DEFAULT_AVATAR } from '../shared/cosmetics.js';
 
 type IO = Server<ClientToServer, ServerToClient, object, SocketData>;
 type Sock = Socket<ClientToServer, ServerToClient, object, SocketData>;
@@ -27,6 +32,8 @@ export interface AppOptions {
   log?: boolean;
   /** Multiplier for per-IP REST rate limits (tests use a large value). */
   rateLimitScale?: number;
+  /** §24 price and reward overrides. */
+  cosmetics?: CosmeticsConfig;
 }
 
 const AVATARS = ['♠', '♥', '♦', '♣', '★', '♛', '♞', '⚜'];
@@ -68,6 +75,14 @@ export class TableManager {
   private pendingBroadcast = new Set<string>();
   /** Linked progressive meter, shared by every table on this server. Seeded from the store at startup. */
   jackpot = 0;
+  /** §37 last known value of every progressive meter (the Store is authoritative). */
+  meters = new Map<string, number>();
+  /** Test hook: deterministic dealer picks (cosmetic only). */
+  dealerRand: ((n: number) => number) | null = null;
+  /** Test hook: Blackjack shoe order. */
+  shoeShuffle: (() => number[]) | null = null;
+  /** Set by createApp: runs after every settled hand (cosmetic rewards only). */
+  onSettled: (code: string, handId: string, nightId: string | null, pids: string[]) => void = () => {};
 
   constructor(private io: IO, private store: Store, private shuffle: () => number[], private timing: Timing) {}
 
@@ -83,7 +98,13 @@ export class TableManager {
     return code;
   }
 
-  private attach(e: TableEngine) { this.tables.set(e.code, e); return e; }
+  private attach(e: TableEngine, dealer: { dealerId: string | null; rounds: number } | null = null) {
+    if (this.dealerRand) e.dealerRand = this.dealerRand;
+    if (this.shoeShuffle) e.shoeShuffle = () => this.shoeShuffle!();
+    e.initHouse(dealer);
+    this.tables.set(e.code, e);
+    return e;
+  }
 
   async get(code: string): Promise<TableEngine | null> {
     const live = this.tables.get(code);
@@ -92,7 +113,8 @@ export class TableManager {
       this.loading.set(code, (async () => {
         const row = await this.store.loadTable(code);
         if (!row || row.closed) return null;
-        return this.tables.get(code) ?? this.attach(new TableEngine(code, row.config, row.hostId, row.handCounter, this.store, this.hooks(code), this.shuffle, this.timing));
+        if (this.tables.get(code)) return this.tables.get(code)!;
+        return this.attach(new TableEngine(code, row.config, row.hostId, row.handCounter, this.store, this.hooks(code), this.shuffle, this.timing), row.dealer ?? null);
       })().finally(() => this.loading.delete(code)));
     }
     return this.loading.get(code)!;
@@ -108,14 +130,17 @@ export class TableManager {
       kicked: (pid: string, reason: string) => {
         for (const s of [...(this.sockets.get(code) ?? [])]) if (s.data.player.id === pid) { s.emit('kicked', { reason }); this.detach(s); }
       },
-      jackpot: (amount: number) => {
-        if (amount === this.jackpot) return;
-        this.jackpot = amount;
-        for (const c of this.tables.keys()) if (c !== code) this.broadcast(c);
+      jackpot: (meterId: string, amount: number) => {
+        if (this.meters.get(meterId) === amount) return;
+        this.meters.set(meterId, amount);
+        if (meterId === JACKPOT_ID) this.jackpot = amount;
+        // Only tables that show this meter need a refresh.
+        for (const [c, e] of this.tables) if (c !== code && e.showsMeter(meterId)) this.broadcast(c);
       },
-      jackpotAmount: () => this.jackpot,
+      jackpotAmount: (meterId: string = JACKPOT_ID) => this.meters.get(meterId) ?? 0,
+      settled: (handId: string, nightId: string | null, pids: string[]) => this.onSettled(code, handId, nightId, pids),
       nightEnded: (nightId: string) => { for (const s of this.sockets.get(code) ?? []) s.emit('night:ended', { nightId }); },
-      jackpotHit: (p: { tableName: string; playerName: string; hand: string; amount: number }) => {
+      jackpotHit: (p: { tableName: string; playerName: string; hand: string; amount: number; meterId?: string; game?: GameId }) => {
         // Every table hears about a linked jackpot hit, like the sign over a casino pit.
         for (const [c, set] of this.sockets) for (const s of set) s.emit('jackpot:hit', { ...p, same: c === code });
       },
@@ -213,7 +238,26 @@ export async function createApp(opts: AppOptions) {
     connectionStateRecovery: undefined,
   });
   const manager = new TableManager(io, store, opts.shuffle ?? secureShuffle, timing);
+  const cosmetics = new Cosmetics(store, opts.cosmetics);
+  const toPlayer = (pid: string, fn: (s: Sock) => void) => { for (const set of manager.sockets.values()) for (const s of set) if (s.data.player.id === pid) fn(s); };
+  const announceEarned = (pid: string, rewards: string[]) => {
+    if (!rewards.length) return;
+    store.getCosmetics(pid).then((st) => toPlayer(pid, (s) => s.emit('style:earned', { rewards, balance: st.balance }))).catch(() => {});
+  };
+  manager.onSettled = (_code, _handId, nightId, pids) => {
+    for (const pid of pids) cosmetics.afterHand(pid, nightId).then((got) => announceEarned(pid, got)).catch((e) => opts.log !== false && console.error('[cosmetics]', e));
+  };
+  /** Push a player's new look to every table they're at. */
+  const refreshLook = (pid: string, look: { appearance: unknown; equipped: unknown }) => {
+    for (const [code, e] of manager.tables) {
+      if (!e.seatOf(pid) && !e.spectators.has(pid)) continue;
+      e.looks.set(pid, look as never);
+      manager.broadcast(code);
+    }
+  };
   manager.jackpot = await store.getJackpot();
+  for (const m of await store.getMeters()) manager.meters.set(m.id, m.amount);
+  manager.meters.set(JACKPOT_ID, manager.jackpot);
 
   const auth = async (token: unknown): Promise<PlayerRow | null> =>
     typeof token === 'string' && token.length >= 20 && token.length <= 100 ? store.playerByTokenHash(sha256(token)) : null;
@@ -237,6 +281,10 @@ export async function createApp(opts: AppOptions) {
     const token = newToken();
     const avatar = AVATARS[Math.floor(Math.random() * AVATARS.length)];
     const p = await store.createPlayer(newId(), name, avatar, sha256(token));
+    // Every new guest starts with a distinct free look and the welcome allowance of Style Credits.
+    const r = randomAvatar();
+    await store.saveAvatar(p.id, { ...DEFAULT_AVATAR, appearance: r.appearance, equipped: r.equipped, preset: 'casual', outfits: { casual: r.equipped } });
+    await cosmetics.welcome(p.id);
     res.json({ player: p, token });
   }));
 
@@ -247,6 +295,50 @@ export async function createApp(opts: AppOptions) {
     const avatar = AVATARS.includes(req.body?.avatar) ? req.body.avatar : undefined;
     await store.updatePlayer(res.locals.player.id, { name, avatar });
     res.json({ ok: true });
+  }));
+
+  // ---- §24 avatars, Style Credits and the Boutique (never chips)
+  const cwrap = (fn: (req: Request, res: Response) => Promise<unknown>) => (req: Request, res: Response) =>
+    fn(req, res).catch((e) => res.status(e instanceof CosmeticError ? 400 : 500).json({ error: e instanceof CosmeticError ? e.message : 'Request failed' }));
+  app.get('/api/catalog', (_req, res) => { res.json({ items: cosmetics.catalog(), rewards: cosmetics.rewards(), collections: COLLECTIONS }); });
+  app.get('/api/me/cosmetics', requireAuth, cwrap(async (_req, res) => {
+    const pid = res.locals.player.id as string;
+    await cosmetics.welcome(pid);
+    const st = await store.getCosmetics(pid);
+    res.json({ ...st, avatar: st.avatar ?? DEFAULT_AVATAR, history: await store.styleHistory(pid, 50) });
+  }));
+  app.put('/api/me/avatar', ipLimit(20, 0.5), requireAuth, cwrap(async (req, res) => {
+    const pid = res.locals.player.id as string;
+    const data = await cosmetics.save(pid, req.body);
+    refreshLook(pid, { appearance: data.appearance, equipped: data.equipped });
+    res.json({ avatar: data, balance: (await store.getCosmetics(pid)).balance });
+  }));
+  app.post('/api/me/outfit', ipLimit(20, 0.5), requireAuth, cwrap(async (req, res) => {
+    const pid = res.locals.player.id as string;
+    const data = await cosmetics.wear(pid, req.body?.preset);
+    refreshLook(pid, { appearance: data.appearance, equipped: data.equipped });
+    res.json({ avatar: data });
+  }));
+  app.post('/api/me/purchase', ipLimit(20, 0.5), requireAuth, cwrap(async (req, res) => {
+    const pid = res.locals.player.id as string;
+    const r = await cosmetics.buy(pid, req.body?.itemId, req.body?.key);
+    res.json(r);
+  }));
+  app.post('/api/me/event', ipLimit(10, 0.2), requireAuth, cwrap(async (req, res) => {
+    const pid = res.locals.player.id as string;
+    const ev = req.body?.event;
+    const applied = await cosmetics.event(pid, ev);
+    const st = await store.getCosmetics(pid);
+    res.json({ applied, balance: st.balance });
+  }));
+  app.get('/api/players/:id/profile', ipLimit(60, 2), requireAuth, cwrap(async (req, res) => {
+    const id = String(req.params.id);
+    if (!/^[A-Za-z0-9_-]{6,64}$/.test(id)) throw new CosmeticError('Invalid player.');
+    res.json({ profile: await cosmetics.profile(id) });
+  }));
+  app.get('/api/looks', ipLimit(60, 2), requireAuth, cwrap(async (req, res) => {
+    const ids = String(req.query.ids ?? '').split(',').filter((x) => /^[A-Za-z0-9_-]{6,64}$/.test(x)).slice(0, 24);
+    res.json({ looks: Object.fromEntries(await store.publicLooks(ids)) });
   }));
 
   app.get('/api/tables', (_req, res) => { res.json({ tables: manager.listings() }); });
@@ -262,8 +354,40 @@ export async function createApp(opts: AppOptions) {
     res.json({ table: { ...t.listing(), solo: t.config.solo } });
   }));
   app.get('/api/stats/me', requireAuth, wrap(async (req, res) => {
-    const g = req.query.game === 'uth' || req.query.game === 'tcp' ? req.query.game : undefined;
+    const g = req.query.game === 'uth' || req.query.game === 'tcp' || req.query.game === 'bj' ? req.query.game : undefined;
     res.json({ stats: await store.playerStats(res.locals.player.id, g) });
+  }));
+  // ---- §34.9 Blackjack bonus statistics: per wager, session and lifetime, plus 21+3 Progressive and its jackpot
+  // history. Kept apart from strategy accuracy (a side-bet win never turns a wrong decision into a right one).
+  app.get('/api/stats/bonus', requireAuth, wrap(async (req, res) => {
+    const rows = await store.bonusRows(res.locals.player.id);
+    const side = typeof req.query.side === 'string' ? req.query.side : '';
+    const combo = typeof req.query.combo === 'string' ? req.query.combo : '';
+    const hands = rows.filter((r) => (!side || (side === 'progressive' ? !!r.prog : r.results.some((x) => x.id === side)))
+      && (!combo || r.results.some((x) => x.label === combo && (!side || x.id === side)) || (side === 'progressive' && r.prog?.combo === combo)))
+      .reverse().slice(0, Math.min(200, Math.max(1, Number(req.query.limit) || 50)));
+    res.json({ stats: bonusStats(rows), hands, catalog: BJ_SIDES.map((d) => ({ id: d.id, name: d.name, status: d.status })) });
+  }));
+  app.get('/api/progressive', wrap(async (_req, res) => {
+    res.json({ meters: await store.getMeters() });
+  }));
+  app.get('/api/progressive/history', requireAuth, wrap(async (req, res) => {
+    res.json({ tx: await store.progressiveTx({ playerId: res.locals.player.id }, Math.min(200, Number(req.query.limit) || 50)) });
+  }));
+  // ---- §31 decision quality vs. results. Computed here from immutable decisions + settled results; the browser
+  // can only read these numbers, never submit a classification or bump a counter.
+  const gameQ = (q: unknown) => (q === 'uth' || q === 'tcp' || q === 'bj' ? q : undefined);
+  app.get('/api/stats/quality', requireAuth, wrap(async (req, res) => {
+    const hs = await store.qualityHands(res.locals.player.id, gameQ(req.query.game));
+    const sess = currentSession(hs);
+    res.json({ lifetime: summarize(hs), session: summarize(sess), sessionStart: sess[0]?.at ?? null });
+  }));
+  app.get('/api/stats/history', requireAuth, wrap(async (req, res) => {
+    const f = (['all', 'wrong-wins', 'wrong-losses', 'right-losses', 'wrong', 'ungraded'] as HistoryFilter[]).includes(req.query.filter as HistoryFilter) ? req.query.filter as HistoryFilter : 'all';
+    const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 50));
+    const hs = await store.qualityHands(res.locals.player.id, gameQ(req.query.game));
+    const rows = hs.map((h) => ({ h, c: classify(h) })).filter((x) => matches(x.c, f));
+    res.json({ total: rows.length, hands: rows.reverse().slice(0, limit).map(({ h, c }) => ({ ...h, ...c })) });
   }));
   // ---- table nights: running tab and recaps
   const nightAccess = async (code: string, me: string) => {
@@ -292,7 +416,9 @@ export async function createApp(opts: AppOptions) {
     const hands = await store.nightHands(night.id);
     const debts = new Map<string, number>();
     for (const pid of new Set(hands.flatMap((h) => h.players.map((p) => p.playerId)))) debts.set(pid, (await store.getStack(pid, code))?.debt ?? 0);
-    res.json({ recap: buildRecap({ nightId: night.id, tableName: t.config.name, startedAt: night.startedAt, endedAt: night.endedAt }, hands, debts) });
+    const pawned = new Map<string, string>();
+    for (const ev of await store.debtEvents(code, 500)) if (!pawned.has(ev.playerId) && ev.debtAfter > 0 && debts.get(ev.playerId)) pawned.set(ev.playerId, ev.item);
+    res.json({ recap: buildRecap({ nightId: night.id, tableName: t.config.name, startedAt: night.startedAt, endedAt: night.endedAt }, hands, debts, pawned) });
   }));
 
   // Your chips at one table, straight from the ledger: start + reloads − wagers + payouts + refunds = stack.
@@ -316,6 +442,9 @@ export async function createApp(opts: AppOptions) {
     r.decisions = r.decisions.filter((d) => d.playerId === me);
     res.json({ hand: r, you: me });
   }));
+
+  // Unknown API routes (and methods) get a JSON 404 — e.g. there is no way to POST statistics.
+  app.use('/api', (_req, res) => { res.status(404).json({ error: 'Not found.' }); });
 
   // ---- static client
   const staticDir = opts.staticDir;
@@ -365,7 +494,9 @@ export async function createApp(opts: AppOptions) {
         const e = await manager.get(code);
         if (!e) throw new EngineError('Table not found or closed.');
         const me = socket.data.player;
+        const av = await cosmetics.look(me.id);
         const seat = await e.run(async () => {
+          e.looks.set(me.id, { appearance: av.appearance, equipped: av.equipped });
           if (e.banned.has(me.id)) throw new EngineError('You were removed from this table.');
           const existing = e.seatOf(me.id);
           if (existing) { e.setConnected(me.id, true); return existing.seat; }
@@ -375,8 +506,8 @@ export async function createApp(opts: AppOptions) {
           return null;
         });
         manager.register(socket, code);
-        socket.emit('chat:history', manager.chat.get(code) ?? []);
         socket.emit('table:state', e.viewFor(me.id));
+        socket.emit('chat:history', manager.chat.get(code) ?? []);
         reply({ ok: true, seat });
       } catch (err) {
         reply({ ok: false, error: err instanceof EngineError ? err.message : 'Could not join table.' });
@@ -391,7 +522,17 @@ export async function createApp(opts: AppOptions) {
     on('bet:place', async (e, p) => {
       const x = obj(p);
       // Raw values go to the engine; validateInitialBet rejects anything that isn't a whole, non-negative number.
-      await e.placeBet(socket.data.player.id, x.actionId, { ante: x.ante, trips: x.trips ?? 0, pairs: x.pairs ?? 0, badBeat: x.badBeat ?? 0, progressive: x.progressive ?? 0, pairPlus: x.pairPlus ?? 0, sixCard: x.sixCard ?? 0 });
+      // §34 Blackjack side bets: a plain {id: number} map; anything else is rejected rather than coerced.
+      let bjSides: Record<string, number> | undefined;
+      if (x.bjSides !== undefined && x.bjSides !== null) {
+        if (typeof x.bjSides !== 'object' || Array.isArray(x.bjSides) || Object.keys(x.bjSides).length > 30) throw new EngineError('Invalid side bets.');
+        bjSides = {};
+        for (const [k, v] of Object.entries(x.bjSides as Record<string, unknown>)) {
+          if (typeof k !== 'string' || k.length > 40 || typeof v !== 'number') throw new EngineError('Invalid side bets.');
+          bjSides[k] = v;
+        }
+      }
+      await e.placeBet(socket.data.player.id, x.actionId, { ante: x.ante, trips: x.trips ?? 0, pairs: x.pairs ?? 0, badBeat: x.badBeat ?? 0, progressive: x.progressive ?? 0, pairPlus: x.pairPlus ?? 0, sixCard: x.sixCard ?? 0, ...(bjSides ? { bjSides } : {}) });
     });
     on('bet:clear', async (e, p) => e.clearBet(socket.data.player.id, obj(p).actionId));
     on('player:ready', async (e, p) => e.setReady(socket.data.player.id, obj(p).actionId, obj(p).ready !== false));
@@ -408,6 +549,15 @@ export async function createApp(opts: AppOptions) {
     on('host:away', async (e, p) => e.setAway(socket.data.player.id, String(obj(p).playerId), obj(p).away !== false));
     on('host:endNight', async (e) => e.endNight(socket.data.player.id));
     on('host:game', async (e, p) => e.setGame(socket.data.player.id, obj(p).game));
+    on('host:dealer', async (e, p) => e.setDealer(socket.data.player.id, obj(p)));
+    // §32: a player's own roast consent (personal targeting, max intensity). Never changes anyone else's settings.
+    on('roast:prefs', async (e, p) => {
+      const c = e.roast.setConsent(socket.data.player.id, p);
+      const seat = e.seatOf(socket.data.player.id);
+      if (seat) e.roast.maybeGreet(seat.playerId, seat.name);
+      return c;
+    });
+    on('bj:act', async (e, p) => { const o = obj(p); return e.bjAct(socket.data.player.id, String(o.actionId), String(o.handId), o.action as never, o.hand === undefined ? undefined : Number(o.hand), o.amount === undefined ? undefined : Number(o.amount)); });
     on('host:standUp', async (e, p) => e.standUp(socket.data.player.id, String(obj(p).playerId)));
     on('host:settings', async (e, p) => e.updateSettings(socket.data.player.id, obj(p)));
 
@@ -420,15 +570,18 @@ export async function createApp(opts: AppOptions) {
       if (!text) return reply({ ok: false, error: 'Empty message.' });
       const me = socket.data.player;
       manager.pushChat(code, { id: newId(), at: Date.now(), kind: 'player', playerId: me.id, name: me.name, text });
+      manager.tables.get(code)?.roast.onChat(me.id, me.name, text);   // §32: brag/challenge detection only
+      cosmetics.tableTalk(me.id).then((ok) => ok && announceEarned(me.id, ['table-talk'])).catch(() => {});
       reply({ ok: true });
     });
     socket.on('chat:react', (p, ack) => {
       const reply = typeof ack === 'function' ? ack : () => {};
       const code = socket.data.code;
-      const reaction = obj(p).reaction as Reaction;
-      if (!code || !REACTIONS.includes(reaction)) return reply({ ok: false, error: 'Invalid reaction.' });
+      const reaction = String(obj(p).reaction ?? '') as Reaction;
+      const e = code ? manager.tables.get(code) : undefined;
+      const pack = REACTION_SETS[e?.looks.get(socket.data.player.id)?.equipped.emotes ?? 'emotes-classic'] ?? [];
+      if (!code || !((REACTIONS as readonly string[]).includes(reaction) || pack.includes(reaction))) return reply({ ok: false, error: 'Invalid reaction.' });
       if (!reactBucket.take()) return reply({ ok: false, error: 'Slow down.' });
-      const e = manager.tables.get(code);
       const seat = e?.seatOf(socket.data.player.id)?.seat ?? null;
       for (const s of manager.sockets.get(code) ?? []) s.emit('chat:reaction', { playerId: socket.data.player.id, seat, reaction });
       reply({ ok: true });
@@ -438,7 +591,7 @@ export async function createApp(opts: AppOptions) {
   });
 
   return {
-    app, http, io, manager, store,
+    app, http, io, manager, store, cosmetics,
     async close() {
       for (const t of manager.tables.values()) t.dispose();
       io.close();

@@ -12,15 +12,16 @@
     "dev:server": "tsx watch src/server/index.ts",
     "dev:client": "vite",
     "db:migrate": "tsx src/server/migrate.ts",
-    "build": "vite build && tsc -p tsconfig.server.json",
+    "build": "node scripts/count-files.mjs && vite build && tsc -p tsconfig.server.json",
     "start": "node dist/server/server/index.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run",
+    "test": "node scripts/count-files.mjs && vitest run",
     "test:unit": "vitest run tests/unit",
     "test:integration": "vitest run tests/integration",
     "test:e2e": "npm run build && playwright test",
     "db:up": "docker compose up -d db",
-    "test:all": "vitest run && npm run test:e2e"
+    "test:all": "vitest run && npm run test:e2e",
+    "check:files": "node scripts/count-files.mjs"
   },
   "dependencies": {
     "@fontsource/barlow-semi-condensed": "^5.3.0",

@@ -3,13 +3,16 @@
 What was actually run, where, and what it proved — and what was not tested.
 
 **Environment:** Linux, Node.js 22.23, PostgreSQL 16 (local), Google Chrome for Testing 153; latest full run 8 November 2026.
-**Result:** 286 of 286 automated tests passed (8 November 2026, final run): 274 in Vitest and 12 browser tests in Playwright.
+**Result:** 320 of 320 automated tests passed (8 November 2026, final run): 307 in Vitest and 13 browser tests in Playwright. Tracked project files: **97** (cap 99).
 
 ```
 npx tsc --noEmit                 → no type errors (client, server, shared, tests)
-npm test  (Vitest)               → 2 files, 274 tests passed   (unit + multiplayer integration on PostgreSQL 16)
-npm run test:e2e (Playwright)    → 12 tests passed in real Chrome against the production build (7.7 min)
+node scripts/count-files.mjs     → OK: 97 tracked project files (cap 99)
+npm test  (Vitest)               → 2 files, 307 tests passed   (unit + multiplayer integration on PostgreSQL 16)
+npm run test:e2e (Playwright)    → 13 tests passed in real Chrome against the production build (8.8 min)
 ```
+
+Update 8 November 2026 (§33–§39 release): payout audit and corrections, Three Card Poker stored-rank fix and new Three Card Progressive, all Stadium UTH tables, UTH Progressive V2, a shared progressive service with separate meters and a High Roller profile, the Blackjack side-bet catalog with Bonus Bets panel, host presets and bonus statistics, 900 new dealer lines, and a 99-file guard — section 1k. Final runs: Vitest 307/307, Playwright 13/13. One Vitest run made while the six-browser Playwright suite was running timed out twice in the §25 rotation tests (waiting for a hand to settle); the same suite passed 307/307 when run on its own afterwards. In that Playwright run the old side-bet browser test failed only because pay tables were renamed to their Stadium ids (“UP-04”, “BB-01”); the expectation was updated and the final full run passed.
 
 Update 8 November 2026 (99-file layout): the project was consolidated to exactly 99 files with no change to app behavior. The 36 roast-line files became `src/shared/roast/lines.ts`; the 13 unit test files became `tests/unit/all.test.ts`; the 14 integration test files became `tests/integration/all.test.ts`, with each former file as its own `describe` section in the original order; and a stray demo log was removed. Re-run after the change: type check clean; Vitest 274/274, the same tests as before; production build OK; the §32 browser test passed against the new build. The full 12-test browser suite was not rerun after this layout-only change; its last full run (12/12) was on the same app code just before it.
 
@@ -24,6 +27,51 @@ Update 7 November 2026: more pawn variety — 15 items at every $1,000 step to $
 Update 6 November 2026: avatars, Style Credits and the Casino Boutique (§24) — section 1h.
 
 Earlier update: refinement pass — Progressive/Envy audit under concurrency, rules version, Sit Out / Sit Back In, same bet every hand, decision countdowns and action tags, Tonight running tab and night recap, chips check, results presentation, six-browser test, restore code — section 1f.
+
+## 1k. Payout audit, progressives, Blackjack side bets and the 99-file cap (scope addenda §33–§39)
+
+**Status:** every *enabled* game and wager below passed its payout tests. Wagers whose published tables could not be verified are **disabled** (listed at the end), not approximated.
+
+### §35 Three Card Poker defect — what was found and fixed
+* **Reproduced exactly** (unit + live-table integration test): player 8♠ 8♥ 8♦ vs dealer A♣ J♣ 6♣. The settlement code (`settleTcp`) already ranked Three of a Kind above Flush and paid correctly: Ante 1:1, Play 1:1, Ante Bonus 4:1, Pair Plus 30:1 (default table). Reversed hands lose correctly. A 6×6 category matrix, kickers, A-K-Q / A-2-3 straights (no wrap), ties and Queen-high qualification are all tested.
+* **Defect 1 — stored ranking:** `TCP_EQUIV_RANK` stored Three Card hands on a five-card scale (Flush 5 > Straight 4 > Three of a Kind 3). Best-hand stats, "hand of the night" and history ordering therefore placed a Flush above Three of a Kind. **Fix:** stored rank now follows Three Card order (`TCP_STORED_RANK`); migration 013 rewrites existing settled TCP rows. Test: the live repro hand is stored with rank 4 and reported as the best hand.
+* **Defect 2 — Progressive:** Three Card Poker had **no progressive at all** (the circle belonged to Hold’em and was refused at TCP tables), so no Three Card Progressive could ever pay. **Fix:** Three Card Poker Progressive Link (Nevada) with its own meter; PT7 default. It reads only the player’s three cards and is resolved whatever the Ante/Play outcome or a fold (Nevada: “always resolved regardless of the outcome of the main theme”). Test: Three of a Kind at $5 pays 500 chips total, the $5 not returned.
+
+### Verified payout matrix (implemented code checked against the source; X:1 = winnings plus stake back; “for 1” = total paid, stake not returned)
+| Game / wager | Table(s) | Source | Profile | Payouts | Convention | Fold / qualification |
+|---|---|---|---|---|---|---|
+| UTH Blind | — | WSGC Stadium UTH | source-accurate | RF 500, SF 50, 4K 10, FH 3, Fl 3:2, St 1; win below St pushes | X:1 (3:2 rounded down to $1) | lost on fold |
+| UTH Trips | UTH-01…05 (default 02) | WSGC Stadium UTH, “Trips Bonus” | source-accurate | 01: 50/40/30/9/7/4/3 · 02: 50/40/30/8/6/5/3 · 03: 50/40/30/8/7/4/3 · 04: 50/40/20/7/6/5/3 · 05: 50/40/30/7/6/5/3 | X:1 | pays on folded hands |
+| UTH Ultimate Pairs | UP-01…06 (default UP-04) | WSGC Stadium UTH paytables 1–6; MLGCA v1.5 B/D | source-accurate | 01: AA30 AKs25 AQ/AJs20 AKo15 KK–JJ10 AQ/AJo5 22–TT3 · 02: as 01 + both-aces 1000 · 03: AA30 A+face s20 o10 pair5 · 04: A♥A♦100 AA30 20/10 pair4 · 05: A♥A♦50 AA25 20/10 pair5 · 06: AA25 20/10 pair5 | X:1, highest row once | dealer-card row never confirmed before the reveal |
+| UTH Bad Beat | BB-01…03 (default BB-01) | WSGC Stadium UTH; CA BGC | source-accurate | SF 10000/7500/2500 · 4K 500 · FH 40/50/50 · Fl 25/30/30 · St 20 · Trips 9 | X:1 on the LOSING hand | ties never qualify; losing hand ≥ Trips; full kickers |
+| UTH Progressive | Five Card ($5) | Hollywood PNRC guide; WSGC Paytable 01 | source-accurate pays; seed/rate operator | RF 100% · SF 10% · 4K $1,500 · FH $250 · Fl $200 · St $150 · Trips $45; Envy $5,000/$1,500 | for 1 | live after fold |
+| UTH Progressive | V2 ($1) | Wizard of Odds “Small Progressive” (Nevada V2 PDF not readable here) | pays per WoO; seed/rate operator | hidden RF 100% (+$100 Envy) · board RF 1,000 · SF 250 · 4K 75 · FH 10 (per $1) | for 1; highest only | live after fold; board royal never drains meter |
+| TCP Ante/Play | — | Wizard of Odds | source-accurate | 1:1; dealer Q-high qualifies; not qualified: Ante 1:1, Play push | X:1 | fold loses Ante |
+| TCP Ante Bonus | — | Wizard of Odds Table 1 | source-accurate | SF 5, Trips 4, St 1 | X:1 | needs a Play bet |
+| TCP Pair Plus | pp-1…10, pp-mr1…6 (default pp-8) | Wizard of Odds Pairplus tables | source-accurate | e.g. pp-8: 40/30/6/3/1; Mini Royal tables add A-K-Q suited (80/50/50/200/100/50) | X:1 | pays on fold |
+| TCP Six Card Bonus | 1000/200/100/20/15/10/7 | Wizard of Odds | source-accurate | standard five-card ranks, best 5 of 6 | X:1 | pays on fold |
+| TCP Progressive | PT1b, PT2b, PT3a, PT6, PT7 (default), PT8 | Nevada Three Card Poker Progressive Link | pays source-accurate; High Roller custom | A-K-Q jackpot suit 100% · A-K-Q other 500 · SF 70/100/75/80/120/100 · Trips 60/90/50/60/100/50 · St 6/–/5/7/–/6 (per $1) | for 1 | independent of main result and fold |
+| BJ main | 3:2 natural, 1:1 win, insurance 2:1, push | existing §27 rules | — | six decks, S17, peek, DAS, split to 4, one card to split aces | X:1 | — |
+| BJ Perfect Player / Dealer Pairs | All Bets 25/12/6; Player also PA Paytable B 30/10/5 | NV All Bets Blackjack; PA §633c.1 | **adapted six-deck** | perfect / coloured / mixed | X:1 | dealer pairs settle with the hole card |
+| BJ 21+3 | All Bets 100/40/30/10/5 | NV All Bets | adapted six-deck | suited trips / SF / trips / straight / flush | X:1 | after the deal |
+| BJ Top 3 | All Bets 270/180/90; PA second table 1000/100/70 | NV All Bets; PA §633c.7 | adapted six-deck | suited trips / SF / trips | X:1 | independent of 21+3 |
+| BJ Buster | All Bets 2000/800/250/50/18/4/2 | NV All Bets; PA §633c.13 | adapted six-deck | 8+ w/ BJ, 7 w/ BJ, 8+, 7, 6, 5, 3–4 cards | X:1 | no extra draws: dealer not drawing ⇒ no bust ⇒ loses |
+| BJ Lucky Lucky | All Bets 200/100/50/25/15/3/2/2 | NV All Bets | adapted six-deck | suited 777, suited 678, 777, 678, suited 21, 21, 20, 19 | X:1 | ace counts as in Blackjack (source silent) |
+| BJ Lucky Ladies | PT-FLTLL-01/02/03 | NV Lucky Ladies V7 App. A | source-accurate | Q♥ pair + dealer BJ 1000 · Q♥ pair 200/150/125 · matched 20/25/20 · suited 20/10/9 · any 20 4 | X:1 | settles with the hole card |
+| BJ Match the Dealer | six-deck 22/15/11/8/4 | Las Vegas Advisor (secondary) | six-deck only | 2 suited / suited+unsuited / 1 suited / 2 unsuited / 1 unsuited | X:1 | after the deal |
+| BJ 21+3 Progressive | PT-PRG-213-16 | NV 21+3 Progressive V5 | pays source-accurate; High Roller custom default | Mini Royal jackpot suit 100% · Mini Royal 500 · SF 75 · Trips 30 · St 5; Flush loses (per $1) | for 1 | independent of the hand and of ordinary 21+3 |
+
+**Discrepancies found and corrected:** (1) TCP stored rank (above); (2) no TCP progressive (above); (3) the UP-02 / UP-04 names were “Bonus 2/4” and Bad Beat “Bonus 01/02” — renamed to the Stadium identifiers and the missing UP-01/03/05/06 and BB-03 added; (4) Trips had one table — the five Stadium configurations are now selectable; (5) the progressive wager size was hard-coded at $5 in validation and on screen — it now follows the table’s variant/profile. No discrepancy was found in the Blind, Ante/Play, existing UP-02/UP-04 rows, BB-01/02 rows, Pair Plus default or Six Card tables.
+
+**Unverified — disabled in the betting menu (shown as unavailable with the reason):** Royal Match, Super Sevens, Blazing 7’s, Hot 3, Super 4, an Ace-combination Progressive Blackjack, Lucky Ladies PT-FLTLL-04 (garbled columns in the source), Three Card Poker Bad Beat Progressive and Bad Beat Bonus (Nevada PDFs are scanned images with no text layer). The UP-02 placement of the 1,000:1 both-aces award follows the scope and MLGCA Paytable B; the WSGC text layer does not say which of its first two columns holds it.
+
+**Progressive Envy** is used only where the source names it: Five Card (both sources), UTH V2 (hidden royal, $100 per $1), TCP PT1b/2b/6/7 ($100/$25 per $1 — Nevada lists Envy for these tables without stating the base; the amounts are the Wizard of Odds figures for the same table). None on PT3a, PT8 or 21+3 Progressive.
+
+**Tests added** (all passing): unit — the §35 repro both ways, the 6×6 matrix, kickers/straights/ties/qualification, stored-rank order, Mini Royal handling, every Pair Plus table (positive + negative per row), every Six Card row, all five Trips configurations, Blind, all six Ultimate Pairs schedules (A♥A♦, both aces, dealer-pending), all three Bad Beat schedules both ways plus ties and kickers, UTH V2 categories and Envy, meter separation and High Roller scaling, percentage/multiple-winner/seed handling, 21+3 Progressive categories, every Blackjack side bet row, validation (closed wager, limits, whole dollars, insufficient bankroll), host preset parsing, and the 99-file cap. Integration (PostgreSQL) — six players with six different side-bet mixes on a rigged shoe (every result, stats endpoint, progressive history, stored rules profile, ledger reconciliation), dealer blackjack before play, every hand busting (no extra dealer card; Buster loses), rebet after the host changes the menu, four tables claiming the 21+3 jackpot at once (paid once each, serialized, conservation exact, retries never pay twice), restart refunds with side bets and meter contribution reversal, and the §35 repro at a live table. Browser — six players in Chrome, each choosing a different mix in the Bonus Bets panel; every recorded result is re-derived from the hand’s actual cards.
+
+**Not covered by a dedicated test:** a dealer rotation triggered specifically by a Blackjack bonus win (rotation uses the round’s total net, which now includes side-bet payouts; the §25 rotation tests are unchanged); a High-Roller house-edge figure (deliberately not shown); the progressive Envy for TCP at a live multi-player table (covered at unit level).
+
+**File count:** 97 tracked files (cap 99), checked by `scripts/count-files.mjs` in `npm run build`, `npm test` and a unit test. To make room, the six documentation screenshots became one contact sheet (`docs/screenshots.jpg`).
 
 ## 1j. Dealer Roast Engine (scope addendum §32, v2 "No Mercy", §32.13 library) — library complete
 
@@ -262,7 +310,7 @@ The test harness runs `npm run build`, boots `node dist/server/server/index.js` 
 
 4. **Side bets in the browser.** Pay tables shown before betting; Bad Beat without Trips+ shows an error; desktop places all three bonus bets and sees "On the table $65 · Reserved for 1× Play $25"; on the iPhone the bonus circles stay hidden until the Bonus bets panel is opened; the other player sees the bonus amount on the felt; bonus circles are disabled after the deal and the phone panel collapses; the result lists every wager and a separate "Main game / Bonus bets" subtotal; the displayed balance equals $1,000 − $50 + the bonus-bet result.
 
-Screenshots from these runs (desktop and iPhone, settled hand) are in `docs/screenshots/`.
+Screenshots from these runs (desktop and iPhone, settled hand) are in `docs/screenshots.jpg` (one contact sheet).
 
 ## Not tested / limitations
 

@@ -66,6 +66,18 @@ export const sfx = {
   lose() { if (!on()) return; const t = now(); tone(196, 'sine', t, 0.3, 0.1); tone(147, 'sine', t + 0.14, 0.4, 0.08); },
   push() { if (!on()) return; const t = now(); tone(440, 'sine', t, 0.15, 0.06); tone(440, 'sine', t + 0.2, 0.15, 0.05); },
   tick() { if (!on()) return; tone(1200, 'square', now(), 0.03, 0.02); },
+  /** A dealer's short "voice" cue: two soft syllables at the dealer's pitch, scaled by the table's dealer volume. */
+  voice(pitch: number, volume: number) {
+    if (!on() || volume <= 0) return;
+    const t = now(), v = 0.05 * Math.min(1, volume / 100);
+    tone(260 * pitch, 'triangle', t, 0.12, v); tone(330 * pitch, 'triangle', t + 0.11, 0.16, v * 0.8);
+  },
+  /** Dealer hand-over chime. */
+  shift(volume: number) {
+    if (!on() || volume <= 0) return;
+    const t = now(), v = 0.06 * Math.min(1, volume / 100);
+    [784, 659, 523, 659, 784].forEach((f, i) => tone(f, 'sine', t + i * 0.11, 0.25, v));
+  },
   notify() { if (!on()) return; const t = now(); tone(880, 'sine', t, 0.12, 0.05); tone(1320, 'sine', t + 0.08, 0.15, 0.04); },
 };
 

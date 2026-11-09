@@ -8,6 +8,10 @@ import { restore, session } from './api.js';
 import { mountHome } from './ui/home.js';
 import { mountStats } from './ui/stats.js';
 import { mountTable } from './ui/table.js';
+import { mountCreator } from './ui/creator.js';
+import { mountBoutique } from './ui/boutique.js';
+import { setEarnedToast } from './cosmetics.js';
+import { REWARD } from '../shared/cosmetics.js';
 import { toast } from './dom.js';
 
 const root = document.getElementById('app')!;
@@ -15,7 +19,11 @@ let current: { dispose(): void } | null = null;
 
 function nav(path: string, replace = false) {
   if (replace) history.replaceState(null, '', path); else history.pushState(null, '', path);
-  route();
+  setEarnedToast((ids) => {
+  const rs = ids.map((id) => REWARD.get(id)).filter(Boolean);
+  if (rs.length) toast(`✦ Style Credits: ${rs.map((r) => `${r!.name} +${r!.credits}`).join(' · ')}`, 'success', 5200);
+});
+route();
 }
 
 async function route(message?: string) {
@@ -34,6 +42,8 @@ async function route(message?: string) {
   }
   document.title = 'Ultimate Texas Hold’em';
   if (path === '/stats' && me) return mountStats(root, nav);
+  if (path === '/avatar' && me) { document.title = 'Character Creator · Ultimate Texas Hold’em'; current = mountCreator(root, nav); return; }
+  if (path === '/boutique' && me) { document.title = 'Casino Boutique · Ultimate Texas Hold’em'; current = mountBoutique(root, nav); return; }
   if (path !== '/') history.replaceState(null, '', '/');
   mountHome(root, nav, { message });
 }
