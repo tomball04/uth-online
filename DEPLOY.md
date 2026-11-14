@@ -11,6 +11,7 @@ Environment variables:
 | `DATABASE_URL` | yes (production) | Postgres connection string. Append `?sslmode=require` if your provider requires TLS from outside its network. |
 | `PORT` | set by most hosts | Listening port (default 3000). |
 | `TRUST_PROXY` | `1` behind a TLS proxy | Uses `X-Forwarded-For` for per-IP rate limits. |
+| `SPOTIFY_CLIENT_ID` | optional | Client ID of your Spotify developer app — turns on **Table music** (listen along with the host). Public value, not a secret. Leave empty to hide the feature. See *Table music (Spotify)* below. |
 | `ALLOWED_ORIGINS` | optional | Comma-separated origins allowed to open sockets from a different domain. Leave empty when the client is served by this same app (the normal setup). |
 
 Health check: `GET /api/health`.
@@ -78,6 +79,17 @@ Set any of these as environment variables (JSON). Leave them out to use the buil
 * `COSMETIC_UNAVAILABLE` — item ids to hide from the Boutique, e.g. `["tux-white"]`. Owners keep them.
 
 Item and reward ids are listed in `src/shared/cosmetics.ts`.
+
+## Table music (Spotify)
+
+Each person listens on **their own** Spotify account; the server relays only the track and position (no audio, no tokens). To turn it on:
+
+1. Sign in at <https://developer.spotify.com/dashboard> with a **Spotify Premium** account (Spotify requires Premium for the app owner since February 2026) and create an app. Tick **Web API** and **Web Playback SDK**.
+2. Add a Redirect URI of exactly `https://<your-domain>/spotify-callback` (for example `https://uth-online.onrender.com/spotify-callback`). Spotify only accepts HTTPS, or `http://127.0.0.1:<port>/spotify-callback` for local testing — not `localhost`.
+3. Under **User Management**, add the Spotify email of everyone who will listen. In Development Mode Spotify allows **up to 5 users per app**, and each of them needs Premium to play.
+4. Copy the app's **Client ID** into `SPOTIFY_CLIENT_ID` (Render: *Environment*), and redeploy. No client secret is used — sign-in is PKCE in the browser, and tokens stay on each person's device.
+
+More than 5 listeners needs Spotify's extended quota, which Spotify currently grants only to registered businesses. The content security policy already allows `sdk.scdn.co`, `api.spotify.com`, `accounts.spotify.com` and `i.scdn.co`; nothing else is opened.
 
 ## What the newer releases add to the database
 

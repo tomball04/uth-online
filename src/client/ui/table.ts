@@ -25,6 +25,7 @@ import { portrait, setPortrait, loadMine, credits } from '../cosmetics.js';
 import { REACTION_SETS, ITEM } from '../../shared/cosmetics.js';
 import type { PublicLook } from '../../shared/cosmetics.js';
 import { openReplay } from './replay.js';
+import { mountMusic } from './music.js';
 import { loadRoastLibrary, showRoast, speak } from '../roast.js';
 import { ATTITUDE_LABEL, ATTITUDE_LABEL_CLEAN } from '../../shared/roast/meta.js';
 import { DEALER } from '../../shared/dealers.js';
@@ -111,12 +112,15 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
   // Phones: one tidy row — back, name, jackpot, chat, and a menu for everything else.
   const moreBtn = h('button', { class: 'ghost more-btn', 'aria-label': 'Table menu', title: 'Table menu', onclick: () => openMoreMenu() }, '☰');
   const chatBtn = h('button', { class: 'ghost panel-toggle', onclick: () => togglePanel('chat') }, 'Chat');
+  // §40 Spotify listen-along: the host shares a track, everyone plays it on their own Spotify.
+  const music = mountMusic({ code, isHost: () => !!view?.you.isHost, solo: () => !!view?.config.solo });
   const top = h('header', { class: 'tbar' },
     h('button', { class: 'ghost back-btn', 'aria-label': 'Back to the lobby', onclick: () => leave() }, '←', h('span', { class: 'hide-m' }, ' Lobby')),
     h('div', { class: 'tbar-title' }, tableName, h('button', { class: 'code', title: 'Copy invitation link', onclick: () => invite() }, code)),
     statusPill, jackpotSign,
     h('div', { class: 'tbar-actions' },
       h('button', { class: 'ghost hide-m', onclick: () => invite() }, 'Invite'),
+      music.button,
       chatBtn,
       h('button', { class: 'ghost panel-toggle hide-m', onclick: () => togglePanel('night') }, 'Tonight'),
       h('button', { class: 'ghost panel-toggle hide-m', onclick: () => togglePanel('table') }, 'History'),
@@ -139,6 +143,7 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
         return me.sitOut ? item('Sit back in', 'Get dealt in from the next hand', () => setSitOut(false))
           : item('Sit out', 'Keep your seat and chips, skip hands', () => setSitOut(true));
       })(),
+      !music.button.hidden ? item('Table music', 'Listen along to the host’s Spotify', () => music.openPanel()) : null,
       item('Settings', 'Sound, animations, strategy trainer', () => openSettings({ inTable: true, view: () => view })),
       item('How to play', 'Rules and pay tables', () => openHelp()),
       view?.config.game === 'bj' ? item('Blackjack practice', 'Drill basic strategy — no chips', () => openBjTrainer(!!view?.config.bjSurrender)) : null,
@@ -341,7 +346,7 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
   // ---------------------------------------------------------------- socket wiring
   const handlers = {
     state: (v: TableView) => {
-      clockOffset = v.serverNow - Date.now(); prev = view; view = v; render();
+      clockOffset = v.serverNow - Date.now(); prev = view; view = v; render(); music.render();
       syncConsent(); maybeAskConsent(v);
       // Keep the running tab current: refresh once per settled hand while it's on screen.
       if (v.phase === 'settled' && prev?.phase !== 'settled' && isPanelVisible('night')) setTimeout(refreshNight, 300);
@@ -439,6 +444,7 @@ export function mountTable(root: HTMLElement, code: string, onExit: (msg?: strin
     sock.off('hand:analysis', handlers.analysis);
     sock.off('table:closed', handlers.closed);
     sock.off('kicked', handlers.kicked);
+    music.dispose();
     offStatus();
     setCurrentTable(null);
     setTableTheme(null);

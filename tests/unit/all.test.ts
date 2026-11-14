@@ -21,7 +21,7 @@ import { BONUS, CATEGORIES, EXTRA, FACTS, PRIMARY, type RoastPayload } from '../
 import { cleanText, fill, profanityOf } from '../../src/shared/roast/render';
 import { viewRoast } from '../../src/shared/roast/view';
 import { RoastDirector, type RoundFacts, type RoundPlayer, grudgePhrase } from '../../src/server/roast';
-import { type DecisionRecord } from '../../src/shared/protocol';
+import { type DecisionRecord, musicPosition, parseMusicNow } from '../../src/shared/protocol';
 import { BAD_BEAT_VARIANTS, PAIRS_VARIANTS, evaluatePairs, previewPairs } from '../../src/shared/sidebets';
 import { ANTE_BONUS, PAIR_PLUS, SIX_CARD, evaluate3, settleTcp, tcpBasicPlay, tcpExactEV, tcpHandName, tcpQualifies } from '../../src/shared/tcp';
 
@@ -1760,5 +1760,32 @@ describe('payouts', () => {
       expect(r.total).toBeLessThanOrEqual(99);
       expect(r.files.some((f: string) => f.startsWith('node_modules/') || f.startsWith('dist/'))).toBe(false);
     });
+  });
+});
+
+describe('music', () => {
+  const ok = { uri: 'spotify:track:4uLU6hMCjMI75M1A2tKUQC', name: 'Song', artist: 'Band', art: 'https://i.scdn.co/image/ab67616d00001e02abc123', durationMs: 200_000, progressMs: 30_000, isPlaying: true };
+  it('accepts a plain Spotify track and keeps only safe fields', () => {
+    expect(parseMusicNow({ ...ok, extra: 'x' })).toEqual(ok);
+    expect(parseMusicNow({ ...ok, progressMs: 999_999 })!.progressMs).toBe(200_000);          // clamped to the track
+    expect(parseMusicNow({ ...ok, name: 'A\u0000B'.padEnd(300, 'z') })!.name).toHaveLength(120);
+  });
+  it('rejects anything that is not a Spotify track URI or has bad numbers', () => {
+    for (const uri of ['spotify:episode:4uLU6hMCjMI75M1A2tKUQC', 'spotify:track:short', 'https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC', 'spotify:track:4uLU6hMCjMI75M1A2tKUQC<'])
+      expect(parseMusicNow({ ...ok, uri })).toBeNull();
+    expect(parseMusicNow({ ...ok, durationMs: -1 })).toBeNull();
+    expect(parseMusicNow({ ...ok, progressMs: Number.NaN })).toBeNull();
+    expect(parseMusicNow(null)).toBeNull();
+  });
+  it('only Spotify CDN artwork is kept (no arbitrary image URLs reach other players)', () => {
+    expect(parseMusicNow({ ...ok, art: 'https://evil.example/x.png' })!.art).toBeNull();
+    expect(parseMusicNow({ ...ok, art: 'javascript:alert(1)' })!.art).toBeNull();
+  });
+  it('listener position follows the host clock while playing and holds while paused', () => {
+    const m = { ...ok, hostId: 'h', hostName: 'H', at: 1_000 };
+    expect(musicPosition(m, 6_000)).toBe(35_000);
+    expect(musicPosition({ ...m, isPlaying: false }, 60_000)).toBe(30_000);
+    expect(musicPosition(m, 10_000_000)).toBe(200_000);
+    expect(musicPosition(m, 0)).toBe(30_000);                                                  // clock skew never rewinds
   });
 });

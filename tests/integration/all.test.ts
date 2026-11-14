@@ -2349,3 +2349,90 @@ describe('bonus', () => {
     });
   });
 });
+
+describe('music', () => {
+  type S = Awaited<ReturnType<typeof startServer>>;
+  const track = (id: string, extra: object = {}) => ({ uri: `spotify:track:${id.padEnd(22, 'A')}`, name: `Song ${id}`, artist: 'Band', art: null, durationMs: 180_000, progressMs: 10_000, isPlaying: true, ...extra });
+  const last = (c: TC) => [...c.events].reverse().find((e) => e.ev === 'music:state')?.args[0] as { music: any; serverNow: number } | undefined;
+  const waitMusic = async (c: TC, pred: (m: any) => boolean) => { await c.waitState(() => { const l = last(c); return !!l && pred(l.music); }, 3000, 'music'); return last(c)!.music; };
+  let s: S; let code: string; let host: TC; let guest: TC;
+  beforeAll(async () => {
+    s = await startServer({ memory: true });
+    host = await s.player('Hana'); guest = await s.player('Gus');
+    code = await s.createTable(host.token);
+    await host.join(code); await guest.join(code);
+    await host.waitState((v) => !!v.seats[1]);
+  });
+  afterAll(() => s.stop());
+
+  it('exposes only the public Spotify client id (empty when not configured)', async () => {
+    const r = await fetch(`${s.url}/api/music/config`);
+    expect(await r.json()).toEqual({ spotifyClientId: '' });
+  });
+
+  it('the CSP allows exactly the Spotify SDK, API and artwork hosts', async () => {
+    const csp = (await fetch(`${s.url}/api/health`)).headers.get('content-security-policy')!;
+    expect(csp).toContain("script-src 'self' https://sdk.scdn.co");
+    expect(csp).toContain('frame-src https://sdk.scdn.co');
+    expect(csp).toContain('https://api.spotify.com https://accounts.spotify.com');
+    expect(csp).toContain("img-src 'self' data: https://i.scdn.co");
+    expect(csp).toContain("frame-ancestors 'none'");
+  });
+
+  it('a joiner gets the current (empty) music state', async () => {
+    expect(last(guest)).toMatchObject({ music: null });
+  });
+
+  it('only the host can share; everyone at the table receives it, server-stamped', async () => {
+    expect((await guest.emit('music:now', track('g1')))).toMatchObject({ ok: false, error: 'Only the host can share music.' });
+    expect((await host.emit('music:now', { ...track('x'), uri: 'spotify:episode:abc' })).ok).toBe(false);
+    const t0 = Date.now();
+    expect((await host.emit('music:now', track('a1'))).ok).toBe(true);
+    const m = await waitMusic(guest, (x) => x?.name === 'Song a1');
+    expect(m).toMatchObject({ hostId: host.id, hostName: 'Hana', progressMs: 10_000, isPlaying: true });
+    expect(m.at).toBeGreaterThanOrEqual(t0);
+    await guest.waitState(() => guest.chat.some((c) => /Hana is playing Song a1/.test(c.text)), 2000);
+    // A play/pause update for the same track doesn't repeat the chat line.
+    expect((await host.emit('music:now', track('a1', { isPlaying: false, progressMs: 20_000 }))).ok).toBe(true);
+    await waitMusic(guest, (x) => x?.isPlaying === false);
+    expect(guest.chat.filter((c) => /is playing Song a1/.test(c.text))).toHaveLength(1);
+  });
+
+  it('a spectator who joins later receives what is playing', async () => {
+    const sp = await s.player('Sid');
+    await sp.join(code, true);
+    expect((await waitMusic(sp, (x) => !!x)).name).toBe('Song a1');
+  });
+
+  it('is rate limited', async () => {
+    const rs = await Promise.all(Array.from({ length: 8 }, () => host.emit('music:now', track('a1'))));
+    expect(rs.some((r) => r.ok === false && r.error === 'Slow down.')).toBe(true);
+  });
+
+  it('only the host can stop it; stopping clears it for everyone', async () => {
+    expect((await guest.emit('music:stop')).ok).toBe(false);
+    expect((await host.emit('music:stop')).ok).toBe(true);
+    await waitMusic(guest, (x) => x === null);
+  });
+
+  it('sharing ends when the host leaves (hosting passes on)', async () => {
+    await new Promise((r) => setTimeout(r, 4000));   // let the rate limit refill
+    expect((await host.emit('music:now', track('b2'))).ok).toBe(true);
+    await waitMusic(guest, (x) => x?.name === 'Song b2');
+    await host.emit('table:leave');
+    await waitMusic(guest, (x) => x === null);
+    await guest.waitState((v) => v.you.isHost);
+    // The new host can share; the old one (no longer at the table) cannot.
+    expect((await guest.emit('music:now', track('c3'))).ok).toBe(true);
+    expect((await host.emit('music:now', track('c4'))).ok).toBe(false);
+  }, 15_000);
+
+  it('tables never see each other’s music', async () => {
+    const other = await s.player('Oz');
+    const code2 = await s.createTable(other.token);
+    await other.join(code2);
+    await new Promise((r) => setTimeout(r, 200));
+    expect(last(other)?.music ?? null).toBeNull();
+    expect(other.events.filter((e) => e.ev === 'music:state' && (e.args[0] as any).music)).toHaveLength(0);
+  });
+});

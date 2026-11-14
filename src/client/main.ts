@@ -13,6 +13,7 @@ import { mountBoutique } from './ui/boutique.js';
 import { setEarnedToast } from './cosmetics.js';
 import { REWARD } from '../shared/cosmetics.js';
 import { toast } from './dom.js';
+import { finishSpotifyLogin } from './ui/music.js';
 
 const root = document.getElementById('app')!;
 let current: { dispose(): void } | null = null;
@@ -30,6 +31,8 @@ async function route(message?: string) {
   current?.dispose();
   current = null;
   const path = location.pathname;
+  // §40 Spotify sends the browser back here after sign-in; finish it and return to the table.
+  if (path === '/spotify-callback') return nav(await finishSpotifyLogin(), true);
   const tableMatch = path.match(/^\/table\/([A-Za-z0-9]{6,8})\/?$/);
   const me = session.me ? await restore() : null;
 

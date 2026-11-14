@@ -13,6 +13,8 @@ services:
         value: "22"
       - key: TRUST_PROXY
         value: "1"
+      - key: SPOTIFY_CLIENT_ID     # optional: table music (§40). Leave blank to hide it.
+        sync: false
       - key: DATABASE_URL
         fromDatabase:
           name: uth-db

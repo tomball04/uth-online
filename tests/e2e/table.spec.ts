@@ -841,3 +841,140 @@ test('§34: six players, six different bonus-bet mixes, every wager resolved ind
   for (const { page } of ps) expect(await bal(page)).toEqual(ref);
   for (const p of ps) expect(p.errors, p.name).toEqual([]);
 });
+
+// §40 Spotify listen-along. Spotify itself is mocked at the network edge (sign-in, token, Web API and the Web Playback
+// SDK script), so this checks OUR flow end to end: PKCE sign-in round trip, host sharing, relay, and listener sync.
+test('§40: host shares Spotify, a desktop listener plays it in the tab, a phone listener on their Spotify app', async ({ browser }) => {
+  const TRACK = { uri: 'spotify:track:4uLU6hMCjMI75M1A2tKUQC', name: 'Velvet Felt', artist: 'The Dealers', durationMs: 215_000 };
+  const host = await newPlayer(browser, 'Dj');
+  const desk = await newPlayer(browser, 'Desk');
+  const phone = await newPlayer(browser, 'Pho', 'iphone');
+  const hostPlayback = { isPlaying: true, progressMs: 42_000, at: Date.now() };
+  const plays: { who: string; url: string; body: any }[] = [];
+  const tokenBodies: string[] = [];
+
+  async function mockSpotify(p: { page: Page; name: string }) {
+    const ctx = p.page.context();
+    const cors = { 'access-control-allow-origin': '*', 'access-control-allow-headers': 'authorization, content-type', 'access-control-allow-methods': 'GET, PUT, POST, OPTIONS' };
+    await ctx.route('https://accounts.spotify.com/authorize?**', async (r) => {
+      const u = new URL(r.request().url());
+      expect(u.searchParams.get('code_challenge_method')).toBe('S256');
+      expect(u.searchParams.get('client_id')).toBe('e2e-spotify-client');
+      expect(u.searchParams.get('scope')).toContain('streaming');
+      await r.fulfill({ status: 302, headers: { location: `${u.searchParams.get('redirect_uri')}?code=code-${p.name}&state=${u.searchParams.get('state')}` } });
+    });
+    await ctx.route('https://accounts.spotify.com/api/token', async (r) => {
+      if (r.request().method() === 'OPTIONS') return r.fulfill({ status: 204, headers: cors });
+      tokenBodies.push(r.request().postData() ?? '');
+      await r.fulfill({ status: 200, headers: cors, contentType: 'application/json', body: JSON.stringify({ access_token: `tok-${p.name}`, refresh_token: 'r', expires_in: 3600 }) });
+    });
+    // A stand-in for Spotify's Web Playback SDK: a "device" whose state the mocked Web API sets.
+    await ctx.route('https://sdk.scdn.co/spotify-player.js', (r) => r.fulfill({ contentType: 'text/javascript', body: `
+      window.__sp = { state: null, ops: [] };
+      window.Spotify = { Player: class { constructor(o) { this.l = {}; this.o = o; }
+        addListener(e, f) { this.l[e] = f; } activateElement() {}
+        connect() { setTimeout(() => this.l.ready && this.l.ready({ device_id: 'dev-${p.name}' }), 50); return Promise.resolve(true); }
+        getCurrentState() { const s = window.__sp.state; if (!s) return Promise.resolve(null);
+          return Promise.resolve({ paused: s.paused, position: s.paused ? s.pos : s.pos + (Date.now() - s.t), track_window: { current_track: { uri: s.uri } } }); }
+        pause() { const s = window.__sp.state; s.pos += s.paused ? 0 : Date.now() - s.t; s.paused = true; window.__sp.ops.push('pause'); return Promise.resolve(); }
+        resume() { const s = window.__sp.state; s.paused = false; s.t = Date.now(); window.__sp.ops.push('resume'); return Promise.resolve(); }
+        seek(ms) { const s = window.__sp.state; s.pos = ms; s.t = Date.now(); window.__sp.ops.push('seek'); return Promise.resolve(); }
+        setVolume() { return Promise.resolve(); } disconnect() {} } };
+      setTimeout(() => window.onSpotifyWebPlaybackSDKReady && window.onSpotifyWebPlaybackSDKReady(), 10);` }));
+    await ctx.route('https://api.spotify.com/v1/**', async (r) => {
+      const req = r.request();
+      if (req.method() === 'OPTIONS') return r.fulfill({ status: 204, headers: cors });
+      expect(req.headers().authorization).toBe(`Bearer tok-${p.name}`);
+      const u = new URL(req.url());
+      const json = (b: unknown) => r.fulfill({ status: 200, headers: cors, contentType: 'application/json', body: JSON.stringify(b) });
+      if (u.pathname === '/v1/me/player/currently-playing') {
+        const pos = hostPlayback.isPlaying ? hostPlayback.progressMs + (Date.now() - hostPlayback.at) : hostPlayback.progressMs;
+        return json({ is_playing: hostPlayback.isPlaying, progress_ms: pos, currently_playing_type: 'track',
+          item: { type: 'track', uri: TRACK.uri, name: TRACK.name, duration_ms: TRACK.durationMs, artists: [{ name: TRACK.artist }], album: { images: [] } } });
+      }
+      if (u.pathname === '/v1/me/player/play') {
+        const body = JSON.parse(req.postData() ?? '{}');
+        plays.push({ who: p.name, url: u.search, body });
+        if (u.searchParams.get('device_id')) await p.page.evaluate((b) => { (window as any).__sp.state = { uri: b.uris[0], pos: b.position_ms, paused: false, t: Date.now() }; }, body);
+        return r.fulfill({ status: 204, headers: cors });
+      }
+      if (u.pathname === '/v1/me/player') {   // the phone's Spotify app, as last told to play
+        const last = [...plays].reverse().find((x) => x.who === p.name);
+        return last ? json({ is_playing: true, progress_ms: last.body.position_ms, item: { uri: last.body.uris[0] } }) : r.fulfill({ status: 204, headers: cors });
+      }
+      return r.fulfill({ status: 204, headers: cors });
+    });
+  }
+  for (const p of [host, desk, phone]) await mockSpotify(p);
+
+  await signIn(host.page, 'Dj');
+  await host.page.getByRole('button', { name: 'Create a private table' }).click();
+  await host.page.getByRole('button', { name: 'Create table' }).click();
+  await host.page.waitForURL(/\/table\/[A-Z0-9]{8}$/);
+  const path = new URL(host.page.url()).pathname;
+  await signIn(desk.page, 'Desk', path);
+  await signIn(phone.page, 'Pho', path);
+  await expect(host.page.locator('.seat:not(.empty-seat) .pname')).toHaveCount(3);
+
+  // Host: connect Spotify (PKCE round trip lands back at the same table) and share.
+  await host.page.getByRole('button', { name: 'Table music' }).click();
+  await host.page.getByRole('button', { name: 'Connect Spotify to share' }).click();
+  await host.page.waitForURL((u) => u.pathname === path);
+  expect(tokenBodies[0]).toMatch(/grant_type=authorization_code/);
+  expect(tokenBodies[0]).toMatch(/code_verifier=[A-Za-z0-9_-]{43,}/);
+  await expect(host.page.locator('.seat:not(.empty-seat) .pname')).toHaveCount(3);
+  await host.page.getByRole('button', { name: 'Table music' }).click();
+  await host.page.getByRole('button', { name: 'Share what I’m playing' }).click();
+  await expect(host.page.getByText('Sharing with the table.')).toBeVisible();
+  await host.page.keyboard.press('Escape');
+
+  // Everyone sees it: the top-bar button names the song, chat announces it.
+  await expect(desk.page.locator('.music-btn')).toContainText('Velvet Felt');
+  await expect(desk.page.locator('.chat-list').getByText('Dj is playing Velvet Felt — The Dealers').first()).toBeVisible();
+
+  // Desktop listener: sign in, "Listen here" → plays the host's track in this tab at the host's position.
+  await desk.page.getByRole('button', { name: 'Table music' }).click();
+  await desk.page.getByRole('button', { name: 'Connect Spotify to listen' }).click();
+  await desk.page.waitForURL((u) => u.pathname === path);
+  await desk.page.getByRole('button', { name: 'Table music' }).click();
+  await desk.page.getByRole('button', { name: 'Listen here' }).click();
+  await expect(desk.page.getByText('Listening along in this tab.')).toBeVisible();
+  const dp = plays.find((x) => x.who === 'Desk')!;
+  expect(dp.url).toBe('?device_id=dev-Desk');
+  expect(dp.body.uris).toEqual([TRACK.uri]);
+  const expectNow = hostPlayback.progressMs + (Date.now() - hostPlayback.at);
+  expect(Math.abs(dp.body.position_ms - expectNow)).toBeLessThan(6000);
+  await desk.page.screenshot({ path: 'test-results/music-listener.png' });
+
+  // Phone listener: no in-browser player on phones, so it drives their Spotify app.
+  await phone.page.getByRole('button', { name: 'Table menu' }).click();
+  await phone.page.locator('.menu-item', { hasText: 'Table music' }).click();
+  await phone.page.getByRole('button', { name: 'Connect Spotify to listen' }).click();
+  await phone.page.waitForURL((u) => u.pathname === path);
+  await phone.page.getByRole('button', { name: 'Table music' }).click();
+  await phone.page.getByRole('button', { name: 'Play on my Spotify app' }).click();
+  await expect(phone.page.getByText('Listening along on your Spotify app.')).toBeVisible();
+  const pp = plays.find((x) => x.who === 'Pho')!;
+  expect(pp.url).toBe('');
+  expect(pp.body.uris).toEqual([TRACK.uri]);
+  await phone.page.screenshot({ path: 'test-results/music-phone.png' });
+
+  // Host pauses on Spotify → within one poll the desktop listener's player pauses too.
+  hostPlayback.progressMs += Date.now() - hostPlayback.at; hostPlayback.at = Date.now(); hostPlayback.isPlaying = false;
+  await expect.poll(() => desk.page.evaluate(() => (window as any).__sp.state?.paused), { timeout: 12_000 }).toBe(true);
+  await expect(desk.page.locator('.mu-meta small')).toContainText('Paused');
+
+  // Host refreshes: sharing drops while they're away and resumes by itself when they're back.
+  hostPlayback.at = Date.now(); hostPlayback.isPlaying = true;
+  await host.page.reload();
+  await expect(desk.page.locator('.music-btn')).not.toContainText('Velvet Felt');
+  await expect(desk.page.locator('.music-btn')).toContainText('Velvet Felt', { timeout: 15_000 });
+  await expect.poll(() => desk.page.evaluate(() => (window as any).__sp.state?.paused), { timeout: 12_000 }).toBe(false);
+
+  // Host stops sharing → listeners are told, the button goes back to "Music".
+  await host.page.getByRole('button', { name: 'Table music' }).click();
+  await host.page.getByRole('button', { name: 'Stop sharing' }).click();
+  await expect(desk.page.getByText('The host isn’t sharing music right now.')).toBeVisible();
+  await expect(phone.page.locator('.music-btn')).not.toContainText('Velvet Felt');
+  expect([...host.errors, ...desk.errors, ...phone.errors]).toEqual([]);
+});

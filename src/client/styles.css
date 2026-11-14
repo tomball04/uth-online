@@ -1323,3 +1323,24 @@ label.radio small { color: var(--muted); font-size: 14px; }
 }
 @media (prefers-reduced-motion: no-preference) { .bb-panel:not([hidden]) { animation: bbIn .18s ease-out; } }
 @keyframes bbIn { from { transform: translateY(8px); opacity: 0; } to { transform: none; opacity: 1; } }
+
+/* §40 table music (Spotify listen-along) */
+.music-btn .mu-note { color: var(--brass-hi); }
+.music-btn .mu-label { margin-left: 4px; max-width: 14ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: bottom; }
+.music-btn.live .mu-note { animation: mu-pulse 1.6s ease-in-out infinite; }
+@keyframes mu-pulse { 50% { opacity: .45; } }
+@media (max-width: 760px) { .music-btn .mu-label { display: none; } .music-btn .mu-note { font-size: 18px; } }
+@media (prefers-reduced-motion: reduce) { .music-btn.live .mu-note { animation: none; } }
+.music-panel { display: grid; gap: 14px; min-width: min(420px, 100%); }
+.mu-now { display: flex; gap: 12px; align-items: center; }
+.mu-art { width: 64px; height: 64px; border-radius: 6px; flex: none; object-fit: cover; box-shadow: 0 2px 8px rgba(0,0,0,.4); }
+.mu-art-empty { display: grid; place-items: center; background: rgba(201,164,92,.15); color: var(--brass-hi); font-size: 28px; }
+.mu-meta { display: grid; gap: 2px; min-width: 0; }
+.mu-meta b { color: var(--brass-hi); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mu-meta small, .music-panel .muted { color: var(--muted); }
+.mu-section h3 { margin: 0 0 6px; font-size: 13px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+.mu-section .row { display: flex; gap: 8px; flex-wrap: wrap; }
+.mu-vol { width: 100%; margin-top: 10px; accent-color: var(--brass-hi); }
+.mu-status { margin: 0; padding: 8px 10px; border-radius: 8px; background: rgba(201,164,92,.12); }
+.mu-foot p { margin: 6px 0 0; }
+.mu-foot .small { font-size: 12.5px; }

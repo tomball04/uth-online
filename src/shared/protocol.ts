@@ -254,6 +254,10 @@ export interface ClientToServer {
   'host:dealer': (p: { settings?: Partial<DealerSettings>; dealerId?: string }, ack: (r: Ack<{ queued: boolean }>) => void) => void;
   'roast:prefs': (p: RoastConsent, ack: (r: Ack<RoastConsent>) => void) => void;
   'host:settings': (p: Partial<TableConfig>, ack: (r: Ack) => void) => void;
+  /** §40 host only: share (or update) what the host is playing on Spotify. */
+  'music:now': (p: MusicNow, ack: (r: Ack) => void) => void;
+  /** §40 host only: stop sharing. */
+  'music:stop': (ack: (r: Ack) => void) => void;
 }
 
 // ------------------------- server -> client -------------------------
@@ -269,6 +273,8 @@ export interface ServerToClient {
   'jackpot:hit': (p: { tableName: string; playerName: string; hand: string; amount: number; same: boolean }) => void;
   /** Style Credits earned (§24). Never chips. */
   'style:earned': (p: { rewards: string[]; balance: number }) => void;
+  /** §40 the table's shared now-playing (null = host not sharing). serverNow lets clients correct clock skew. */
+  'music:state': (p: { music: MusicState | null; serverNow: number }) => void;
 }
 
 export type Ack<T = object> = ({ ok: true } & T) | { ok: false; error: string };
@@ -288,3 +294,46 @@ export interface PublicTableListing {
 }
 
 export type { Advice };
+
+// ------------------------- §40 table music (Spotify listen-along) -------------------------
+/** What the host is playing. Only metadata and a Spotify track URI travel; audio is never relayed. */
+export interface MusicNow {
+  uri: string;          // spotify:track:<22 base62>
+  name: string;
+  artist: string;
+  art: string | null;   // https://i.scdn.co/image/… only
+  durationMs: number;
+  progressMs: number;
+  isPlaying: boolean;
+}
+export interface MusicState extends MusicNow {
+  hostId: string;
+  hostName: string;
+  /** Server time the host's position was sampled; listeners add (now - at) when playing. */
+  at: number;
+}
+
+const clip = (v: unknown, n: number) => String(v ?? '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, n);
+const ms = (v: unknown, max: number) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Math.min(Math.floor(v), max) : null);
+
+/** Validate a host's now-playing report. Returns null for anything that isn't a plain Spotify track. */
+export function parseMusicNow(p: unknown): MusicNow | null {
+  if (!p || typeof p !== 'object') return null;
+  const x = p as Record<string, unknown>;
+  const uri = String(x.uri ?? '');
+  if (!/^spotify:track:[A-Za-z0-9]{22}$/.test(uri)) return null;
+  const durationMs = ms(x.durationMs, 3_600_000);
+  const progressMs = ms(x.progressMs, 3_600_000);
+  if (durationMs === null || progressMs === null) return null;
+  const art = typeof x.art === 'string' && /^https:\/\/i\.scdn\.co\/image\/[A-Za-z0-9]{1,64}$/.test(x.art) ? x.art : null;
+  return {
+    uri, name: clip(x.name, 120) || 'Unknown track', artist: clip(x.artist, 120), art,
+    durationMs, progressMs: Math.min(progressMs, durationMs), isPlaying: x.isPlaying === true,
+  };
+}
+
+/** Where a listener should be right now, given the shared state and the current server-synced time. */
+export function musicPosition(m: MusicState, now: number): number {
+  const p = m.isPlaying ? m.progressMs + Math.max(0, now - m.at) : m.progressMs;
+  return Math.min(p, m.durationMs);
+}

@@ -7,7 +7,7 @@ import { Server, type Socket } from 'socket.io';
 import type {
   Ack, ChatMessage, ClientToServer, PublicTableListing, Reaction, ServerToClient,
 } from '../shared/protocol.js';
-import { REACTIONS } from '../shared/protocol.js';
+import { REACTIONS, parseMusicNow, type MusicState } from '../shared/protocol.js';
 import { buildConfig } from './config.js';
 import { DEFAULT_TIMING, EngineError, TableEngine, cleanName, type Timing } from './engine.js';
 import { newId, newToken, roomCode, secureShuffle, sha256 } from './rng.js';
@@ -34,6 +34,8 @@ export interface AppOptions {
   rateLimitScale?: number;
   /** §24 price and reward overrides. */
   cosmetics?: CosmeticsConfig;
+  /** §40 public Spotify app Client ID (PKCE, no secret). Empty = table music is hidden. */
+  spotifyClientId?: string;
 }
 
 const AVATARS = ['♠', '♥', '♦', '♣', '★', '♛', '♞', '⚜'];
@@ -71,6 +73,8 @@ export class TableManager {
   tables = new Map<string, TableEngine>();
   sockets = new Map<string, Set<Sock>>();
   chat = new Map<string, ChatMessage[]>();
+  /** §40 each table's shared now-playing. Memory only: it describes the host's live player, nothing to persist. */
+  music = new Map<string, MusicState>();
   private loading = new Map<string, Promise<TableEngine | null>>();
   private pendingBroadcast = new Set<string>();
   /** Linked progressive meter, shared by every table on this server. Seeded from the store at startup. */
@@ -149,6 +153,7 @@ export class TableManager {
         this.sockets.delete(code);
         this.tables.delete(code);
         this.chat.delete(code);
+        this.music.delete(code);
       },
     };
   }
@@ -161,6 +166,20 @@ export class TableManager {
     for (const s of this.sockets.get(code) ?? []) s.emit('chat:message', m);
   }
 
+  emitMusic(code: string, to?: Sock) {
+    const p = { music: this.music.get(code) ?? null, serverNow: Date.now() };
+    if (to) { to.emit('music:state', p); return; }
+    for (const s of this.sockets.get(code) ?? []) s.emit('music:state', p);
+  }
+
+  /** §40 sharing belongs to whoever is host: it ends when hosting passes on or the host goes. */
+  checkMusic(code: string) {
+    const m = this.music.get(code);
+    const e = this.tables.get(code);
+    if (!m) return;
+    if (!e || e.hostId !== m.hostId || this.connectionsFor(code, m.hostId) === 0) { this.music.delete(code); this.emitMusic(code); }
+  }
+
   /** Coalesce bursts of changes into one personalised view per socket. */
   broadcast(code: string) {
     if (this.pendingBroadcast.has(code)) return;
@@ -170,6 +189,7 @@ export class TableManager {
       const e = this.tables.get(code);
       if (!e) return;
       for (const s of this.sockets.get(code) ?? []) s.emit('table:state', e.viewFor(s.data.player.id));
+      this.checkMusic(code);
     });
   }
 
@@ -193,6 +213,7 @@ export class TableManager {
     this.sockets.get(code)?.delete(s);
     s.data.code = null;
     const e = this.tables.get(code);
+    this.checkMusic(code);
     if (e && this.connectionsFor(code, s.data.player.id) === 0) {
       e.run(() => {
         if (e.seatOf(s.data.player.id)) e.setConnected(s.data.player.id, false);
@@ -224,7 +245,7 @@ export async function createApp(opts: AppOptions) {
     res.setHeader('X-Frame-Options', 'DENY');
     res.setHeader('Referrer-Policy', 'same-origin');
     res.setHeader('Content-Security-Policy',
-      "default-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'self'; frame-ancestors 'none'");
+      "default-src 'self'; connect-src 'self' ws: wss: https://api.spotify.com https://accounts.spotify.com; img-src 'self' data: https://i.scdn.co; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'self' https://sdk.scdn.co; frame-src https://sdk.scdn.co; frame-ancestors 'none'");
     next();
   });
   app.use(express.json({ limit: '16kb' }));
@@ -273,6 +294,8 @@ export async function createApp(opts: AppOptions) {
     fn(req, res).catch((e) => res.status(400).json({ error: e instanceof Error ? e.message : 'Request failed' }));
 
   // ---- REST
+  // §40 public, non-secret Spotify Client ID (PKCE). The browser signs each person in to their own Spotify.
+  app.get('/api/music/config', (_req, res) => { res.json({ spotifyClientId: opts.spotifyClientId ?? '' }); });
   app.get('/api/health', (_req, res) => { res.json({ ok: true, tables: manager.tables.size }); });
 
   app.post('/api/guest', ipLimit(10, 0.2), wrap(async (req, res) => {
@@ -465,6 +488,7 @@ export async function createApp(opts: AppOptions) {
     const bucket = new Bucket(25, 6);
     const chatBucket = new Bucket(5, 0.5);
     const reactBucket = new Bucket(2, 0.7);
+    const musicBucket = new Bucket(4, 0.5);
 
     // Wrap a handler: rate limit, find table, run inside the table mutex, convert errors to acks.
     const on = <K extends keyof ClientToServer>(ev: K, handler: (e: TableEngine, ...args: any[]) => Promise<object | void>) => {
@@ -508,6 +532,7 @@ export async function createApp(opts: AppOptions) {
         manager.register(socket, code);
         socket.emit('table:state', e.viewFor(me.id));
         socket.emit('chat:history', manager.chat.get(code) ?? []);
+        manager.emitMusic(code, socket);
         reply({ ok: true, seat });
       } catch (err) {
         reply({ ok: false, error: err instanceof EngineError ? err.message : 'Could not join table.' });
@@ -584,6 +609,32 @@ export async function createApp(opts: AppOptions) {
       if (!reactBucket.take()) return reply({ ok: false, error: 'Slow down.' });
       const seat = e?.seatOf(socket.data.player.id)?.seat ?? null;
       for (const s of manager.sockets.get(code) ?? []) s.emit('chat:reaction', { playerId: socket.data.player.id, seat, reaction });
+      reply({ ok: true });
+    });
+
+    // §40 table music: the host's browser reports what its own Spotify is playing; the server relays metadata only.
+    socket.on('music:now', (p, ack) => {
+      const reply = typeof ack === 'function' ? ack : () => {};
+      const code = socket.data.code;
+      const e = code ? manager.tables.get(code) : undefined;
+      if (!code || !e) return reply({ ok: false, error: 'Join a table first.' });
+      if (e.hostId !== socket.data.player.id) return reply({ ok: false, error: 'Only the host can share music.' });
+      if (!musicBucket.take()) return reply({ ok: false, error: 'Slow down.' });
+      const now = parseMusicNow(p);
+      if (!now) return reply({ ok: false, error: 'Not a Spotify track.' });
+      const fresh = manager.music.get(code)?.uri !== now.uri;
+      const host = e.seatOf(socket.data.player.id)?.name ?? socket.data.player.name;
+      manager.music.set(code, { ...now, hostId: socket.data.player.id, hostName: host, at: Date.now() });
+      manager.emitMusic(code);
+      if (fresh) manager.pushChat(code, { id: newId(), at: Date.now(), kind: 'system', text: `♫ ${host} is playing ${now.name}${now.artist ? ` — ${now.artist}` : ''}` } as ChatMessage);
+      reply({ ok: true });
+    });
+    socket.on('music:stop', (ack) => {
+      const reply = typeof ack === 'function' ? ack : () => {};
+      const code = socket.data.code;
+      const e = code ? manager.tables.get(code) : undefined;
+      if (!code || !e || e.hostId !== socket.data.player.id) return reply({ ok: false, error: 'Only the host can stop the music.' });
+      if (manager.music.delete(code)) manager.emitMusic(code);
       reply({ ok: true });
     });
 

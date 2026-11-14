@@ -260,6 +260,15 @@ To add or change lines, edit the situation's section in `src/shared/roast/lines.
 
 The full payout audit (every table, source, discrepancy, correction and test) is section 1k of `VERIFICATION.md`.
 
+## Table music — Spotify listen-along (§40)
+
+The host can share what they're playing on Spotify; everyone at the table can listen along **on their own Spotify account**, kept in step with the host.
+
+* **Host:** ♫ in the top bar (phones: also in ☰) → *Connect Spotify to share* → *Share what I'm playing*. Play music from any Spotify app (phone, desktop, web); the table follows track changes, pause/play and seeks within about 4 seconds. A host who refreshes keeps sharing; sharing ends when they stop, leave or hand over hosting.
+* **Listeners:** ♫ → *Listen here* (plays in the browser tab via Spotify's Web Playback SDK, with a volume slider) or *Play on my Spotify app* (phones — Spotify has no in-browser player on mobile). Playback re-syncs if it drifts more than 2.5 seconds; *Open in Spotify* always works, even without signing in.
+* **What travels:** only a `spotify:track:` URI, title, artist, Spotify artwork URL, position and play/pause — validated, capped and rate-limited by the server, host-only, per table, memory-only. Audio is never relayed (Spotify forbids rebroadcasting), and Spotify tokens never reach our server.
+* **Spotify's limits, not ours:** playback control needs **Spotify Premium**; while the Spotify app is in Development Mode only the (up to 5) accounts added in its dashboard can sign in. Setup is in `DEPLOY.md` → *Table music (Spotify)*. Without `SPOTIFY_CLIENT_ID` the ♫ button is hidden.
+
 ## Using it
 
 * **Create a private table** → copy the invite link (`/table/XXXXXXXX`) → friends open it, pick a name, and land in a free seat.

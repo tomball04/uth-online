@@ -25,6 +25,7 @@ async function main() {
     store,
     staticDir: join(root, 'dist', 'client'),
     trustProxy: process.env.TRUST_PROXY === '1',
+    spotifyClientId: (process.env.SPOTIFY_CLIENT_ID ?? '').trim(),
     cosmetics: cosmeticsConfigFromEnv(),
     allowedOrigins: (process.env.ALLOWED_ORIGINS ?? '').split(',').map((s) => s.trim()).filter(Boolean),
   });

@@ -2,15 +2,17 @@
 
 What was actually run, where, and what it proved — and what was not tested.
 
-**Environment:** Linux, Node.js 22.23, PostgreSQL 16 (local), Google Chrome for Testing 153; latest full run 8 November 2026.
-**Result:** 320 of 320 automated tests passed (8 November 2026, final run): 307 in Vitest and 13 browser tests in Playwright. Tracked project files: **97** (cap 99).
+**Environment:** Linux, Node.js 22.23, PostgreSQL 16 (local), Google Chrome for Testing 153; latest full run 13 November 2026.
+**Result:** 334 of 334 automated tests passed (13 November 2026, final run): 320 in Vitest and 14 browser tests in Playwright. Tracked project files: **98** (cap 99).
 
 ```
 npx tsc --noEmit                 → no type errors (client, server, shared, tests)
-node scripts/count-files.mjs     → OK: 97 tracked project files (cap 99)
-npm test  (Vitest)               → 2 files, 307 tests passed   (unit + multiplayer integration on PostgreSQL 16)
-npm run test:e2e (Playwright)    → 13 tests passed in real Chrome against the production build (8.8 min)
+node scripts/count-files.mjs     → OK: 98 tracked project files (cap 99)
+npm test  (Vitest)               → 2 files, 320 tests passed   (unit + multiplayer integration on PostgreSQL 16)
+npm run test:e2e (Playwright)    → 14 tests passed in real Chrome against the production build (8.0 min)
 ```
+
+Update 13 November 2026 (§40 table music): Spotify listen-along — section 1l. Vitest 320/320 (13 new: 4 unit, 9 integration), Playwright 14/14 (1 new). **Spotify itself was mocked** in every test; no real Spotify account, app or audio was used — see 1l for exactly what that does and doesn't prove.
 
 Update 8 November 2026 (§33–§39 release): payout audit and corrections, Three Card Poker stored-rank fix and new Three Card Progressive, all Stadium UTH tables, UTH Progressive V2, a shared progressive service with separate meters and a High Roller profile, the Blackjack side-bet catalog with Bonus Bets panel, host presets and bonus statistics, 900 new dealer lines, and a 99-file guard — section 1k. Final runs: Vitest 307/307, Playwright 13/13. One Vitest run made while the six-browser Playwright suite was running timed out twice in the §25 rotation tests (waiting for a hand to settle); the same suite passed 307/307 when run on its own afterwards. In that Playwright run the old side-bet browser test failed only because pay tables were renamed to their Stadium ids (“UP-04”, “BB-01”); the expectation was updated and the final full run passed.
 
@@ -27,6 +29,20 @@ Update 7 November 2026: more pawn variety — 15 items at every $1,000 step to $
 Update 6 November 2026: avatars, Style Credits and the Casino Boutique (§24) — section 1h.
 
 Earlier update: refinement pass — Progressive/Envy audit under concurrency, rules version, Sit Out / Sit Back In, same bet every hand, decision countdowns and action tags, Tonight running tab and night recap, chips check, results presentation, six-browser test, restore code — section 1f.
+
+## 1l. Table music — Spotify listen-along (§40)
+
+**Design.** The host's browser reads the host's own Spotify (`GET /me/player/currently-playing`, every 4 s) and sends `music:now` only when the track, play/pause or position (±2 s) changes, plus a 20 s heartbeat. The server checks the sender is the table's host, validates (`spotify:track:` + 22 base-62 characters only; title/artist ≤120 chars with control characters removed; artwork kept only if it is an `https://i.scdn.co/image/…` URL; times clamped to the track), rate-limits (4 burst, 1 per 2 s), stamps server time and relays `music:state` to that table only. Listeners compute the host's position from server time and play the same URI on their own account — in the tab (Web Playback SDK device "UTH Table") or on their Spotify app (Web API, no device id) — re-syncing on track change, play/pause, or drift over 2.5 s. Sign-in is OAuth PKCE in the browser (no secret); tokens are in that browser's localStorage and are never sent to our server. State is memory-only per table and is cleared when the host stops, disconnects, leaves or hosting passes on; a refreshing host resumes sharing automatically (sessionStorage).
+
+| Test | What it checks | Result |
+|---|---|---|
+| unit `music` ×4 | URI/field validation and rejection (episodes, open.spotify URLs, short ids, injected chars, NaN/negative times), artwork host allow-list, clamping, listener position while playing/paused and under clock skew | pass |
+| integration `music` ×9 (real server + Socket.IO) | public client-id endpoint; CSP contains exactly the four Spotify hosts and still `frame-ancestors 'none'`; joiners and late spectators receive current state; non-host `music:now`/`music:stop` rejected; one chat line per new track (not per pause); rate limit; stop clears for everyone; host leaving clears it, the new host can share and the old one can't; another table never receives it | pass |
+| e2e `§40` (3 browsers, Chrome) | host PKCE round trip returns to the same table (S256 challenge, verifier ≥43 chars, client id sent); host shares; desktop listener's top bar and chat show the song; *Listen here* plays the host URI on the SDK device at the host's position (±6 s window allowing for test timing); phone listener (iPhone 13 emulation) uses *Play on my Spotify app* (no device id); host pauses → listener pauses within one poll; host refresh → sharing drops then resumes and the listener resumes; host stops → listeners told; no page errors | pass |
+
+Screenshots: desktop listener panel and phone listener panel (in the delivered contact sheet).
+
+**Not verified — Spotify was mocked.** The tests replace `accounts.spotify.com`, `api.spotify.com` and the SDK script (`sdk.scdn.co/spotify-player.js`) with stand-ins that follow Spotify's documented request/response shapes. Not tested: a real Spotify sign-in, real audio, the real SDK in Chrome, real token refresh, Premium/non-Premium (`PREMIUM_REQUIRED`) and not-on-the-user-list (403) responses — the messages for those are written from Spotify's documentation. Spotify's February 2026 Development Mode rules restrict which Web API endpoints new apps may call; whether the player endpoints used here (`/me/player`, `/me/player/currently-playing`, `/play`, `/pause`, `/seek`) remain available to a new Development Mode app was **not confirmed** from the published material and needs checking with a real app. The Web Playback SDK does not support mobile browsers (hence the app mode on phones); Safari/WebKit was not tested.
 
 ## 1k. Payout audit, progressives, Blackjack side bets and the 99-file cap (scope addenda §33–§39)
 
@@ -323,4 +339,5 @@ Screenshots from these runs (desktop and iPhone, settled hand) are in `docs/scre
 * **Face-up policy:** after a hand settles everyone's cards, folded hands included, are shown to the table, with bonus combinations announced in chat. During a hand nobody sees another player's cards.
 * **Pre-flop and flop EV costs** are estimates (Monte Carlo / sampled runouts) and labelled "est." in the UI. River EV is exact.
 * **Deck commitment.** Each hand stores a SHA-256 of the shuffled deck for audit, but the full deck order isn't stored, so it can't be independently re-verified later; the dealt cards themselves are stored.
+* **Spotify table music** was tested only against mocked Spotify services (see 1l).
 * **Not implemented:** registered accounts and a friends list (guest identities only, as the brief allowed); a cross-table hand-history browser (replays are reached from a table's History panel, last 15 hands, and from the Tonight tab); horizontal scaling across multiple server instances.

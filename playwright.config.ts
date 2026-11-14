@@ -20,7 +20,7 @@ export default defineConfig({
     command: `node tests/e2e/reset-db.mjs && node dist/server/server/index.js`,
     url: `http://localhost:${PORT}/api/health`,
     reuseExistingServer: false,
-    env: { PORT: String(PORT), DATABASE_URL: DB },
+    env: { PORT: String(PORT), DATABASE_URL: DB, SPOTIFY_CLIENT_ID: 'e2e-spotify-client' },
     timeout: 30_000,
   },
   projects: [{ name: 'chrome', use: { ...devices['Desktop Chrome'] } }],
